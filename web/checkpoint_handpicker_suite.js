@@ -10,7 +10,6 @@ const STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed
 const SELECTOR_CLASS = "CheckpointListSelector";
 const CYCLER_CLASS = "CheckpointNameCycler";
 const TAGGER_CLASS = "CheckpointStatusTagger";
-const FILTER_CLASS = "CheckpointStatusFilter";
 const PREVIEW_CLASSES = new Set(["EphemeralPreviewTap", "EphemeralPreview", "ImageDirPreview"]);
 
 const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
@@ -33,15 +32,17 @@ function drawRounded(ctx, x, y, w, h, r = 6) {
   else ctx.rect(x, y, w, h);
 }
 
-function drawButton(ctx, rect, label, enabled = true, active = false, color = null) {
+function drawButton(ctx, rect, label, enabled = true, active = false, color = null, opts = {}) {
   ctx.save();
-  ctx.fillStyle = color || (active ? "rgba(70,140,110,0.75)" : enabled ? "rgba(80,120,180,0.65)" : "rgba(80,80,80,0.35)");
-  ctx.strokeStyle = enabled ? "rgba(200,230,255,0.75)" : "rgba(160,160,160,0.35)";
+  const bg = color || (active ? "rgba(70,140,110,0.82)" : enabled ? "rgba(80,120,180,0.65)" : "rgba(80,80,80,0.26)");
+  ctx.fillStyle = bg;
+  ctx.strokeStyle = enabled ? (active ? "rgba(235,255,245,0.95)" : "rgba(200,230,255,0.75)") : "rgba(150,150,150,0.28)";
+  ctx.lineWidth = active ? 3 : 1;
   drawRounded(ctx, rect.x, rect.y, rect.w, rect.h, 6);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = enabled ? "#fff" : "#999";
-  ctx.font = "12px sans-serif";
+  ctx.fillStyle = opts.textColor || (enabled ? "#fff" : "#888");
+  ctx.font = `${active ? "bold " : ""}12px sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2);
@@ -149,9 +150,9 @@ function selectorRects(node) {
   return {
     refreshAll: { x: margin, y: 8, w: 120, h: 24 },
     listOnly: { x: 134, y: 8, w: 80, h: 24 },
-    queueToCycler: { x: 220, y: 8, w: 126, h: 24 },
-    up: { x: 352, y: 8, w: 34, h: 24 },
-    down: { x: 392, y: 8, w: 34, h: 24 },
+    pushLocalList: { x: 220, y: 8, w: 172, h: 24 },
+    up: { x: 398, y: 8, w: 34, h: 24 },
+    down: { x: 438, y: 8, w: 34, h: 24 },
     list: { x: margin, y: 86, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
@@ -211,16 +212,16 @@ async function refreshSelector(node, all = false) {
     app.graph.setDirtyCanvas(true, true);
   }
 }
-async function queueSelectedToCycler(node) {
+async function pushSelectedToLocalList(node) {
   const selected = selectorSelected(node);
   if (!selected) return;
-  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/queue_append`, {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/local_list_append`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ckpt_name_str: selected }),
   });
   const result = await response.json();
-  node.__hpsStatus = result.ok ? `Queued to ${result.updated} cycler(s): ${selected}` : (result.error || "Queue failed");
+  node.__hpsStatus = result.ok ? `Pushed to ${result.updated} Local List(s): ${selected}` : (result.error || "Push failed");
   app.graph.setDirtyCanvas(true, true);
 }
 function maxSelectorScroll(node) {
@@ -295,9 +296,9 @@ function setupSelectorNode(nodeType) {
     if (origDraw) origDraw.apply(this, arguments);
     hideSelectorWidget(this);
     const r = selectorRects(this);
-    drawButton(ctx, r.refreshAll, "Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.listOnly, "List only", !this.__hpsLoading);
-    drawButton(ctx, r.queueToCycler, "Queue to Cycler", !this.__hpsLoading);
+    drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
+    drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
+    drawButton(ctx, r.pushLocalList, "🏹 Push to Local List", !this.__hpsLoading);
     drawButton(ctx, r.up, "▲", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
     drawButton(ctx, r.down, "▼", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
     ctx.fillStyle = "#ddd";
@@ -337,7 +338,7 @@ function setupSelectorNode(nodeType) {
     const r = selectorRects(this);
     if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
     if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
-    if (hitAny(this, pos, r.queueToCycler)) { queueSelectedToCycler(this); return true; }
+    if (hitAny(this, pos, r.pushLocalList)) { pushSelectedToLocalList(this); return true; }
     if (hitAny(this, pos, r.up)) { scrollSelector(this, -SELECTOR_VISIBLE_ROWS); return true; }
     if (hitAny(this, pos, r.down)) { scrollSelector(this, SELECTOR_VISIBLE_ROWS); return true; }
     const listHitPos = candidatePositions(this, pos).find((p) => hit(p, r.list));
@@ -366,21 +367,27 @@ function setupSelectorNode(nodeType) {
 }
 
 // ---------- Tagger ----------
+const TAGGER_STATUSES = ["favorite", "nice", "keep", "delete"];
 function currentTaggerPath(node) {
   return node.__hpsTaggerPath || getWidget(node, "ckpt_name_str")?.value || "";
 }
 function taggerButtons(node) {
-  return STATUS_ORDER.map((status, i) => ({
+  return TAGGER_STATUSES.map((status, i) => ({
     status,
-    x: 8 + i * 72,
+    x: 150 + i * 78,
     y: 10,
-    w: 66,
+    w: 72,
     h: 24,
   }));
+}
+function taggerDeleteEnabled(node) {
+  const current = node.__hpsTaggerStatus || "none";
+  return current === "none" || current === "delete";
 }
 async function setTaggerStatus(node, status) {
   const ckpt = currentTaggerPath(node);
   if (!ckpt) return;
+  if (status === "delete" && !taggerDeleteEnabled(node)) return;
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tagger/set_status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -389,6 +396,7 @@ async function setTaggerStatus(node, status) {
   const result = await response.json();
   if (result.ok) {
     node.__hpsTaggerStatus = result.status;
+    node.__hpsTaggerMessage = result.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[result.status]} ${STATUS_LABEL[result.status]}`;
     node.title = result.status === "none" ? `Tagger : ${ckpt}` : `Tagger : ${STATUS_ICON[result.status]} ${ckpt}`;
   } else {
     node.__hpsTaggerMessage = result.error || "Failed";
@@ -399,27 +407,47 @@ function setupTaggerNode(nodeType) {
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 390, 120);
+    ensureSize(this, 500, 125);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     ctx.save();
+    const current = this.__hpsTaggerStatus || "none";
     for (const b of taggerButtons(this)) {
-      drawButton(ctx, b, `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`, true, this.__hpsTaggerStatus === b.status);
+      const enabled = b.status !== "delete" || taggerDeleteEnabled(this);
+      drawButton(
+        ctx,
+        b,
+        `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`,
+        enabled,
+        current === b.status,
+        null,
+        { textColor: enabled ? undefined : "#888" }
+      );
     }
+    const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    const p = currentTaggerPath(this);
     ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 54);
-    if (this.__hpsTaggerMessage) ctx.fillText(this.__hpsTaggerMessage, 8, 72);
+    const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: — none" : `Current: ${STATUS_ICON[current]} ${STATUS_LABEL[current]}`);
+    ctx.fillStyle = current === "none" ? "#888" : "#ddd";
+    ctx.fillText(msg, 8, 72);
+    if (current !== "none" && current !== "delete") {
+      ctx.fillStyle = "#aaa";
+      ctx.fillText("Delete is available only from none.", 8, 90);
+    }
     ctx.restore();
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
     for (const b of taggerButtons(this)) {
-      if (hitAny(this, pos, b)) { setTaggerStatus(this, b.status); return true; }
+      if (hitAny(this, pos, b)) {
+        if (b.status === "delete" && !taggerDeleteEnabled(this)) return true;
+        setTaggerStatus(this, b.status);
+        return true;
+      }
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
@@ -429,6 +457,7 @@ api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   if (!node) return;
   node.__hpsTaggerPath = detail.ckpt_name_str;
   node.__hpsTaggerStatus = detail.status;
+  node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
   if (detail.title) node.title = detail.title;
   app.graph.setDirtyCanvas(true, true);
 });
@@ -439,88 +468,70 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
     }
     if ((node.type === TAGGER_CLASS || node.comfyClass === TAGGER_CLASS) && node.__hpsTaggerPath === detail.ckpt_name_str) {
       node.__hpsTaggerStatus = detail.status;
+      node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
       app.graph.setDirtyCanvas(true, true);
     }
   }
 });
 
-// ---------- Filter ----------
-function filterButtons() {
-  return STATUS_ORDER.map((status, i) => ({ status, x: 8 + i * 72, y: 10, w: 66, h: 24 }));
-}
-async function pushFilter(node) {
-  const statuses = node.__hpsFilterStatuses || ["none"];
-  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ statuses }),
-  });
-}
-function setupFilterNode(nodeType) {
-  const origCreated = nodeType.prototype.onNodeCreated;
-  nodeType.prototype.onNodeCreated = function () {
-    const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 390, 120);
-    this.__hpsFilterStatuses = ["none"];
-    return r;
-  };
-  const origDraw = nodeType.prototype.onDrawBackground;
-  nodeType.prototype.onDrawBackground = function (ctx) {
-    if (origDraw) origDraw.apply(this, arguments);
-    ctx.save();
-    const active = this.__hpsFilterStatuses || [];
-    for (const b of filterButtons()) drawButton(ctx, b, `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`, true, active.includes(b.status));
-    ctx.fillStyle = "#ddd"; ctx.font = "12px sans-serif";
-    ctx.fillText(`Active: ${(active || []).join(", ")}`, 8, 54);
-    ctx.restore();
-  };
-  const origMouseDown = nodeType.prototype.onMouseDown;
-  nodeType.prototype.onMouseDown = function (e, pos) {
-    for (const b of filterButtons()) {
-      if (hitAny(this, pos, b)) {
-        const set = new Set(this.__hpsFilterStatuses || []);
-        if (set.has(b.status)) set.delete(b.status); else set.add(b.status);
-        this.__hpsFilterStatuses = STATUS_ORDER.filter((x) => set.has(x));
-        pushFilter(this);
-        app.graph.setDirtyCanvas(true, true);
-        return true;
-      }
-    }
-    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
-  };
-}
-
 // ---------- Cycler ----------
+const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
 function cyclerRects(node) {
+  const filterY = 70;
+  const filter = [{ status: "all", x: 8, y: filterY, w: 54, h: 24 }];
+  CYCLER_FILTER_STATUSES.forEach((status, i) => filter.push({ status, x: 68 + i * 48, y: filterY, w: 42, h: 24 }));
   return {
-    queueToggle: { x: 8, y: 10, w: 120, h: 24 },
-    filterToggle: { x: 8, y: 40, w: 120, h: 24 },
+    localListToggle: { x: 8, y: 10, w: 132, h: 24 },
+    clearLocalList: { x: 8, y: 40, w: 132, h: 24 },
+    filter,
     statusBox: { x: 8, y: 110, w: node.size[0] - 16, h: Math.max(80, node.size[1] - 118) },
   };
+}
+function cyclerActiveFilter(node) {
+  return node.__hpsFilterStatuses || [];
 }
 async function pushCyclerFlags(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id, accept_queue: !!node.__hpsAcceptQueue, accept_filter: !!node.__hpsAcceptFilter }),
+    body: JSON.stringify({ node_id: node.id, use_local_list: !!node.__hpsUseLocalList }),
+  });
+}
+async function pushCyclerFilter(node) {
+  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, statuses: cyclerActiveFilter(node) }),
+  });
+}
+async function clearLocalList(node) {
+  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/clear_local_list`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id }),
   });
 }
 function setupCyclerNode(nodeType) {
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 360, 240);
-    this.__hpsAcceptQueue = true;
-    this.__hpsAcceptFilter = true;
-    setTimeout(() => pushCyclerFlags(this), 0);
+    ensureSize(this, 420, 260);
+    this.__hpsUseLocalList = true;
+    this.__hpsFilterStatuses = [];
+    setTimeout(() => { pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     const r = cyclerRects(this);
-    drawButton(ctx, r.queueToggle, this.__hpsAcceptQueue ? "☑ Accept Queue" : "☐ Accept Queue", true, this.__hpsAcceptQueue);
-    drawButton(ctx, r.filterToggle, this.__hpsAcceptFilter ? "☑ Accept Filter" : "☐ Accept Filter", true, this.__hpsAcceptFilter);
+    drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
+    drawButton(ctx, r.clearLocalList, "Clear Local List", true, false, "rgba(105,90,90,0.65)");
+    const active = cyclerActiveFilter(this);
+    for (const b of r.filter) {
+      if (b.status === "all") drawButton(ctx, b, "All", true, active.length === 0);
+      else drawButton(ctx, b, STATUS_ICON[b.status], true, active.includes(b.status));
+    }
     ctx.save();
     ctx.fillStyle = "rgba(0,0,0,0.18)";
     ctx.fillRect(r.statusBox.x, r.statusBox.y, r.statusBox.w, r.statusBox.h);
@@ -533,8 +544,29 @@ function setupCyclerNode(nodeType) {
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
     const r = cyclerRects(this);
-    if (hitAny(this, pos, r.queueToggle)) { this.__hpsAcceptQueue = !this.__hpsAcceptQueue; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
-    if (hitAny(this, pos, r.filterToggle)) { this.__hpsAcceptFilter = !this.__hpsAcceptFilter; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
+    if (hitAny(this, pos, r.localListToggle)) {
+      this.__hpsUseLocalList = !this.__hpsUseLocalList;
+      pushCyclerFlags(this);
+      app.graph.setDirtyCanvas(true, true);
+      return true;
+    }
+    if (hitAny(this, pos, r.clearLocalList)) {
+      clearLocalList(this);
+      return true;
+    }
+    for (const b of r.filter) {
+      if (!hitAny(this, pos, b)) continue;
+      if (b.status === "all") {
+        this.__hpsFilterStatuses = [];
+      } else {
+        const set = new Set(this.__hpsFilterStatuses || []);
+        if (set.has(b.status)) set.delete(b.status); else set.add(b.status);
+        this.__hpsFilterStatuses = CYCLER_FILTER_STATUSES.filter((x) => set.has(x));
+      }
+      pushCyclerFilter(this);
+      app.graph.setDirtyCanvas(true, true);
+      return true;
+    }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 }
@@ -552,7 +584,6 @@ app.registerExtension({
     if (PREVIEW_CLASSES.has(nodeData.name)) return setupPreviewNode(nodeType);
     if (nodeData.name === SELECTOR_CLASS) return setupSelectorNode(nodeType);
     if (nodeData.name === TAGGER_CLASS) return setupTaggerNode(nodeType);
-    if (nodeData.name === FILTER_CLASS) return setupFilterNode(nodeType);
     if (nodeData.name === CYCLER_CLASS) return setupCyclerNode(nodeType);
   },
 });

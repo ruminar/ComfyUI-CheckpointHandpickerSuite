@@ -537,18 +537,31 @@ def _get_cycler_state(node_key: str) -> dict:
         state = _CYCLER_STATES.get(node_key)
         if state is None:
             state = {
-                "accept_queue": True,
-                "accept_filter": True,
-                "override_queue": [],
-                "active_filter": ["none"],
+                "use_local_list": True,
+                "local_list": [],
+                "active_filter": [],  # empty means All
                 "repeat_count": 0,
                 "current_index": 0,
                 "cycle_count": 0,
                 "last_checkpoint_hash": "",
+                "last_ckpt_name": "",
+                "last_title": "",
+                "last_hold_index": 0,
+                "last_change_every": 1,
+                # compatibility with older draft state/routes
+                "accept_queue": True,
+                "override_queue": [],
+                "accept_filter": True,
             }
             _CYCLER_STATES[node_key] = state
+        # migrate older draft keys in-memory
+        if "use_local_list" not in state:
+            state["use_local_list"] = bool(state.get("accept_queue", True))
+        if "local_list" not in state:
+            state["local_list"] = list(state.get("override_queue", []))
+        if "active_filter" not in state:
+            state["active_filter"] = []
         return state
-
 
 def _checkpoint_hash(names: Iterable[str]) -> str:
     return "\n".join(names)
@@ -574,41 +587,106 @@ def _find_start_index(checkpoints: list[str], start_checkpoint: str) -> int:
     return 0
 
 
-def _build_cycler_title(source: str, ckpt_name: str, hold_index: int, change_every: int, active_filter: list[str], fallback_all: bool, queue_total: int) -> str:
+def _build_cycler_title(source: str, ckpt_name: str, hold_index: int, change_every: int, active_filter: list[str], fallback_all: bool, local_list_total: int) -> str:
     status = _get_status(ckpt_name)
     icon = STATUS_ICON[status] if status != "none" else ""
     display = f"{icon} {ckpt_name}".strip()
-    if source == "queue":
-        return f"Cycler : {display} ({queue_total} Queue Total)"
+    if source == "local_list":
+        return f"Cycler : {display} (Local List)"
     if fallback_all:
         return f"Cycler : ⚠ {ckpt_name} ({hold_index}/{change_every} Filter:0→All)"
-    filter_icons = _status_icons_for_filter(active_filter)
-    if filter_icons and set(active_filter) != {"none"}:
-        return f"Cycler : {display} ({hold_index}/{change_every} Filter:{filter_icons})"
     return f"Cycler : {display} ({hold_index}/{change_every})"
 
 
-def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[str], fallback_all: bool, queue: list[str], hold_index: int, change_every: int, total_matches: int) -> str:
-    status = _get_status(ckpt_name)
-    lines = [f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" else f"Current: {ckpt_name}"]
-    if source == "queue":
-        lines.append("Source: Queue")
-        lines.append(f"Queue Total: {len(queue)}")
-        if queue:
-            lines.append("Queued:")
-            for i, item in enumerate(queue[:8], start=1):
+def _filter_label(active_filter: list[str]) -> str:
+    if not active_filter:
+        return "All"
+    icons = _status_icons_for_filter(active_filter)
+    return icons or "All"
+
+
+def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[str], fallback_all: bool, local_list_remaining: list[str], hold_index: int, change_every: int, total_matches: int, local_list_total: int | None = None) -> str:
+    lines = []
+    if ckpt_name:
+        status = _get_status(ckpt_name)
+        lines.append(f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" else f"Current: {ckpt_name}")
+    else:
+        lines.append("Current: (not executed yet)")
+    if source == "local_list":
+        lines.append("Source: Local List")
+        total = local_list_total if local_list_total is not None else len(local_list_remaining)
+        lines.append(f"Local List Total: {total}")
+        lines.append(f"Local List Remaining: {len(local_list_remaining)}")
+        if local_list_remaining:
+            lines.append("Remaining:")
+            for i, item in enumerate(local_list_remaining[:8], start=1):
                 s = _get_status(item)
                 prefix = STATUS_ICON[s] if s != "none" else "-"
                 lines.append(f"{i}. {prefix} {item}")
+        if active_filter:
+            lines.append(f"Filter: {_filter_label(active_filter)}")
+            lines.append("Note: Local List has priority over Filter.")
     else:
         lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
-        if active_filter:
-            lines.append(f"Filter: {', '.join(active_filter)}")
+        lines.append(f"Filter: {_filter_label(active_filter)}")
         if fallback_all:
             lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
         lines.append(f"Matches: {total_matches}")
         lines.append(f"Hold: {hold_index} / {change_every}")
+        if local_list_remaining:
+            lines.append(f"Local List Pending: {len(local_list_remaining)}")
     return "\n".join(lines)
+
+
+def _build_cycler_pending_status_text(state: dict) -> str:
+    all_checkpoints = _get_checkpoint_list()
+    active_filter = state.get("active_filter", []) or []
+    filtered, fallback_all = _filter_checkpoints(all_checkpoints, active_filter)
+    if not filtered:
+        filtered = all_checkpoints
+    local_list = list(state.get("local_list", []))
+    last_ckpt = state.get("last_ckpt_name", "")
+    hold = int(state.get("last_hold_index") or 0)
+    change_every = int(state.get("last_change_every") or 1)
+    source = "local_list" if local_list else "cycle"
+    if not last_ckpt and filtered:
+        # keep status honest: this is not current output, just a pending preview
+        lines = ["Current: (not executed yet)"]
+        if local_list:
+            lines.append("Source: Local List")
+            lines.append(f"Local List Total: {len(local_list)}")
+            lines.append(f"Local List Remaining: {len(local_list)}")
+            lines.append("Pending:")
+            for i, item in enumerate(local_list[:8], start=1):
+                s = _get_status(item)
+                prefix = STATUS_ICON[s] if s != "none" else "-"
+                lines.append(f"{i}. {prefix} {item}")
+            if active_filter:
+                lines.append(f"Filter: {_filter_label(active_filter)}")
+                lines.append("Note: Local List has priority over Filter.")
+        else:
+            lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
+            lines.append(f"Filter: {_filter_label(active_filter)}")
+            if fallback_all:
+                lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
+            lines.append(f"Matches: {len(filtered)}")
+            lines.append("Note: Filter will apply on next Cycler execution.")
+        return "\n".join(lines)
+    return _build_cycler_status_text(
+        source,
+        last_ckpt,
+        active_filter,
+        fallback_all,
+        local_list,
+        hold if hold else 1,
+        change_every,
+        len(filtered),
+        len(local_list),
+    )
+
+
+def _send_cycler_state_update(node_id: str, state: dict):
+    _send_cycler_update(node_id, "", _build_cycler_pending_status_text(state))
 
 
 class CheckpointListSelector:
@@ -666,7 +744,7 @@ class CheckpointNameCycler:
         state = _get_cycler_state(node_key)
         all_checkpoints = _get_checkpoint_list()
         fallback_all = False
-        active_filter = state.get("active_filter", []) if state.get("accept_filter", True) else []
+        active_filter = state.get("active_filter", []) or []
         filtered, fallback_all = _filter_checkpoints(all_checkpoints, active_filter)
         if not filtered:
             filtered = all_checkpoints
@@ -678,14 +756,17 @@ class CheckpointNameCycler:
         if not filtered:
             return ("", "", "checkpoint")
 
-        queue = state.get("override_queue", []) if state.get("accept_queue", True) else []
+        local_list = state.get("local_list", []) if state.get("use_local_list", True) else []
         source = "cycle"
-        if queue:
-            ckpt_name = queue.pop(0)
-            state["override_queue"] = queue
+        if local_list:
+            ckpt_name = local_list.pop(0)
+            state["local_list"] = local_list
+            # keep older draft key mirrored for compatibility while testing
+            state["override_queue"] = local_list
             hold_index = 1
-            title = _build_cycler_title("queue", ckpt_name, hold_index, int(change_every), active_filter, False, len(queue) + 1)
-            status_text = _build_cycler_status_text("queue", ckpt_name, active_filter, False, queue, hold_index, int(change_every), len(filtered))
+            local_total = len(local_list) + 1
+            title = _build_cycler_title("local_list", ckpt_name, hold_index, int(change_every), active_filter, False, local_total)
+            status_text = _build_cycler_status_text("local_list", ckpt_name, active_filter, False, local_list, hold_index, int(change_every), len(filtered), local_total)
         else:
             index = max(0, min(int(state.get("current_index", 0)), len(filtered) - 1))
             ckpt_name = filtered[index]
@@ -702,7 +783,11 @@ class CheckpointNameCycler:
                 elif mode == "randomize":
                     state["current_index"] = int(time.time_ns()) % len(filtered)
             title = _build_cycler_title(source, ckpt_name, hold_index, int(change_every), active_filter, fallback_all, 0)
-            status_text = _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, int(change_every), len(filtered))
+            status_text = _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, local_list, hold_index, int(change_every), len(filtered), 0)
+        state["last_ckpt_name"] = ckpt_name
+        state["last_title"] = title
+        state["last_hold_index"] = hold_index
+        state["last_change_every"] = int(change_every)
         _send_cycler_update(node_key, title, status_text)
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
@@ -738,29 +823,6 @@ class CheckpointStatusTagger:
             "status": status,
             "title": title,
         })
-        return ()
-
-
-class CheckpointStatusFilter:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {},
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-            },
-        }
-
-    RETURN_TYPES = ()
-    FUNCTION = "noop"
-    CATEGORY = "checkpoint/handpicker"
-    OUTPUT_NODE = True
-
-    @classmethod
-    def IS_CHANGED(cls, unique_id=None):
-        return float("nan")
-
-    def noop(self, unique_id=None):
         return ()
 
 
@@ -896,12 +958,22 @@ async def refresh_all(_request):
 async def tagger_set_status(request):
     data = await request.json()
     relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
-    status = str(data.get("status", "none"))
+    requested = str(data.get("status", "none"))
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+    if requested not in STATUS_VALUES:
+        return web.json_response({"ok": False, "error": "Invalid status."}, status=400)
+
     current = _get_status(relpath)
-    if status == "delete" and current != "none":
-        return web.json_response({"ok": False, "error": "Delete can only be set from none state."}, status=400)
+    if requested == "none":
+        status = "none"
+    elif requested == current:
+        status = "none"  # toggle off
+    elif requested == "delete" and current not in ("none", "delete"):
+        return web.json_response({"ok": False, "error": "Delete is available only from none."}, status=400)
+    else:
+        status = requested
+
     _set_status(relpath, status)
     if status == "delete":
         resolved = _resolve_checkpoint_unique(relpath)
@@ -943,48 +1015,61 @@ async def cycler_set_flags(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
     state = _get_cycler_state(node_id)
-    if "accept_queue" in data:
-        state["accept_queue"] = bool(data.get("accept_queue"))
-    if "accept_filter" in data:
-        state["accept_filter"] = bool(data.get("accept_filter"))
-    return web.json_response({"ok": True, "accept_queue": state["accept_queue"], "accept_filter": state["accept_filter"]})
+    if "use_local_list" in data:
+        state["use_local_list"] = bool(data.get("use_local_list"))
+        state["accept_queue"] = state["use_local_list"]
+    _send_cycler_state_update(node_id, state)
+    return web.json_response({"ok": True, "use_local_list": state["use_local_list"]})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/set_filter")
 async def cycler_set_filter(request):
     data = await request.json()
+    node_id = str(data.get("node_id", ""))
     statuses = [s for s in data.get("statuses", []) if s in STATUS_VALUES]
-    updated = 0
-    with _STATE_LOCK:
-        for node_id, state in _CYCLER_STATES.items():
-            if state.get("accept_filter", True):
-                state["active_filter"] = statuses.copy()
-                updated += 1
-    logger.info("[CheckpointHandpickerSuite] Updated cycler filters: %s", updated)
-    return web.json_response({"ok": True, "updated": updated, "statuses": statuses})
+    state = _get_cycler_state(node_id)
+    state["active_filter"] = statuses.copy()
+    _send_cycler_state_update(node_id, state)
+    logger.info("[CheckpointHandpickerSuite] Updated cycler filter for node %s: %s", node_id, statuses or ["All"])
+    return web.json_response({"ok": True, "node_id": node_id, "statuses": statuses})
 
 
-@routes.post(f"/{EXTENSION_PREFIX}/cycler/queue_append")
-async def cycler_queue_append(request):
+@routes.post(f"/{EXTENSION_PREFIX}/cycler/local_list_append")
+async def cycler_local_list_append(request):
     data = await request.json()
     relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
     updated = 0
     with _STATE_LOCK:
-        for node_id, state in _CYCLER_STATES.items():
-            if state.get("accept_queue", True):
-                state.setdefault("override_queue", []).append(relpath)
-                updated += 1
-    logger.info("[CheckpointHandpickerSuite] Queued checkpoint for %s cycler widgets: %s", updated, relpath)
+        target_states = list(_CYCLER_STATES.items())
+    for node_id, state in target_states:
+        if state.get("use_local_list", True):
+            state.setdefault("local_list", []).append(relpath)
+            state["override_queue"] = state["local_list"]
+            updated += 1
+            _send_cycler_state_update(node_id, state)
+    logger.info("[CheckpointHandpickerSuite] Pushed checkpoint to %s Local List(s): %s", updated, relpath)
     return web.json_response({"ok": True, "updated": updated})
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/cycler/clear_local_list")
+async def cycler_clear_local_list(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    state = _get_cycler_state(node_id)
+    cleared = len(state.get("local_list", []))
+    state["local_list"] = []
+    state["override_queue"] = []
+    _send_cycler_state_update(node_id, state)
+    logger.info("[CheckpointHandpickerSuite] Cleared Local List for node %s: %s item(s)", node_id, cleared)
+    return web.json_response({"ok": True, "cleared": cleared})
 
 
 NODE_CLASS_MAPPINGS = {
     "CheckpointListSelector": CheckpointListSelector,
     "CheckpointNameCycler": CheckpointNameCycler,
     "CheckpointStatusTagger": CheckpointStatusTagger,
-    "CheckpointStatusFilter": CheckpointStatusFilter,
     "EphemeralPreviewTap": EphemeralPreviewTap,
     "EphemeralPreview": EphemeralPreview,
     "ImageDirPreview": ImageDirPreview,
@@ -994,7 +1079,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CheckpointListSelector": "Checkpoint List Selector",
     "CheckpointNameCycler": "Checkpoint Name Cycler",
     "CheckpointStatusTagger": "Checkpoint Status Tagger",
-    "CheckpointStatusFilter": "Checkpoint Status Filter",
     "EphemeralPreviewTap": "Ephemeral Preview Tap",
     "EphemeralPreview": "Ephemeral Preview",
     "ImageDirPreview": "ImageDir Preview",
