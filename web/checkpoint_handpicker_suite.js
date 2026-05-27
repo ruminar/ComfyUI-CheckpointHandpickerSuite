@@ -148,11 +148,11 @@ function hideSelectorWidget(node) {
 function selectorRects(node) {
   const margin = 8;
   return {
-    refreshAll: { x: margin, y: 8, w: 120, h: 24 },
-    listOnly: { x: 134, y: 8, w: 80, h: 24 },
-    pushLocalList: { x: 220, y: 8, w: 172, h: 24 },
-    up: { x: 398, y: 8, w: 34, h: 24 },
-    down: { x: 438, y: 8, w: 34, h: 24 },
+    refreshAll: { x: margin, y: 8, w: 100, h: 24 },
+    listOnly: { x: 114, y: 8, w: 80, h: 24 },
+    pushLocalList: { x: 200, y: 8, w: 132, h: 24 },
+    up: { x: 338, y: 8, w: 34, h: 24 },
+    down: { x: 378, y: 8, w: 34, h: 24 },
     list: { x: margin, y: 86, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
@@ -374,8 +374,8 @@ function currentTaggerPath(node) {
 function taggerButtons(node) {
   return TAGGER_STATUSES.map((status, i) => ({
     status,
-    x: 150 + i * 78,
-    y: 10,
+    x: 120 + i * 78,
+    y: 5,
     w: 72,
     h: 24,
   }));
@@ -477,14 +477,14 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
 // ---------- Cycler ----------
 const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
 function cyclerRects(node) {
-  const filterY = 70;
+  const filterY = 35;
   const filter = [{ status: "all", x: 8, y: filterY, w: 54, h: 24 }];
   CYCLER_FILTER_STATUSES.forEach((status, i) => filter.push({ status, x: 68 + i * 48, y: filterY, w: 42, h: 24 }));
   return {
-    localListToggle: { x: 8, y: 10, w: 132, h: 24 },
-    clearLocalList: { x: 8, y: 40, w: 132, h: 24 },
+    localListToggle: { x: 8, y: 4, w: 122, h: 24 },
+    clearLocalList: { x: 136, y: 4, w: 122, h: 24 },
     filter,
-    statusBox: { x: 8, y: 110, w: node.size[0] - 16, h: Math.max(80, node.size[1] - 118) },
+    statusBox: { x: 8, y: 140, w: node.size[0] - 16, h: Math.max(80, node.size[1] - 150) },
   };
 }
 function cyclerActiveFilter(node) {
