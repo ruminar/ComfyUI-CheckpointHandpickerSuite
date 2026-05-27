@@ -57,6 +57,19 @@ function localPos(node, pos) {
   return [pos[0] - (node.pos?.[0] || 0), pos[1] - (node.pos?.[1] || 0)];
 }
 
+function candidatePositions(node, pos) {
+  if (!pos) return [];
+  // LiteGraph/ComfyUI versions differ here: some callbacks pass node-local
+  // coordinates, others pass graph/canvas coordinates. Test both so custom
+  // drawn controls keep working across frontend versions.
+  const graphToLocal = localPos(node, pos);
+  return [pos, graphToLocal];
+}
+
+function hitAny(node, pos, rect) {
+  return candidatePositions(node, pos).some((p) => hit(p, rect));
+}
+
 // ---------- Preview ----------
 function setupPreviewNode(nodeType) {
   const origCreated = nodeType.prototype.onNodeCreated;
@@ -137,6 +150,8 @@ function selectorRects(node) {
     refreshAll: { x: margin, y: 8, w: 120, h: 24 },
     listOnly: { x: 134, y: 8, w: 80, h: 24 },
     queueToCycler: { x: 220, y: 8, w: 126, h: 24 },
+    up: { x: 352, y: 8, w: 34, h: 24 },
+    down: { x: 392, y: 8, w: 34, h: 24 },
     list: { x: margin, y: 86, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
@@ -199,17 +214,76 @@ async function refreshSelector(node, all = false) {
 async function queueSelectedToCycler(node) {
   const selected = selectorSelected(node);
   if (!selected) return;
-  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/queue_append`, {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/queue_append`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ckpt_name_str: selected }),
   });
+  const result = await response.json();
+  node.__hpsStatus = result.ok ? `Queued to ${result.updated} cycler(s): ${selected}` : (result.error || "Queue failed");
+  app.graph.setDirtyCanvas(true, true);
 }
+function maxSelectorScroll(node) {
+  return Math.max(0, selectorItems(node).length - SELECTOR_VISIBLE_ROWS);
+}
+
+function scrollSelector(node, delta) {
+  node.__hpsScroll = Math.max(0, Math.min(maxSelectorScroll(node), (node.__hpsScroll || 0) + delta));
+  app.graph.setDirtyCanvas(true, true);
+}
+
+function selectorScrollbar(node) {
+  const items = selectorItems(node);
+  if (items.length <= SELECTOR_VISIBLE_ROWS) return null;
+  const r = selectorRects(node).list;
+  const scroll = Math.max(0, Math.min(node.__hpsScroll || 0, maxSelectorScroll(node)));
+  const thumbH = Math.max(24, r.h * (SELECTOR_VISIBLE_ROWS / items.length));
+  const range = Math.max(1, maxSelectorScroll(node));
+  const y = r.y + (r.h - thumbH) * (scroll / range);
+  return {
+    track: { x: r.x + r.w - 16, y: r.y, w: 16, h: r.h },
+    thumb: { x: r.x + r.w - 12, y, w: 8, h: thumbH },
+  };
+}
+
+let selectorWheelCaptureInstalled = false;
+function installSelectorWheelCapture() {
+  if (selectorWheelCaptureInstalled) return;
+  selectorWheelCaptureInstalled = true;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+  canvasEl.addEventListener("wheel", (event) => {
+    const canvas = app.canvas;
+    const graph = app.graph;
+    if (!canvas || !graph) return;
+    let graphPos = null;
+    try {
+      graphPos = canvas.convertEventToCanvasOffset?.(event);
+    } catch {
+      graphPos = null;
+    }
+    if (!graphPos) return;
+    const nodes = [...(graph._nodes || [])].reverse();
+    for (const node of nodes) {
+      if (!(node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS)) continue;
+      if (node.flags?.collapsed) continue;
+      const local = [graphPos[0] - (node.pos?.[0] || 0), graphPos[1] - (node.pos?.[1] || 0)];
+      if (!hit(local, selectorRects(node).list)) continue;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      scrollSelector(node, event.deltaY > 0 ? 3 : -3);
+      return;
+    }
+  }, { passive: false, capture: true });
+}
+
 function setupSelectorNode(nodeType) {
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 560, 520);
+    installSelectorWheelCapture();
     hideSelectorWidget(this);
     this.__hpsItems = [];
     this.__hpsScroll = 0;
@@ -224,6 +298,8 @@ function setupSelectorNode(nodeType) {
     drawButton(ctx, r.refreshAll, "Refresh All", !this.__hpsLoading);
     drawButton(ctx, r.listOnly, "List only", !this.__hpsLoading);
     drawButton(ctx, r.queueToCycler, "Queue to Cycler", !this.__hpsLoading);
+    drawButton(ctx, r.up, "▲", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
+    drawButton(ctx, r.down, "▼", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
     ctx.fillText(this.__hpsStatus || "", 8, 54);
@@ -246,18 +322,27 @@ function setupSelectorNode(nodeType) {
       }
       ctx.fillStyle = "#e6e6e6";
       ctx.font = "12px monospace";
-      ctx.fillText(item.label || item.ckpt_name_str, r.list.x + 8, y + 14);
+      ctx.fillText(item.label || item.ckpt_name_str, r.list.x + 8, y + 14, r.list.w - 24);
+    }
+    const sb = selectorScrollbar(this);
+    if (sb) {
+      ctx.fillStyle = "rgba(220,220,220,0.18)";
+      ctx.fillRect(sb.track.x + 6, sb.track.y, 4, sb.track.h);
+      ctx.fillStyle = "rgba(230,230,230,0.55)";
+      ctx.fillRect(sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h);
     }
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
-    const lp = localPos(this, pos);
     const r = selectorRects(this);
-    if (hit(lp, r.refreshAll)) { refreshSelector(this, true); return true; }
-    if (hit(lp, r.listOnly)) { refreshSelector(this, false); return true; }
-    if (hit(lp, r.queueToCycler)) { queueSelectedToCycler(this); return true; }
-    if (hit(lp, r.list)) {
-      const row = Math.floor((lp[1] - r.list.y) / ROW_H);
+    if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
+    if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
+    if (hitAny(this, pos, r.queueToCycler)) { queueSelectedToCycler(this); return true; }
+    if (hitAny(this, pos, r.up)) { scrollSelector(this, -SELECTOR_VISIBLE_ROWS); return true; }
+    if (hitAny(this, pos, r.down)) { scrollSelector(this, SELECTOR_VISIBLE_ROWS); return true; }
+    const listHitPos = candidatePositions(this, pos).find((p) => hit(p, r.list));
+    if (listHitPos) {
+      const row = Math.floor((listHitPos[1] - r.list.y) / ROW_H);
       const idx = (this.__hpsScroll || 0) + row;
       const item = selectorItems(this)[idx];
       if (item) {
@@ -270,12 +355,10 @@ function setupSelectorNode(nodeType) {
   };
   const origWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (e, pos) {
-    const lp = localPos(this, pos);
     const r = selectorRects(this).list;
-    if (hit(lp, r)) {
+    if (hitAny(this, pos, r)) {
       e?.preventDefault?.(); e?.stopPropagation?.();
-      this.__hpsScroll = Math.max(0, (this.__hpsScroll || 0) + (e.deltaY > 0 ? 3 : -3));
-      app.graph.setDirtyCanvas(true, true);
+      scrollSelector(this, e.deltaY > 0 ? 3 : -3);
       return true;
     }
     return origWheel ? origWheel.apply(this, arguments) : false;
@@ -335,9 +418,8 @@ function setupTaggerNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
-    const lp = localPos(this, pos);
     for (const b of taggerButtons(this)) {
-      if (hit(lp, b)) { setTaggerStatus(this, b.status); return true; }
+      if (hitAny(this, pos, b)) { setTaggerStatus(this, b.status); return true; }
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
@@ -394,9 +476,8 @@ function setupFilterNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
-    const lp = localPos(this, pos);
     for (const b of filterButtons()) {
-      if (hit(lp, b)) {
+      if (hitAny(this, pos, b)) {
         const set = new Set(this.__hpsFilterStatuses || []);
         if (set.has(b.status)) set.delete(b.status); else set.add(b.status);
         this.__hpsFilterStatuses = STATUS_ORDER.filter((x) => set.has(x));
@@ -451,10 +532,9 @@ function setupCyclerNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
-    const lp = localPos(this, pos);
     const r = cyclerRects(this);
-    if (hit(lp, r.queueToggle)) { this.__hpsAcceptQueue = !this.__hpsAcceptQueue; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
-    if (hit(lp, r.filterToggle)) { this.__hpsAcceptFilter = !this.__hpsAcceptFilter; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
+    if (hitAny(this, pos, r.queueToggle)) { this.__hpsAcceptQueue = !this.__hpsAcceptQueue; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
+    if (hitAny(this, pos, r.filterToggle)) { this.__hpsAcceptFilter = !this.__hpsAcceptFilter; pushCyclerFlags(this); app.graph.setDirtyCanvas(true, true); return true; }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 }
