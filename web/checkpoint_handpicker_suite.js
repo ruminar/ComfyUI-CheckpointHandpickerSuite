@@ -26,6 +26,31 @@ function ensureSize(node, w, h) {
   node.size[1] = Math.max(node.size[1], h);
 }
 
+function installMinSize(nodeType, minW, minH) {
+  if (nodeType.prototype.__hpsMinSizeInstalled) return;
+  nodeType.prototype.__hpsMinSizeInstalled = true;
+  const origResize = nodeType.prototype.onResize;
+  nodeType.prototype.onResize = function (size) {
+    if (size) {
+      size[0] = Math.max(size[0], minW);
+      size[1] = Math.max(size[1], minH);
+    }
+    ensureSize(this, minW, minH);
+    return origResize ? origResize.apply(this, arguments) : undefined;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    ensureSize(this, minW, minH);
+    return r;
+  };
+}
+
+function setCanvasCursor(cursor) {
+  const canvasEl = app.canvas?.canvas;
+  if (canvasEl) canvasEl.style.cursor = cursor || "";
+}
+
 function drawRounded(ctx, x, y, w, h, r = 6) {
   ctx.beginPath();
   if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
@@ -71,8 +96,47 @@ function hitAny(node, pos, rect) {
   return candidatePositions(node, pos).some((p) => hit(p, rect));
 }
 
+function graphEventToLocal(node, event) {
+  let graphPos = null;
+  try {
+    graphPos = app.canvas?.convertEventToCanvasOffset?.(event);
+  } catch {
+    graphPos = null;
+  }
+  if (!graphPos) return null;
+  return [graphPos[0] - (node.pos?.[0] || 0), graphPos[1] - (node.pos?.[1] || 0)];
+}
+
+let cursorCaptureInstalled = false;
+function installCursorCapture() {
+  if (cursorCaptureInstalled) return;
+  cursorCaptureInstalled = true;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+  canvasEl.addEventListener("mousemove", (event) => {
+    const graph = app.graph;
+    if (!graph) return;
+    const nodes = [...(graph._nodes || [])].reverse();
+    for (const node of nodes) {
+      if (node.flags?.collapsed) continue;
+      let cursor = "";
+      if (node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS) cursor = selectorCursorAt(node, graphEventToLocal(node, event));
+      else if (node.type === TAGGER_CLASS || node.comfyClass === TAGGER_CLASS) cursor = taggerCursorAt(node, graphEventToLocal(node, event));
+      else if (node.type === CYCLER_CLASS || node.comfyClass === CYCLER_CLASS) cursor = cyclerCursorAt(node, graphEventToLocal(node, event));
+      if (cursor) {
+        setCanvasCursor(cursor);
+        return;
+      }
+    }
+    setCanvasCursor("");
+  });
+  canvasEl.addEventListener("mouseleave", () => setCanvasCursor(""));
+}
+
 // ---------- Preview ----------
 function setupPreviewNode(nodeType) {
+  installMinSize(nodeType, 340, 300);
+  installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -279,7 +343,24 @@ function installSelectorWheelCapture() {
   }, { passive: false, capture: true });
 }
 
+function selectorCursorAt(node, local) {
+  if (!local) return "";
+  const r = selectorRects(node);
+  if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList)) return node.__hpsLoading ? "wait" : "pointer";
+  if ((selectorItems(node).length > SELECTOR_VISIBLE_ROWS) && (hit(local, r.up) || hit(local, r.down))) return "pointer";
+  const sb = selectorScrollbar(node);
+  if (sb && (hit(local, sb.track) || hit(local, sb.thumb))) return "pointer";
+  if (hit(local, r.list)) {
+    const row = Math.floor((local[1] - r.list.y) / ROW_H);
+    const idx = (node.__hpsScroll || 0) + row;
+    return selectorItems(node)[idx] ? "pointer" : "";
+  }
+  return "";
+}
+
 function setupSelectorNode(nodeType) {
+  installMinSize(nodeType, 560, 520);
+  installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -403,7 +484,19 @@ async function setTaggerStatus(node, status) {
   }
   app.graph.setDirtyCanvas(true, true);
 }
+function taggerCursorAt(node, local) {
+  if (!local) return "";
+  for (const b of taggerButtons(node)) {
+    if (!hit(local, b)) continue;
+    if (b.status === "delete" && !taggerDeleteEnabled(node)) return "not-allowed";
+    return "pointer";
+  }
+  return "";
+}
+
 function setupTaggerNode(nodeType) {
+  installMinSize(nodeType, 500, 125);
+  installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -417,13 +510,14 @@ function setupTaggerNode(nodeType) {
     const current = this.__hpsTaggerStatus || "none";
     for (const b of taggerButtons(this)) {
       const enabled = b.status !== "delete" || taggerDeleteEnabled(this);
+      const buttonColor = b.status === "delete" && enabled ? "rgba(105,90,90,0.65)" : null;
       drawButton(
         ctx,
         b,
         `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`,
         enabled,
         current === b.status,
-        null,
+        buttonColor,
         { textColor: enabled ? undefined : "#888" }
       );
     }
@@ -511,11 +605,23 @@ async function clearLocalList(node) {
     body: JSON.stringify({ node_id: node.id }),
   });
 }
+function cyclerCursorAt(node, local) {
+  if (!local) return "";
+  const r = cyclerRects(node);
+  if (hit(local, r.localListToggle) || hit(local, r.clearLocalList)) return "pointer";
+  for (const b of r.filter) {
+    if (hit(local, b)) return "pointer";
+  }
+  return "";
+}
+
 function setupCyclerNode(nodeType) {
+  installMinSize(nodeType, 560, 260);
+  installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 420, 260);
+    ensureSize(this, 560, 260);
     this.__hpsUseLocalList = true;
     this.__hpsFilterStatuses = [];
     setTimeout(() => { pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
@@ -526,7 +632,7 @@ function setupCyclerNode(nodeType) {
     if (origDraw) origDraw.apply(this, arguments);
     const r = cyclerRects(this);
     drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
-    drawButton(ctx, r.clearLocalList, "Clear Local List", true, false, "rgba(105,90,90,0.65)");
+    drawButton(ctx, r.clearLocalList, "Clear Local List", true, false);
     const active = cyclerActiveFilter(this);
     for (const b of r.filter) {
       if (b.status === "all") drawButton(ctx, b, "All", true, active.length === 0);
