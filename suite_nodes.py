@@ -652,7 +652,7 @@ class CheckpointNameCycler:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_TYPES = (_get_checkpoint_list() if _get_checkpoint_list() else [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "cycle"
     CATEGORY = "checkpoint/handpicker"
