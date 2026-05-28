@@ -23,12 +23,16 @@ This is an experimental draft for discussion and testing.
 
 `Sync Checkpoint` does not queue or execute the workflow. It synchronizes the currently selected checkpoint to connected review nodes only.
 
+After sync, the Selector shows a compact one-line message such as `synced : model.safetensors`.
+
 The selector list supports wheel scrolling, up/down buttons, and scrollbar thumb dragging.
 
 ## Local List
 
 `Local List` is a per-Cycler temporary checkpoint list.
 
+- Local List is isolated by browser tab and Cycler node.
+- Push to Local List updates only Cyclers in the current tab.
 - Local List has priority over all normal selection modes, including fixed mode.
 - Local List entries are used as-is and are not affected by Filter.
 - Local List ignores `change_every`.
@@ -90,6 +94,14 @@ Delete is a reservation only. It never deletes checkpoints immediately.
 - `ImageDir Preview` searches output images for the selected checkpoint and shows a contact sheet.
 
 Preview images are normalized to a 512px long edge. Contact sheet packing uses the content area first, then adds gaps during rendering, so the final canvas may slightly exceed the nominal packing area.
+
+## Tab isolation
+
+UI operation events are tab-local. Local List updates, Cycler UI updates, Tagger sync, and preview/progress updates include a tab id and are ignored by other tabs.
+
+Checkpoint statuses are global. When a status changes, all tabs may refresh their own Selector lists, but global notifications do not directly modify arbitrary node titles by node id.
+
+Top-bar locking and localStorage-based queue sharing are intentionally not included in this release.
 
 ## Safety
 

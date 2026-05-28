@@ -843,7 +843,7 @@ class CheckpointNameCycler:
                 "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
             },
             "optional": {
-                "hps_tab_id": ("STRING", {"default": ""}),
+                "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1015,7 +1015,7 @@ class CheckpointStatusTagger:
                 "ckpt_name_str": ("STRING", {"forceInput": True}),
             },
             "optional": {
-                "hps_tab_id": ("STRING", {"default": ""}),
+                "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1051,7 +1051,7 @@ class EphemeralPreview:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",)},
-            "optional": {"hps_tab_id": ("STRING", {"default": ""})},
+            "optional": {"hps_tab_id": ("STRING", {"default": "", "hidden": True})},
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -1084,7 +1084,7 @@ class ImageDirPreview:
             },
             "optional": {
                 "search_directory": ("STRING", {"forceInput": True}),
-                "hps_tab_id": ("STRING", {"default": ""}),
+                "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1206,7 +1206,23 @@ async def review_sync_checkpoint(request):
 
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     tagger_ids = [str(x) for x in data.get("tagger_node_ids", []) if str(x).isdigit()]
-    preview_ids = [str(x) for x in data.get("preview_node_ids", []) if str(x).isdigit()]
+    preview_targets = []
+    raw_preview_targets = data.get("preview_targets")
+    if isinstance(raw_preview_targets, list):
+        for item in raw_preview_targets:
+            if isinstance(item, dict):
+                node_id = str(item.get("node_id", ""))
+                if node_id.isdigit():
+                    preview_targets.append({
+                        "node_id": node_id,
+                        "search_directory": str(item.get("search_directory") or ""),
+                    })
+    if not preview_targets:
+        preview_targets = [
+            {"node_id": str(x), "search_directory": ""}
+            for x in data.get("preview_node_ids", [])
+            if str(x).isdigit()
+        ]
     status = _get_status(relpath)
     title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
     for node_id in tagger_ids:
@@ -1220,8 +1236,10 @@ async def review_sync_checkpoint(request):
         })
 
     preview_count = 0
-    for node_id in preview_ids:
-        sheet, extra = _load_image_dir_preview(node_id, relpath, None, tab_id=tab_id, send_progress=True)
+    for target in preview_targets:
+        node_id = target["node_id"]
+        search_directory = target.get("search_directory") or None
+        sheet, extra = _load_image_dir_preview(node_id, relpath, search_directory, tab_id=tab_id, send_progress=True)
         _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
         preview_count += 1
 

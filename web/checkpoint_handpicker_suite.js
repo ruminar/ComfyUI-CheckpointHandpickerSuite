@@ -41,12 +41,35 @@ function nodeFromEvent(detail, className) {
   return node;
 }
 
-function ensureHiddenTabIdWidget(node) {
-  const w = getWidget(node, "hps_tab_id");
-  if (!w) return;
-  w.value = HPS_TAB_ID;
+function ensureHiddenWidgetValue(node, name, value) {
+  const w = getWidget(node, name);
+  if (!w) return false;
+  w.value = value;
+
+  // Different ComfyUI/LiteGraph builds hide widgets through different flags.
+  // Set all harmless hints, and do it repeatedly from lifecycle hooks so the
+  // value is still serialized but the row does not occupy visible node space.
   w.type = "hidden";
+  w.hidden = true;
+  w.disabled = true;
+  w.options = { ...(w.options || {}), hidden: true };
   w.computeSize = () => [0, -4];
+  w.draw = () => {};
+  return true;
+}
+
+function ensureHiddenTabIdWidget(node) {
+  return ensureHiddenWidgetValue(node, "hps_tab_id", HPS_TAB_ID);
+}
+
+function scheduleHideTabIdWidget(node) {
+  ensureHiddenTabIdWidget(node);
+  setTimeout(() => {
+    if (ensureHiddenTabIdWidget(node)) app.graph?.setDirtyCanvas?.(true, true);
+  }, 0);
+  setTimeout(() => {
+    if (ensureHiddenTabIdWidget(node)) app.graph?.setDirtyCanvas?.(true, true);
+  }, 100);
 }
 
 function installTabIdSupport(nodeType) {
@@ -55,13 +78,19 @@ function installTabIdSupport(nodeType) {
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureHiddenTabIdWidget(this);
+    scheduleHideTabIdWidget(this);
+    return r;
+  };
+  const origAdded = nodeType.prototype.onAdded;
+  nodeType.prototype.onAdded = function () {
+    const r = origAdded ? origAdded.apply(this, arguments) : undefined;
+    scheduleHideTabIdWidget(this);
     return r;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
-    ensureHiddenTabIdWidget(this);
+    scheduleHideTabIdWidget(this);
     return r;
   };
 }
@@ -197,9 +226,11 @@ function setupPreviewNode(nodeType) {
     ensureHiddenTabIdWidget(this);
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
-    const top = 30;
+    const isImageDir = isNodeClass(this, "ImageDirPreview");
+    const top = isImageDir ? 70 : 30;
     const margin = 8;
-    const messageX = Math.min(Math.max(100, margin), Math.max(margin, this.size[0] - 40));
+    const messageX = isImageDir ? Math.min(120, Math.max(margin, this.size[0] - 80)) : margin;
+    const captionY = isImageDir ? 52 : top - 6;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -207,7 +238,7 @@ function setupPreviewNode(nodeType) {
     if (this.__hpsPreviewCaption) {
       ctx.fillStyle = "#ddd";
       ctx.font = "12px sans-serif";
-      ctx.fillText(this.__hpsPreviewCaption, messageX, top - 6, messageW);
+      ctx.fillText(this.__hpsPreviewCaption, messageX, captionY, messageW);
     }
     if (img) {
       let dw = w;
@@ -234,7 +265,8 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   if (detail.title) node.title = detail.title;
   node.__hpsPreviewCaption = detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   if (!detail.image) {
-    node.__hpsPreview = null;
+    // Progress messages should not blank a previously loaded sheet.
+    if (!detail.progress) node.__hpsPreview = null;
     app.graph.setDirtyCanvas(true, true);
     return;
   }
@@ -301,6 +333,30 @@ function getSelectorReviewTargets(node) {
     if (isNodeClass(target, "ImageDirPreview")) previews.push(target);
   }
   return { taggers, previews };
+}
+
+function firstWidgetValue(node) {
+  if (!node?.widgets?.length) return "";
+  const preferred = node.widgets.find((w) => ["text", "string", "value", "search_directory"].includes(w.name));
+  const w = preferred || node.widgets[0];
+  const v = w?.value;
+  return v == null ? "" : String(v);
+}
+
+function linkedInputValue(node, inputName) {
+  const index = node.inputs?.findIndex((i) => i.name === inputName) ?? -1;
+  if (index < 0) return "";
+  const linkId = node.inputs?.[index]?.link;
+  if (linkId == null) return "";
+  const link = app.graph?.links?.[linkId];
+  const source = link ? app.graph?.getNodeById?.(link.origin_id) : null;
+  return firstWidgetValue(source);
+}
+
+function imageDirSearchDirectory(node) {
+  const direct = getWidget(node, "search_directory")?.value;
+  if (direct != null && String(direct).trim()) return String(direct);
+  return linkedInputValue(node, "search_directory");
 }
 
 function selectorActionMode(node) {
@@ -388,6 +444,10 @@ async function syncSelectedCheckpoint(node) {
       ckpt_name_str: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
+      preview_targets: targets.previews.map((n) => ({
+        node_id: n.id,
+        search_directory: imageDirSearchDirectory(n),
+      })),
     })),
   });
   const result = await response.json();
