@@ -227,10 +227,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 100 : 30;
+    const top = isImageDir ? 72 : 30;
     const margin = 8;
-    const messageX = isImageDir ? Math.min(120, Math.max(margin, this.size[0] - 80)) : margin;
-    const captionY = isImageDir ? 82 : top - 6;
+    const messageX = isImageDir ? Math.min(140, Math.max(margin, this.size[0] - 80)) : 100;
+    const captionY = isImageDir ? 36 : 20;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -258,7 +258,9 @@ function setupPreviewNode(nodeType) {
       ctx.drawImage(img, x, y, dw, dh);
     } else {
       ctx.fillStyle = "rgba(255,255,255,0.15)";
-      ctx.fillText(this.__hpsPreviewCaption || "no preview", messageX, top + 16, messageW);
+      //ctx.fillText(this.__hpsPreviewCaption || "no preview", messageX, top + 50, messageW);
+      ctx.fillText(this.__hpsPreviewCaption || "no preview",  this.size[0]/2 -30, this.size[1]/2 +top-50, messageW);
+
     }
     ctx.restore();
   };
