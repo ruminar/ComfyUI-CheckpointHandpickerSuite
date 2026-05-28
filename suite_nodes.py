@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -53,7 +54,8 @@ DELETE_SCRIPT_PATH = Path(folder_paths.get_temp_directory()).resolve() / "delete
 JPEG_QUALITY = 80
 JPEG_OPTIMIZE = False
 GAP = 6
-MAX_IMAGES = 64
+IMAGE_DIR_DEFAULT_MAX_IMAGES = 12
+IMAGE_DIR_MAX_IMAGES = 80
 MAX_LONG_EDGE = 512
 MAX_CONTENT_EDGE = 4096
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
@@ -403,19 +405,35 @@ def _tensor_batch_to_pil(image_tensor) -> list[Image.Image]:
     if image_tensor.ndim == 3:
         image_tensor = image_tensor.unsqueeze(0)
     batch = image_tensor.detach().cpu().numpy()
-    return [_pil_from_array(arr) for arr in batch[:MAX_IMAGES]]
+    # EphemeralPreview is a faithful branch-end preview. Do not silently drop
+    # batch items here; the contact sheet builder will shrink only when needed.
+    return [_pil_from_array(arr) for arr in batch]
 
 
-def _normalize_image_to_tile(img: Image.Image, tile_w: int, tile_h: int) -> Image.Image:
+def _clamp_image_dir_max_images(value) -> int:
+    try:
+        value = int(value)
+    except Exception:
+        value = IMAGE_DIR_DEFAULT_MAX_IMAGES
+    return max(1, min(IMAGE_DIR_MAX_IMAGES, value))
+
+
+def _fit_image_to_tile(img: Image.Image, tile_w: int, tile_h: int, allow_upscale: bool = False) -> Image.Image:
     resampling = getattr(Image, "Resampling", Image).LANCZOS
     w, h = img.size
     scale = min(tile_w / max(1, w), tile_h / max(1, h))
+    if not allow_upscale:
+        scale = min(1.0, scale)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
+    if (new_w, new_h) == (w, h):
+        return img.copy()
     return img.resize((new_w, new_h), resampling)
 
 
-def _reference_tile_size(images: list[Image.Image]) -> tuple[int, int]:
+def _reference_image_size(images: list[Image.Image]) -> tuple[int, int]:
+    if not images:
+        return 512, 512
     ref = images[0]
     w, h = ref.size
     if w <= 0 or h <= 0:
@@ -423,60 +441,86 @@ def _reference_tile_size(images: list[Image.Image]) -> tuple[int, int]:
     ratio = w / h
     if ratio < 0.25 or ratio > 4.0:
         return 512, 512
-    if w >= h:
-        return MAX_LONG_EDGE, max(1, int(round(MAX_LONG_EDGE / ratio)))
-    return max(1, int(round(MAX_LONG_EDGE * ratio))), MAX_LONG_EDGE
+    return int(w), int(h)
 
 
-def _choose_layout(count: int, tile_w: int, tile_h: int) -> SheetLayout:
+def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool = False) -> SheetLayout:
+    """Choose a contact-sheet layout using MAX_CONTENT_EDGE as the image-content limit.
+
+    GAP is intentionally ignored for the fit calculation and added only to the
+    final canvas size. This keeps the 8x10 / 512x384 style overview possible,
+    with the small gap overflow accepted by design.
+    """
+    count = max(1, int(count))
+    ref_w = max(1, int(ref_w))
+    ref_h = max(1, int(ref_h))
+    landscape = ref_w >= ref_h
     best = None
-    max_cols_by_size = max(1, MAX_CONTENT_EDGE // max(1, tile_w))
-    max_rows_by_size = max(1, MAX_CONTENT_EDGE // max(1, tile_h))
-    max_cols_by_count = min(count, max_cols_by_size)
-    for cols in range(1, max_cols_by_count + 1):
+    for cols in range(1, count + 1):
         rows = math.ceil(count / cols)
-        if rows > max_rows_by_size:
+        cells = cols * rows
+        empty = cells - count
+        scale = min(MAX_CONTENT_EDGE / (cols * ref_w), MAX_CONTENT_EDGE / (rows * ref_h))
+        if not allow_upscale:
+            scale = min(1.0, scale)
+        if scale <= 0:
             continue
+        tile_w = max(1, int(ref_w * scale))
+        tile_h = max(1, int(ref_h * scale))
         content_w = cols * tile_w
         content_h = rows * tile_h
-        placed = min(count, cols * rows)
         if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
             continue
-        score = (placed, -abs(content_w - content_h), -cols)
+        canvas_w = content_w + GAP * max(0, cols - 1)
+        canvas_h = content_h + GAP * max(0, rows - 1)
+        # Primary: largest tile scale. Secondary: fewer empty cells.
+        # Tie-breaker: landscape images prefer wider grids, portrait images taller grids.
+        orientation_bonus = 1 if ((cols >= rows) if landscape else (rows >= cols)) else 0
+        score = (
+            round(scale, 8),
+            -empty,
+            orientation_bonus,
+            -abs(content_w - content_h),
+            cols if landscape else rows,
+        )
         if best is None or score > best[0]:
-            canvas_w = content_w + GAP * max(0, cols - 1)
-            canvas_h = content_h + GAP * max(0, rows - 1)
-            best = (score, SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, placed))
+            best = (score, SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, count))
     if best is not None:
         return best[1]
-    cols = max(1, min(count, max_cols_by_size))
-    rows = max(1, min(max_rows_by_size, math.ceil(count / cols)))
-    content_w = cols * tile_w
-    content_h = rows * tile_h
-    return SheetLayout(cols, rows, tile_w, tile_h, content_w + GAP * max(0, cols - 1), content_h + GAP * max(0, rows - 1), min(count, cols * rows))
+    return SheetLayout(1, count, ref_w, ref_h, ref_w, count * ref_h + GAP * max(0, count - 1), count)
 
 
-def _build_contact_sheet(images: list[Image.Image], progress_callback=None) -> tuple[Image.Image | None, dict]:
+def _build_contact_sheet(
+    images: list[Image.Image],
+    progress_callback=None,
+    max_images: int | None = None,
+    allow_upscale: bool = False,
+) -> tuple[Image.Image | None, dict]:
     if not images:
         return None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
-    tile_w, tile_h = _reference_tile_size(images)
-    layout = _choose_layout(min(len(images), MAX_IMAGES), tile_w, tile_h)
+    if max_images is None:
+        limit = len(images)
+    else:
+        limit = max(1, min(int(max_images), len(images)))
+    selected = images[:limit]
+    ref_w, ref_h = _reference_image_size(selected)
+    layout = _choose_layout_fit(len(selected), ref_w, ref_h, allow_upscale=allow_upscale)
     canvas = Image.new("RGB", (layout.canvas_width, layout.canvas_height), (24, 24, 24))
     normalized = []
     total = layout.count
-    for idx, img in enumerate(images[:layout.count], start=1):
+    for idx, img in enumerate(selected[:layout.count], start=1):
         if progress_callback:
             progress_callback(idx - 1, total, f"Building preview sheet {idx}/{total}")
-        normalized.append(_normalize_image_to_tile(img, tile_w, tile_h))
+        normalized.append(_fit_image_to_tile(img, layout.tile_width, layout.tile_height, allow_upscale=allow_upscale))
         if progress_callback:
             progress_callback(idx, total, f"Building preview sheet {idx}/{total}")
     for idx, img in enumerate(normalized):
         row = idx // layout.cols
         col = idx % layout.cols
-        x = col * (tile_w + GAP)
-        y = row * (tile_h + GAP)
-        px = x + (tile_w - img.width) // 2
-        py = y + (tile_h - img.height) // 2
+        x = col * (layout.tile_width + GAP)
+        y = row * (layout.tile_height + GAP)
+        px = x + (layout.tile_width - img.width) // 2
+        py = y + (layout.tile_height - img.height) // 2
         if img.mode == "RGBA":
             canvas.paste(img, (px, py), img)
         else:
@@ -485,13 +529,13 @@ def _build_contact_sheet(images: list[Image.Image], progress_callback=None) -> t
         "count": layout.count,
         "columns": layout.cols,
         "rows": layout.rows,
-        "tile_width": tile_w,
-        "tile_height": tile_h,
+        "tile_width": layout.tile_width,
+        "tile_height": layout.tile_height,
         "gap": GAP,
-        "max_long_edge": MAX_LONG_EDGE,
-        "max_images": MAX_IMAGES,
+        "max_content_edge": MAX_CONTENT_EDGE,
+        "allow_upscale": allow_upscale,
+        "max_images": max_images if max_images is not None else len(images),
     }
-
 
 def _encode_jpeg(image: Image.Image) -> str:
     if image.mode not in ("RGB", "L"):
@@ -577,7 +621,7 @@ def _iter_dirs_newest_first(root: Path):
             continue
 
 
-def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None, progress_callback=None) -> tuple[list[Path], str, str]:
+def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None, max_images: int = IMAGE_DIR_DEFAULT_MAX_IMAGES, progress_callback=None) -> tuple[list[Path], str, str]:
     relpath = _normalize_relpath(ckpt_name_str)
     safe = _ckpt_name_safe_from_relpath(relpath)
     root, mode = _resolve_search_root(search_directory)
@@ -605,18 +649,19 @@ def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None
                     continue
                 found.append(resolved)
                 if progress_callback:
-                    progress_callback(len(found), MAX_IMAGES, f"Found preview images {len(found)}/{MAX_IMAGES}")
-                if len(found) >= MAX_IMAGES:
+                    progress_callback(len(found), max_images, f"Found preview images {len(found)}/{max_images}")
+                if len(found) >= max_images:
                     return found, str(root), mode
         except Exception:
             continue
     return found, str(root), mode
 
 
-def _load_pil_images(paths: list[Path], progress_callback=None) -> list[Image.Image]:
+def _load_pil_images(paths: list[Path], max_images: int | None = None, progress_callback=None) -> list[Image.Image]:
     images: list[Image.Image] = []
-    total = min(len(paths), MAX_IMAGES)
-    for index, path in enumerate(paths[:MAX_IMAGES], start=1):
+    limit = len(paths) if max_images is None else max(1, min(int(max_images), len(paths)))
+    total = limit
+    for index, path in enumerate(paths[:limit], start=1):
         if progress_callback:
             progress_callback(index - 1, total, f"Loading preview images {index}/{total}")
         try:
@@ -629,21 +674,43 @@ def _load_pil_images(paths: list[Path], progress_callback=None) -> list[Image.Im
     return images
 
 
-def _load_image_dir_preview(node_id, ckpt_name_str: str, search_directory: str | None = None, tab_id: str | None = None, send_progress: bool = True) -> tuple[Image.Image | None, dict]:
+def _load_image_dir_preview(
+    node_id,
+    ckpt_name_str: str,
+    search_directory: str | None = None,
+    tab_id: str | None = None,
+    send_progress: bool = True,
+    max_preview_images: int = IMAGE_DIR_DEFAULT_MAX_IMAGES,
+) -> tuple[Image.Image | None, dict]:
     relpath = _normalize_relpath(ckpt_name_str)
+    max_preview_images = _clamp_image_dir_max_images(max_preview_images)
 
     def progress(value: int, total: int, message: str, root: str = ""):
         if send_progress:
             _send_image_dir_progress(node_id, relpath, message, value=value, total=total, tab_id=tab_id, root=root)
 
-    progress(0, MAX_IMAGES, "Searching preview images...")
-    paths, root, mode = _find_preview_images(relpath, search_directory, progress_callback=lambda v, t, m: progress(v, t, m, root=""))
-    progress(len(paths), MAX_IMAGES, f"Found preview images {len(paths)}/{MAX_IMAGES}", root=root)
+    progress(0, max_preview_images, "Searching preview images...")
+    paths, root, mode = _find_preview_images(
+        relpath,
+        search_directory,
+        max_images=max_preview_images,
+        progress_callback=lambda v, t, m: progress(v, t, m, root=""),
+    )
+    progress(len(paths), max_preview_images, f"Found preview images {len(paths)}/{max_preview_images}", root=root)
 
-    pil_images = _load_pil_images(paths, progress_callback=lambda v, t, m: progress(v, t, m, root=root)) if paths else []
+    pil_images = _load_pil_images(
+        paths,
+        max_images=max_preview_images,
+        progress_callback=lambda v, t, m: progress(v, t, m, root=root),
+    ) if paths else []
     if pil_images:
-        sheet, meta = _build_contact_sheet(pil_images, progress_callback=lambda v, t, m: progress(v, t, m, root=root))
-        progress(MAX_IMAGES, MAX_IMAGES, "Encoding preview image...", root=root)
+        sheet, meta = _build_contact_sheet(
+            pil_images,
+            progress_callback=lambda v, t, m: progress(v, t, m, root=root),
+            max_images=max_preview_images,
+            allow_upscale=False,
+        )
+        progress(max_preview_images, max_preview_images, "Encoding preview image...", root=root)
     else:
         sheet, meta = None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
 
@@ -654,11 +721,12 @@ def _load_image_dir_preview(node_id, ckpt_name_str: str, search_directory: str |
         "search_mode": mode,
         "preview_found": bool(paths),
         "preview_count": len(paths),
+        "max_preview_images": max_preview_images,
         "status": "ready" if sheet is not None else "no_preview",
         "message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
         "progress_message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
-        "progress_value": MAX_IMAGES,
-        "progress_total": MAX_IMAGES,
+        "progress_value": max_preview_images,
+        "progress_total": max_preview_images,
     }
     extra.update(meta)
     return sheet, extra
@@ -1156,6 +1224,7 @@ class ImageDirPreview:
             },
             "optional": {
                 "search_directory": ("STRING", {"forceInput": True}),
+                "max_preview_images": ("INT", {"default": IMAGE_DIR_DEFAULT_MAX_IMAGES, "min": 1, "max": IMAGE_DIR_MAX_IMAGES}),
                 "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
             },
             "hidden": {
@@ -1169,12 +1238,12 @@ class ImageDirPreview:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, ckpt_name_str, search_directory=None, hps_tab_id="", unique_id=None):
+    def IS_CHANGED(cls, ckpt_name_str, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def preview(self, ckpt_name_str, search_directory=None, hps_tab_id="", unique_id=None):
+    def preview(self, ckpt_name_str, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
         relpath = _normalize_relpath(ckpt_name_str)
-        sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True)
+        sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True, max_preview_images=max_preview_images)
         _send_preview(unique_id, _image_dir_title(relpath), sheet, extra, tab_id=hps_tab_id)
         return ()
 
@@ -1288,10 +1357,11 @@ async def review_sync_checkpoint(request):
                     preview_targets.append({
                         "node_id": node_id,
                         "search_directory": str(item.get("search_directory") or ""),
+                        "max_preview_images": _clamp_image_dir_max_images(item.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES)),
                     })
     if not preview_targets:
         preview_targets = [
-            {"node_id": str(x), "search_directory": ""}
+            {"node_id": str(x), "search_directory": "", "max_preview_images": IMAGE_DIR_DEFAULT_MAX_IMAGES}
             for x in data.get("preview_node_ids", [])
             if str(x).isdigit()
         ]
@@ -1311,7 +1381,16 @@ async def review_sync_checkpoint(request):
     for target in preview_targets:
         node_id = target["node_id"]
         search_directory = target.get("search_directory") or None
-        sheet, extra = _load_image_dir_preview(node_id, relpath, search_directory, tab_id=tab_id, send_progress=True)
+        max_preview_images = _clamp_image_dir_max_images(target.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES))
+        sheet, extra = await asyncio.to_thread(
+            _load_image_dir_preview,
+            node_id,
+            relpath,
+            search_directory,
+            tab_id,
+            True,
+            max_preview_images,
+        )
         _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
         preview_count += 1
 

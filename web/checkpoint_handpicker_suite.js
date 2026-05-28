@@ -227,10 +227,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 70 : 30;
+    const top = isImageDir ? 100 : 30;
     const margin = 8;
     const messageX = isImageDir ? Math.min(120, Math.max(margin, this.size[0] - 80)) : margin;
-    const captionY = isImageDir ? 52 : top - 6;
+    const captionY = isImageDir ? 82 : top - 6;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -417,6 +417,38 @@ function imageDirSearchDirectory(node) {
   return "";
 }
 
+function clampInt(value, min, max, fallback) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function imageDirMaxPreviewImages(node) {
+  return clampInt(getWidget(node, "max_preview_images")?.value, 1, 80, 12);
+}
+
+function markImageDirPreviewLoading(node, ckptName) {
+  if (!isNodeClass(node, "ImageDirPreview")) return;
+  const maxPreviewImages = imageDirMaxPreviewImages(node);
+  const message = "Searching preview images...";
+  node.__hpsPreviewState = {
+    ...(node.__hpsPreviewState || {}),
+    node_class: "ImageDirPreview",
+    ckpt_name_str: ckptName,
+    status: "loading",
+    message,
+    progress_message: message,
+    progress_value: 0,
+    progress_total: maxPreviewImages,
+    max_preview_images: maxPreviewImages,
+  };
+  node.__hpsPreviewCaption = message;
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 function selectorActionMode(node) {
   const targets = getSelectorReviewTargets(node);
   return (targets.taggers.length || targets.previews.length) ? "sync" : "push";
@@ -495,6 +527,13 @@ async function syncSelectedCheckpoint(node) {
   const selected = selectorSelected(node);
   if (!selected) return;
   const targets = getSelectorReviewTargets(node);
+  for (const preview of targets.previews) {
+    markImageDirPreviewLoading(preview, selected);
+  }
+  if (targets.previews.length) {
+    app.graph.setDirtyCanvas(true, true);
+    await nextAnimationFrame();
+  }
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/review/sync_checkpoint`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -508,6 +547,7 @@ async function syncSelectedCheckpoint(node) {
         return {
           node_id: n.id,
           search_directory: searchDirectory,
+          max_preview_images: imageDirMaxPreviewImages(n),
         };
       }),
     })),

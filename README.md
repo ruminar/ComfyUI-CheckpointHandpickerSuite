@@ -90,10 +90,17 @@ Delete is a reservation only. It never deletes checkpoints immediately.
 
 ## Preview
 
-- `Ephemeral Preview` shows a lightweight in-workflow contact sheet.
+- `Ephemeral Preview` shows all images from the incoming `IMAGE` batch. It does not drop batch items.
 - `ImageDir Preview` searches output images for the selected checkpoint and shows a contact sheet.
 
-Preview images are normalized to a 512px long edge. Contact sheet packing uses the content area first, then adds gaps during rendering, so the final canvas may slightly exceed the nominal packing area.
+`ImageDir Preview` has `max_preview_images`:
+
+- default: `12`
+- range: `1..80`
+
+Smaller values are recommended for review and tagging because each image remains easier to inspect. Larger values are useful for overview.
+
+Preview contact sheets do not upscale images. If the sheet fits within the 4096px content limit, images stay at their original size. If the sheet would be too large, images are scaled down. Contact sheet packing uses the content area first, then adds gaps during rendering, so the final canvas may slightly exceed the nominal packing area.
 
 ## Tab isolation
 
