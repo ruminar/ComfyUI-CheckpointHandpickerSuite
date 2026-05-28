@@ -236,7 +236,13 @@ function setupPreviewNode(nodeType) {
     const h = Math.max(1, this.size[1] - top - margin);
     ctx.save();
     if (this.__hpsPreviewCaption) {
-      ctx.fillStyle = "#ddd";
+      const st = this.__hpsPreviewState || {};
+      const isWarning = st.status && !["ready", "loading"].includes(st.status);
+      if (isImageDir) {
+        ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.18)";
+        ctx.fillRect(messageX - 4, captionY - 13, messageW + 4, 18);
+      }
+      ctx.fillStyle = isWarning ? "#FFD28A" : "#ddd";
       ctx.font = "12px sans-serif";
       ctx.fillText(this.__hpsPreviewCaption, messageX, captionY, messageW);
     }
@@ -262,8 +268,11 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   if (!isForThisTab(detail)) return;
   const node = app.graph?.getNodeById(Number(detail?.node));
   if (!node || !PREVIEW_CLASSES.has(node.type || node.comfyClass)) return;
+  if (detail.node_class && !isNodeClass(node, detail.node_class)) return;
   if (detail.title) node.title = detail.title;
-  node.__hpsPreviewCaption = detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
+  node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), ...detail };
+  const caption = detail.progress_message || detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
+  node.__hpsPreviewCaption = caption;
   if (!detail.image) {
     // Progress messages should not blank a previously loaded sheet.
     if (!detail.progress) node.__hpsPreview = null;
@@ -273,7 +282,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const img = new Image();
   img.onload = () => {
     node.__hpsPreview = img;
-    node.__hpsPreviewCaption = detail.message || node.__hpsPreviewCaption;
+    node.__hpsPreviewCaption = detail.progress_message || detail.message || node.__hpsPreviewCaption;
     app.graph.setDirtyCanvas(true, true);
   };
   img.src = `data:image/${detail.format};base64,${detail.image}`;
@@ -335,28 +344,77 @@ function getSelectorReviewTargets(node) {
   return { taggers, previews };
 }
 
-function firstWidgetValue(node) {
-  if (!node?.widgets?.length) return "";
-  const preferred = node.widgets.find((w) => ["text", "string", "value", "search_directory"].includes(w.name));
-  const w = preferred || node.widgets[0];
-  const v = w?.value;
-  return v == null ? "" : String(v);
+function stringValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
 }
 
-function linkedInputValue(node, inputName) {
+function firstWidgetValue(node, preferredSlot = null, seen = new Set()) {
+  if (!node || seen.has(node.id)) return "";
+  seen.add(node.id);
+
+  const widgets = node.widgets || [];
+  const preferredNames = new Set(["text", "string", "value", "search_directory", "directory", "path"]);
+
+  if (preferredSlot != null && widgets[preferredSlot]) {
+    const v = stringValue(widgets[preferredSlot].value).trim();
+    if (v) return v;
+  }
+
+  for (const w of widgets) {
+    const name = String(w?.name || "").toLowerCase();
+    if (name === "hps_tab_id" || w?.hidden) continue;
+    if (!preferredNames.has(name)) continue;
+    const v = stringValue(w.value).trim();
+    if (v) return v;
+  }
+
+  for (const w of widgets) {
+    const name = String(w?.name || "").toLowerCase();
+    if (name === "hps_tab_id" || w?.hidden) continue;
+    const v = stringValue(w.value).trim();
+    if (v) return v;
+  }
+
+  for (const v of node.widgets_values || []) {
+    const s = stringValue(v).trim();
+    if (s) return s;
+  }
+
+  const props = node.properties || {};
+  for (const key of ["value", "text", "string", "search_directory", "directory", "path"]) {
+    const s = stringValue(props[key]).trim();
+    if (s) return s;
+  }
+
+  // Reroute-like nodes usually forward their first input. Follow one hop chain.
+  const type = String(node.type || node.comfyClass || "").toLowerCase();
+  if (type.includes("reroute") || type.includes("relay")) {
+    return linkedInputValue(node, node.inputs?.[0]?.name || "", seen);
+  }
+
+  return "";
+}
+
+function linkedInputValue(node, inputName, seen = new Set()) {
   const index = node.inputs?.findIndex((i) => i.name === inputName) ?? -1;
   if (index < 0) return "";
   const linkId = node.inputs?.[index]?.link;
   if (linkId == null) return "";
   const link = app.graph?.links?.[linkId];
   const source = link ? app.graph?.getNodeById?.(link.origin_id) : null;
-  return firstWidgetValue(source);
+  if (!source) return "";
+  return firstWidgetValue(source, link?.origin_slot, seen);
 }
 
 function imageDirSearchDirectory(node) {
-  const direct = getWidget(node, "search_directory")?.value;
-  if (direct != null && String(direct).trim()) return String(direct);
-  return linkedInputValue(node, "search_directory");
+  const direct = stringValue(getWidget(node, "search_directory")?.value).trim();
+  if (direct) return direct;
+  const linked = linkedInputValue(node, "search_directory").trim();
+  if (linked) return linked;
+  return "";
 }
 
 function selectorActionMode(node) {
@@ -444,10 +502,14 @@ async function syncSelectedCheckpoint(node) {
       ckpt_name_str: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
-      preview_targets: targets.previews.map((n) => ({
-        node_id: n.id,
-        search_directory: imageDirSearchDirectory(n),
-      })),
+      preview_targets: targets.previews.map((n) => {
+        const searchDirectory = imageDirSearchDirectory(n);
+        console.debug("[CheckpointHandpickerSuite] ImageDirPreview search_directory", n.id, searchDirectory);
+        return {
+          node_id: n.id,
+          search_directory: searchDirectory,
+        };
+      }),
     })),
   });
   const result = await response.json();

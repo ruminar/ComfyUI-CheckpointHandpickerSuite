@@ -456,13 +456,20 @@ def _choose_layout(count: int, tile_w: int, tile_h: int) -> SheetLayout:
     return SheetLayout(cols, rows, tile_w, tile_h, content_w + GAP * max(0, cols - 1), content_h + GAP * max(0, rows - 1), min(count, cols * rows))
 
 
-def _build_contact_sheet(images: list[Image.Image]) -> tuple[Image.Image | None, dict]:
+def _build_contact_sheet(images: list[Image.Image], progress_callback=None) -> tuple[Image.Image | None, dict]:
     if not images:
         return None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
     tile_w, tile_h = _reference_tile_size(images)
     layout = _choose_layout(min(len(images), MAX_IMAGES), tile_w, tile_h)
     canvas = Image.new("RGB", (layout.canvas_width, layout.canvas_height), (24, 24, 24))
-    normalized = [_normalize_image_to_tile(img, tile_w, tile_h) for img in images[:layout.count]]
+    normalized = []
+    total = layout.count
+    for idx, img in enumerate(images[:layout.count], start=1):
+        if progress_callback:
+            progress_callback(idx - 1, total, f"Building preview sheet {idx}/{total}")
+        normalized.append(_normalize_image_to_tile(img, tile_w, tile_h))
+        if progress_callback:
+            progress_callback(idx, total, f"Building preview sheet {idx}/{total}")
     for idx, img in enumerate(normalized):
         row = idx // layout.cols
         col = idx % layout.cols
@@ -519,7 +526,9 @@ def _image_dir_title(relpath: str) -> str:
     return f"ImageDir : {STATUS_ICON[status]} {relpath}" if status != "none" else f"ImageDir : {relpath}"
 
 
-def _send_image_dir_progress(node_id, relpath: str, message: str, tab_id: str | None = None, root: str = ""):
+def _send_image_dir_progress(node_id, relpath: str, message: str, value: int = 0, total: int = 0, tab_id: str | None = None, root: str = ""):
+    # Keep both the old CheckpointCleanupReview field names and the newer
+    # ImageDirPreview caption field. Some frontend builds draw one or the other.
     _send_preview(
         node_id,
         _image_dir_title(relpath),
@@ -528,68 +537,131 @@ def _send_image_dir_progress(node_id, relpath: str, message: str, tab_id: str | 
             "node_class": "ImageDirPreview",
             "ckpt_name_str": relpath,
             "search_directory": root,
+            "status": "loading",
             "message": message,
+            "progress_message": message,
+            "progress_value": value,
+            "progress_total": total,
             "progress": True,
         },
         tab_id=tab_id,
     )
 
 
-def _load_image_dir_preview(node_id, ckpt_name_str: str, search_directory: str | None = None, tab_id: str | None = None, send_progress: bool = True) -> tuple[Image.Image | None, dict]:
+def _resolve_search_root(search_directory: str | None) -> tuple[Path, str]:
+    if search_directory is None:
+        return Path(folder_paths.get_output_directory()).resolve(), "default_output"
+    value = str(search_directory).strip()
+    if not value:
+        return Path(folder_paths.get_output_directory()).resolve(), "default_output"
+    try:
+        candidate = Path(value).expanduser().resolve()
+        if candidate.exists() and candidate.is_dir():
+            return candidate, "custom"
+        return Path(folder_paths.get_output_directory()).resolve(), "invalid_fallback_output"
+    except Exception:
+        return Path(folder_paths.get_output_directory()).resolve(), "invalid_fallback_output"
+
+
+def _iter_dirs_newest_first(root: Path):
+    root = root.resolve()
+    queue = [root]
+    while queue:
+        current = queue.pop(0)
+        yield current
+        try:
+            children = [p for p in current.iterdir() if p.is_dir()]
+            children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            queue[0:0] = children
+        except Exception:
+            continue
+
+
+def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None, progress_callback=None) -> tuple[list[Path], str, str]:
     relpath = _normalize_relpath(ckpt_name_str)
-    title = _image_dir_title(relpath)
-    if send_progress:
-        _send_image_dir_progress(node_id, relpath, f"searching : {relpath}", tab_id=tab_id)
-    paths, root = _find_preview_images(relpath, search_directory)
-    if send_progress:
-        _send_image_dir_progress(node_id, relpath, f"found : {len(paths[:MAX_IMAGES])} image(s)", tab_id=tab_id, root=root)
-    pil_images = []
+    safe = _ckpt_name_safe_from_relpath(relpath)
+    root, mode = _resolve_search_root(search_directory)
+    found: list[Path] = []
+    if not root.exists() or not root.is_dir():
+        return found, str(root), "missing_search_root"
+
+    safe_lower = safe.lower()
+    for directory in _iter_dirs_newest_first(root):
+        try:
+            files = [
+                p for p in directory.iterdir()
+                if p.is_file()
+                and p.suffix.lower() in ALLOWED_IMAGE_SUFFIXES
+                and safe_lower in p.stem.lower()
+            ]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for file in files:
+                resolved = file.resolve()
+                # A symlink should not escape the selected preview root.
+                try:
+                    if resolved != root and root not in resolved.parents:
+                        continue
+                except Exception:
+                    continue
+                found.append(resolved)
+                if progress_callback:
+                    progress_callback(len(found), MAX_IMAGES, f"Found preview images {len(found)}/{MAX_IMAGES}")
+                if len(found) >= MAX_IMAGES:
+                    return found, str(root), mode
+        except Exception:
+            continue
+    return found, str(root), mode
+
+
+def _load_pil_images(paths: list[Path], progress_callback=None) -> list[Image.Image]:
+    images: list[Image.Image] = []
     total = min(len(paths), MAX_IMAGES)
     for index, path in enumerate(paths[:MAX_IMAGES], start=1):
-        if send_progress:
-            _send_image_dir_progress(node_id, relpath, f"loading : {index}/{total}", tab_id=tab_id, root=root)
+        if progress_callback:
+            progress_callback(index - 1, total, f"Loading preview images {index}/{total}")
         try:
-            pil_images.append(Image.open(path).convert("RGB"))
+            with Image.open(path) as img:
+                images.append(img.convert("RGB"))
         except Exception:
             logger.exception("Failed to open preview image: %s", path)
-    if send_progress:
-        _send_image_dir_progress(node_id, relpath, "building preview sheet", tab_id=tab_id, root=root)
-    sheet, meta = _build_contact_sheet(pil_images)
+        if progress_callback:
+            progress_callback(index, total, f"Loading preview images {index}/{total}")
+    return images
+
+
+def _load_image_dir_preview(node_id, ckpt_name_str: str, search_directory: str | None = None, tab_id: str | None = None, send_progress: bool = True) -> tuple[Image.Image | None, dict]:
+    relpath = _normalize_relpath(ckpt_name_str)
+
+    def progress(value: int, total: int, message: str, root: str = ""):
+        if send_progress:
+            _send_image_dir_progress(node_id, relpath, message, value=value, total=total, tab_id=tab_id, root=root)
+
+    progress(0, MAX_IMAGES, "Searching preview images...")
+    paths, root, mode = _find_preview_images(relpath, search_directory, progress_callback=lambda v, t, m: progress(v, t, m, root=""))
+    progress(len(paths), MAX_IMAGES, f"Found preview images {len(paths)}/{MAX_IMAGES}", root=root)
+
+    pil_images = _load_pil_images(paths, progress_callback=lambda v, t, m: progress(v, t, m, root=root)) if paths else []
+    if pil_images:
+        sheet, meta = _build_contact_sheet(pil_images, progress_callback=lambda v, t, m: progress(v, t, m, root=root))
+        progress(MAX_IMAGES, MAX_IMAGES, "Encoding preview image...", root=root)
+    else:
+        sheet, meta = None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
+
     extra = {
         "node_class": "ImageDirPreview",
         "ckpt_name_str": relpath,
         "search_directory": root,
+        "search_mode": mode,
         "preview_found": bool(paths),
-        "message": "preview ready" if sheet is not None else f"no preview : {relpath}",
+        "preview_count": len(paths),
+        "status": "ready" if sheet is not None else "no_preview",
+        "message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
+        "progress_message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
+        "progress_value": MAX_IMAGES,
+        "progress_total": MAX_IMAGES,
     }
     extra.update(meta)
     return sheet, extra
-
-
-def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None) -> tuple[list[Path], str]:
-    relpath = _normalize_relpath(ckpt_name_str)
-    safe = _ckpt_name_safe_from_relpath(relpath)
-    roots = []
-    if search_directory and str(search_directory).strip():
-        roots.append(Path(str(search_directory)).expanduser().resolve())
-    else:
-        roots.append(Path(folder_paths.get_output_directory()).resolve())
-    found: list[Path] = []
-    for root in roots:
-        if not root.exists() or not root.is_dir():
-            continue
-        for path in sorted(root.rglob("*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
-            if len(found) >= MAX_IMAGES:
-                break
-            if not path.is_file() or path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
-                continue
-            name = path.stem.lower()
-            if safe.lower() in name:
-                found.append(path)
-        if found:
-            return found, str(root)
-    return found, str(roots[0]) if roots else ""
-
 
 def _send_cycler_update(node_id: str | None, title: str, status_text: str, tab_id: str | None = None):
     payload = {
