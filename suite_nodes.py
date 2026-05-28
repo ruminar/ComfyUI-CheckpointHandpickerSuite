@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import math
+import random
 import re
 import threading
 import time
@@ -545,9 +546,13 @@ def _get_cycler_state(node_key: str) -> dict:
                 "cycle_count": 0,
                 "last_checkpoint_hash": "",
                 "last_ckpt_name": "",
+                "last_normal_ckpt_name": "",
                 "last_title": "",
                 "last_hold_index": 0,
                 "last_change_every": 1,
+                "last_mode": "increment",
+                "last_all_checkpoint_hash": "",
+                "shuffle_deck": [],
                 # compatibility with older draft state/routes
                 "accept_queue": True,
                 "override_queue": [],
@@ -561,6 +566,14 @@ def _get_cycler_state(node_key: str) -> dict:
             state["local_list"] = list(state.get("override_queue", []))
         if "active_filter" not in state:
             state["active_filter"] = []
+        if "shuffle_deck" not in state:
+            state["shuffle_deck"] = []
+        if "last_mode" not in state:
+            state["last_mode"] = "increment"
+        if "last_all_checkpoint_hash" not in state:
+            state["last_all_checkpoint_hash"] = ""
+        if "last_normal_ckpt_name" not in state:
+            state["last_normal_ckpt_name"] = state.get("last_ckpt_name", "")
         return state
 
 def _checkpoint_hash(names: Iterable[str]) -> str:
@@ -577,6 +590,24 @@ def _filter_checkpoints(checkpoints: list[str], statuses: list[str]) -> tuple[li
     if not filtered:
         return checkpoints, True
     return filtered, False
+
+
+def _active_filter_values(statuses: list[str] | None) -> list[str]:
+    return [s for s in (statuses or []) if s in STATUS_VALUES]
+
+
+def _filter_match_count(checkpoints: list[str], statuses: list[str] | None) -> int:
+    active = _active_filter_values(statuses)
+    if not active:
+        return len(checkpoints)
+    return sum(1 for ckpt in checkpoints if _get_status(ckpt) in active)
+
+
+def _matches_filter(ckpt_name: str, statuses: list[str] | None, fallback_all: bool = False) -> bool:
+    active = _active_filter_values(statuses)
+    if fallback_all or not active:
+        return True
+    return _get_status(ckpt_name) in active
 
 
 def _find_start_index(checkpoints: list[str], start_checkpoint: str) -> int:
@@ -605,7 +636,7 @@ def _filter_label(active_filter: list[str]) -> str:
     return icons or "All"
 
 
-def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[str], fallback_all: bool, local_list_remaining: list[str], hold_index: int, change_every: int, total_matches: int, local_list_total: int | None = None) -> str:
+def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[str], fallback_all: bool, local_list_remaining: list[str], hold_index: int, change_every: int, total_matches: int, local_list_total: int | None = None, mode: str = "") -> str:
     lines = []
     if ckpt_name:
         status = _get_status(ckpt_name)
@@ -623,15 +654,24 @@ def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[s
                 s = _get_status(item)
                 prefix = STATUS_ICON[s] if s != "none" else "-"
                 lines.append(f"{i}. {prefix} {item}")
+            if len(local_list_remaining) > 8:
+                lines.append(f"+{len(local_list_remaining) - 8} more")
         if active_filter:
             lines.append(f"Filter: {_filter_label(active_filter)}")
             lines.append("Note: Local List has priority over Filter.")
     else:
-        lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
-        lines.append(f"Filter: {_filter_label(active_filter)}")
-        if fallback_all:
-            lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
-        lines.append(f"Matches: {total_matches}")
+        if mode == "fixed":
+            lines.append("Source: Fixed")
+            if active_filter:
+                lines.append(f"Filter: {_filter_label(active_filter)}")
+                lines.append("Note: Filter is ignored in fixed mode.")
+        else:
+            lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
+            lines.append(f"Filter: {_filter_label(active_filter)}")
+            if fallback_all:
+                lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
+            lines.append(f"Matches: {total_matches}")
+        lines.append(f"Mode: {mode or 'increment'}")
         lines.append(f"Hold: {hold_index} / {change_every}")
         if local_list_remaining:
             lines.append(f"Local List Pending: {len(local_list_remaining)}")
@@ -641,16 +681,15 @@ def _build_cycler_status_text(source: str, ckpt_name: str, active_filter: list[s
 def _build_cycler_pending_status_text(state: dict) -> str:
     all_checkpoints = _get_checkpoint_list()
     active_filter = state.get("active_filter", []) or []
-    filtered, fallback_all = _filter_checkpoints(all_checkpoints, active_filter)
-    if not filtered:
-        filtered = all_checkpoints
+    match_count = _filter_match_count(all_checkpoints, active_filter)
+    fallback_all = bool(active_filter) and match_count == 0
     local_list = list(state.get("local_list", []))
     last_ckpt = state.get("last_ckpt_name", "")
     hold = int(state.get("last_hold_index") or 0)
     change_every = int(state.get("last_change_every") or 1)
+    mode = state.get("last_mode", "increment")
     source = "local_list" if local_list else "cycle"
-    if not last_ckpt and filtered:
-        # keep status honest: this is not current output, just a pending preview
+    if not last_ckpt:
         lines = ["Current: (not executed yet)"]
         if local_list:
             lines.append("Source: Local List")
@@ -661,15 +700,23 @@ def _build_cycler_pending_status_text(state: dict) -> str:
                 s = _get_status(item)
                 prefix = STATUS_ICON[s] if s != "none" else "-"
                 lines.append(f"{i}. {prefix} {item}")
+            if len(local_list) > 8:
+                lines.append(f"+{len(local_list) - 8} more")
             if active_filter:
                 lines.append(f"Filter: {_filter_label(active_filter)}")
                 lines.append("Note: Local List has priority over Filter.")
         else:
-            lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
-            lines.append(f"Filter: {_filter_label(active_filter)}")
-            if fallback_all:
-                lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
-            lines.append(f"Matches: {len(filtered)}")
+            if mode == "fixed":
+                lines.append("Source: Fixed")
+                if active_filter:
+                    lines.append(f"Filter: {_filter_label(active_filter)}")
+                    lines.append("Note: Filter is ignored in fixed mode.")
+            else:
+                lines.append("Source: Normal Cycle" if not active_filter else "Source: Status Filter")
+                lines.append(f"Filter: {_filter_label(active_filter)}")
+                if fallback_all:
+                    lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
+                lines.append(f"Matches: {match_count}")
             lines.append("Note: Filter will apply on next Cycler execution.")
         return "\n".join(lines)
     return _build_cycler_status_text(
@@ -680,8 +727,9 @@ def _build_cycler_pending_status_text(state: dict) -> str:
         local_list,
         hold if hold else 1,
         change_every,
-        len(filtered),
+        match_count,
         len(local_list),
+        mode,
     )
 
 
@@ -722,7 +770,7 @@ class CheckpointNameCycler:
         return {
             "required": {
                 "start_checkpoint": (checkpoints if checkpoints else [""],),
-                "mode": (["fixed", "increment", "randomize"], {"default": "increment"}),
+                "mode": (["fixed", "increment", "randomize", "shuffle_once"], {"default": "increment"}),
                 "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
             },
             "hidden": {
@@ -743,51 +791,144 @@ class CheckpointNameCycler:
         node_key = str(unique_id) if unique_id is not None else "__default__"
         state = _get_cycler_state(node_key)
         all_checkpoints = _get_checkpoint_list()
-        fallback_all = False
-        active_filter = state.get("active_filter", []) or []
-        filtered, fallback_all = _filter_checkpoints(all_checkpoints, active_filter)
-        if not filtered:
-            filtered = all_checkpoints
-        checkpoint_hash = _checkpoint_hash(filtered)
-        if state.get("last_checkpoint_hash") != checkpoint_hash:
-            state["current_index"] = _find_start_index(filtered, start_checkpoint)
-            state["repeat_count"] = 0
-            state["last_checkpoint_hash"] = checkpoint_hash
-        if not filtered:
+        if not all_checkpoints:
             return ("", "", "checkpoint")
 
-        local_list = state.get("local_list", []) if state.get("use_local_list", True) else []
-        source = "cycle"
-        if local_list:
-            ckpt_name = local_list.pop(0)
+        mode = mode if mode in ("fixed", "increment", "randomize", "shuffle_once") else "increment"
+        change_every = max(1, int(change_every or 1))
+        active_filter = _active_filter_values(state.get("active_filter", []) or [])
+        match_count = _filter_match_count(all_checkpoints, active_filter)
+        fallback_all = bool(active_filter) and match_count == 0
+        all_set = set(all_checkpoints)
+
+        all_hash = _checkpoint_hash(all_checkpoints)
+        if state.get("last_all_checkpoint_hash") != all_hash:
+            state["last_all_checkpoint_hash"] = all_hash
+            state["current_index"] = max(0, min(int(state.get("current_index", 0)), len(all_checkpoints) - 1))
+            state["shuffle_deck"] = [ckpt for ckpt in state.get("shuffle_deck", []) if ckpt in all_set]
+            if state.get("last_normal_ckpt_name") not in all_set:
+                state["last_normal_ckpt_name"] = ""
+                state["repeat_count"] = 0
+
+        # Local List is an isolated manual lane:
+        # one entry per execution, no filter, no change_every, no normal index/deck progress.
+        local_list = list(state.get("local_list", [])) if state.get("use_local_list", True) else []
+        selected_from_local = None
+        skipped_local = 0
+        while local_list:
+            candidate = _normalize_relpath(local_list.pop(0))
+            if candidate in all_set:
+                selected_from_local = candidate
+                break
+            skipped_local += 1
+        if selected_from_local:
             state["local_list"] = local_list
-            # keep older draft key mirrored for compatibility while testing
             state["override_queue"] = local_list
+            ckpt_name = selected_from_local
             hold_index = 1
             local_total = len(local_list) + 1
-            title = _build_cycler_title("local_list", ckpt_name, hold_index, int(change_every), active_filter, False, local_total)
-            status_text = _build_cycler_status_text("local_list", ckpt_name, active_filter, False, local_list, hold_index, int(change_every), len(filtered), local_total)
+            title = _build_cycler_title("local_list", ckpt_name, hold_index, 1, active_filter, False, local_total)
+            status_text = _build_cycler_status_text("local_list", ckpt_name, active_filter, False, local_list, hold_index, 1, match_count, local_total, mode)
+            if skipped_local:
+                status_text += f"\nSkipped missing Local List item(s): {skipped_local}"
+            state["last_ckpt_name"] = ckpt_name
+            state["last_title"] = title
+            state["last_hold_index"] = hold_index
+            state["last_change_every"] = change_every
+            state["last_mode"] = mode
+            _send_cycler_update(node_key, title, status_text)
+            return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
+        elif skipped_local:
+            state["local_list"] = []
+            state["override_queue"] = []
+
+        def is_match(ckpt: str) -> bool:
+            return _matches_filter(ckpt, active_filter, fallback_all)
+
+        def find_next_increment(start_idx: int) -> tuple[str, int]:
+            start_idx = max(0, min(int(start_idx), len(all_checkpoints) - 1))
+            for offset in range(len(all_checkpoints)):
+                idx = (start_idx + offset) % len(all_checkpoints)
+                ckpt = all_checkpoints[idx]
+                if is_match(ckpt):
+                    return ckpt, idx
+            return all_checkpoints[start_idx], start_idx
+
+        def filtered_candidates() -> list[str]:
+            if fallback_all or not active_filter:
+                return all_checkpoints
+            return [ckpt for ckpt in all_checkpoints if _get_status(ckpt) in active_filter]
+
+        def draw_from_shuffle_deck() -> str:
+            deck = [ckpt for ckpt in state.get("shuffle_deck", []) if ckpt in all_set]
+            while True:
+                if not deck:
+                    deck = list(all_checkpoints)
+                    random.shuffle(deck)
+                candidate = deck.pop(0)
+                # In shuffle_once, skipped non-matching cards are consumed too.
+                if is_match(candidate):
+                    state["shuffle_deck"] = deck
+                    return candidate
+
+        last_ckpt = state.get("last_normal_ckpt_name", "")
+        repeat_count = int(state.get("repeat_count", 0))
+        can_hold_last = (
+            repeat_count > 0
+            and repeat_count < change_every
+            and last_ckpt in all_set
+            and (mode == "fixed" or is_match(last_ckpt))
+        )
+
+        new_selection = False
+        if can_hold_last:
+            ckpt_name = last_ckpt
+            try:
+                selected_index = all_checkpoints.index(ckpt_name)
+            except ValueError:
+                selected_index = 0
         else:
-            index = max(0, min(int(state.get("current_index", 0)), len(filtered) - 1))
-            ckpt_name = filtered[index]
-            state["repeat_count"] = int(state.get("repeat_count", 0)) + 1
-            hold_index = state["repeat_count"]
-            if hold_index >= int(change_every):
-                state["repeat_count"] = 0
-                if mode == "increment":
-                    next_index = index + 1
-                    if next_index >= len(filtered):
-                        next_index = 0
-                        state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
-                    state["current_index"] = next_index
-                elif mode == "randomize":
-                    state["current_index"] = int(time.time_ns()) % len(filtered)
-            title = _build_cycler_title(source, ckpt_name, hold_index, int(change_every), active_filter, fallback_all, 0)
-            status_text = _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, local_list, hold_index, int(change_every), len(filtered), 0)
+            new_selection = True
+            if mode == "fixed":
+                requested = _normalize_relpath(start_checkpoint)
+                ckpt_name = requested if requested in all_set else all_checkpoints[0]
+                selected_index = all_checkpoints.index(ckpt_name)
+            elif mode == "randomize":
+                candidates = filtered_candidates()
+                ckpt_name = random.choice(candidates if candidates else all_checkpoints)
+                selected_index = all_checkpoints.index(ckpt_name)
+            elif mode == "shuffle_once":
+                ckpt_name = draw_from_shuffle_deck()
+                selected_index = all_checkpoints.index(ckpt_name)
+            else:  # increment
+                ckpt_name, selected_index = find_next_increment(int(state.get("current_index", 0)))
+
+        hold_index = repeat_count + 1 if can_hold_last else 1
+        if hold_index >= change_every:
+            state["repeat_count"] = 0
+            if mode == "increment":
+                next_index = selected_index + 1
+                if next_index >= len(all_checkpoints):
+                    next_index = 0
+                    state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
+                state["current_index"] = next_index
+            else:
+                state["current_index"] = selected_index
+        else:
+            state["repeat_count"] = hold_index
+            state["current_index"] = selected_index
+
+        source = "cycle"
+        title = _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filter, fallback_all and mode != "fixed", 0)
+        status_text = _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all and mode != "fixed", [], hold_index, change_every, match_count, 0, mode)
+        if mode == "shuffle_once":
+            status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
         state["last_ckpt_name"] = ckpt_name
+        state["last_normal_ckpt_name"] = ckpt_name
         state["last_title"] = title
         state["last_hold_index"] = hold_index
-        state["last_change_every"] = int(change_every)
+        state["last_change_every"] = change_every
+        state["last_mode"] = mode
         _send_cycler_update(node_key, title, status_text)
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
@@ -824,33 +965,6 @@ class CheckpointStatusTagger:
             "title": title,
         })
         return ()
-
-
-class EphemeralPreviewTap:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"image": ("IMAGE",)},
-            "hidden": {"unique_id": "UNIQUE_ID"},
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-    FUNCTION = "tap"
-    CATEGORY = "checkpoint/handpicker/preview"
-
-    @classmethod
-    def IS_CHANGED(cls, image, unique_id=None):
-        return float("nan")
-
-    def tap(self, image, unique_id=None):
-        try:
-            pil_images = _tensor_batch_to_pil(image)
-            sheet, meta = _build_contact_sheet(pil_images)
-            _send_preview(unique_id, "Ephemeral Preview Tap", sheet, meta)
-        except Exception:
-            logger.exception("EphemeralPreviewTap failed")
-        return (image,)
 
 
 class EphemeralPreview:
@@ -1010,6 +1124,50 @@ async def tagger_set_status(request):
     return web.json_response(payload)
 
 
+@routes.post(f"/{EXTENSION_PREFIX}/review/sync_checkpoint")
+async def review_sync_checkpoint(request):
+    data = await request.json()
+    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
+    if not _is_valid_checkpoint_relpath(relpath):
+        return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+
+    tagger_ids = [str(x) for x in data.get("tagger_node_ids", []) if str(x).isdigit()]
+    preview_ids = [str(x) for x in data.get("preview_node_ids", []) if str(x).isdigit()]
+    status = _get_status(relpath)
+    title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
+    for node_id in tagger_ids:
+        _send_event(TAGGER_EVENT, {
+            "node": int(node_id),
+            "ckpt_name_str": relpath,
+            "status": status,
+            "title": title,
+        })
+
+    preview_count = 0
+    for node_id in preview_ids:
+        paths, root = _find_preview_images(relpath, None)
+        pil_images = []
+        for path in paths[:MAX_IMAGES]:
+            try:
+                pil_images.append(Image.open(path).convert("RGB"))
+            except Exception:
+                logger.exception("Failed to open preview image: %s", path)
+        sheet, meta = _build_contact_sheet(pil_images)
+        ptitle = f"ImageDir : {STATUS_ICON[status]} {relpath}" if status != "none" else f"ImageDir : {relpath}"
+        extra = {"ckpt_name_str": relpath, "search_directory": root, "preview_found": bool(paths)}
+        extra.update(meta)
+        _send_preview(node_id, ptitle, sheet, extra)
+        preview_count += 1
+
+    return web.json_response({
+        "ok": True,
+        "ckpt_name_str": relpath,
+        "taggers": len(tagger_ids),
+        "previews": preview_count,
+        "status": status,
+    })
+
+
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/set_flags")
 async def cycler_set_flags(request):
     data = await request.json()
@@ -1070,7 +1228,6 @@ NODE_CLASS_MAPPINGS = {
     "CheckpointListSelector": CheckpointListSelector,
     "CheckpointNameCycler": CheckpointNameCycler,
     "CheckpointStatusTagger": CheckpointStatusTagger,
-    "EphemeralPreviewTap": EphemeralPreviewTap,
     "EphemeralPreview": EphemeralPreview,
     "ImageDirPreview": ImageDirPreview,
 }
@@ -1079,7 +1236,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CheckpointListSelector": "Checkpoint List Selector",
     "CheckpointNameCycler": "Checkpoint Name Cycler",
     "CheckpointStatusTagger": "Checkpoint Status Tagger",
-    "EphemeralPreviewTap": "Ephemeral Preview Tap",
     "EphemeralPreview": "Ephemeral Preview",
     "ImageDirPreview": "ImageDir Preview",
 }

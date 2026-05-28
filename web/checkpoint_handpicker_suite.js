@@ -10,7 +10,7 @@ const STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed
 const SELECTOR_CLASS = "CheckpointListSelector";
 const CYCLER_CLASS = "CheckpointNameCycler";
 const TAGGER_CLASS = "CheckpointStatusTagger";
-const PREVIEW_CLASSES = new Set(["EphemeralPreviewTap", "EphemeralPreview", "ImageDirPreview"]);
+const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
 const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
 const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
@@ -214,10 +214,10 @@ function selectorRects(node) {
   return {
     refreshAll: { x: margin, y: 8, w: 100, h: 24 },
     listOnly: { x: 114, y: 8, w: 80, h: 24 },
-    pushLocalList: { x: 200, y: 8, w: 132, h: 24 },
-    up: { x: 338, y: 8, w: 34, h: 24 },
-    down: { x: 378, y: 8, w: 34, h: 24 },
-    list: { x: margin, y: 86, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
+    pushLocalList: { x: 200, y: 8, w: 148, h: 24 },
+    up: { x: 360, y: 8, w: 34, h: 24 },
+    down: { x: 400, y: 8, w: 34, h: 24 },
+    list: { x: margin, y: 104, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
 function selectorItems(node) { return node.__hpsItems || []; }
@@ -231,6 +231,39 @@ function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
   return `${prefix}${s.total ?? 0} total (💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
 }
+function isNodeClass(node, className) {
+  return node && (node.type === className || node.comfyClass === className);
+}
+
+function getSelectorReviewTargets(node) {
+  const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name_str") ?? -1;
+  if (outIndex < 0) return { taggers: [], previews: [] };
+  const output = node.outputs?.[outIndex];
+  const links = output?.links || [];
+  const taggers = [];
+  const previews = [];
+  for (const linkId of links) {
+    const link = app.graph?.links?.[linkId];
+    if (!link) continue;
+    const target = app.graph?.getNodeById?.(link.target_id);
+    if (!target) continue;
+    const input = target.inputs?.[link.target_slot];
+    if (input?.name !== "ckpt_name_str") continue;
+    if (isNodeClass(target, TAGGER_CLASS)) taggers.push(target);
+    if (isNodeClass(target, "ImageDirPreview")) previews.push(target);
+  }
+  return { taggers, previews };
+}
+
+function selectorActionMode(node) {
+  const targets = getSelectorReviewTargets(node);
+  return (targets.taggers.length || targets.previews.length) ? "sync" : "push";
+}
+
+function selectorActionLabel(node) {
+  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push to Local List";
+}
+
 async function loadSelector(node, mode = "list") {
   node.__hpsLoading = true; app.graph.setDirtyCanvas(true, true);
   try {
@@ -285,9 +318,39 @@ async function pushSelectedToLocalList(node) {
     body: JSON.stringify({ ckpt_name_str: selected }),
   });
   const result = await response.json();
-  node.__hpsStatus = result.ok ? `Pushed to ${result.updated} Local List(s): ${selected}` : (result.error || "Push failed");
+  node.__hpsStatus = result.ok
+    ? `Pushed to Local List:\n${selected}\n\nUpdated Cyclers:\n${result.updated} Cycler(s)`
+    : (result.error || "Push failed");
   app.graph.setDirtyCanvas(true, true);
 }
+
+async function syncSelectedCheckpoint(node) {
+  const selected = selectorSelected(node);
+  if (!selected) return;
+  const targets = getSelectorReviewTargets(node);
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/review/sync_checkpoint`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ckpt_name_str: selected,
+      tagger_node_ids: targets.taggers.map((n) => n.id),
+      preview_node_ids: targets.previews.map((n) => n.id),
+    }),
+  });
+  const result = await response.json();
+  if (result.ok) {
+    node.__hpsStatus = `Synced Checkpoint:\n${selected}\n\nSynced Tagger:\n${result.taggers} connected Tagger(s)\n\nSynced Preview:\n${result.previews} connected ImageDir Preview(s)`;
+  } else {
+    node.__hpsStatus = result.error || "Sync failed";
+  }
+  app.graph.setDirtyCanvas(true, true);
+}
+
+function runSelectorAction(node) {
+  if (selectorActionMode(node) === "sync") return syncSelectedCheckpoint(node);
+  return pushSelectedToLocalList(node);
+}
+
 function maxSelectorScroll(node) {
   return Math.max(0, selectorItems(node).length - SELECTOR_VISIBLE_ROWS);
 }
@@ -309,6 +372,21 @@ function selectorScrollbar(node) {
     track: { x: r.x + r.w - 16, y: r.y, w: 16, h: r.h },
     thumb: { x: r.x + r.w - 12, y, w: 8, h: thumbH },
   };
+}
+
+function setSelectorScrollFromScrollbarY(node, localY, thumbH, dragOffset = thumbH / 2) {
+  const r = selectorRects(node).list;
+  const maxScroll = maxSelectorScroll(node);
+  const usable = Math.max(1, r.h - thumbH);
+  const y = Math.max(r.y, Math.min(r.y + usable, localY - dragOffset));
+  node.__hpsScroll = Math.round(((y - r.y) / usable) * maxScroll);
+  app.graph.setDirtyCanvas(true, true);
+}
+
+function selectorLocalFromEventOrPos(node, event, pos) {
+  const fromEvent = event ? graphEventToLocal(node, event) : null;
+  if (fromEvent) return fromEvent;
+  return candidatePositions(node, pos)?.[0] || null;
 }
 
 let selectorWheelCaptureInstalled = false;
@@ -349,7 +427,9 @@ function selectorCursorAt(node, local) {
   if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList)) return node.__hpsLoading ? "wait" : "pointer";
   if ((selectorItems(node).length > SELECTOR_VISIBLE_ROWS) && (hit(local, r.up) || hit(local, r.down))) return "pointer";
   const sb = selectorScrollbar(node);
-  if (sb && (hit(local, sb.track) || hit(local, sb.thumb))) return "pointer";
+  if (node.__hpsScrollbarDragging) return "grabbing";
+  if (sb && hit(local, sb.thumb)) return "grab";
+  if (sb && hit(local, sb.track)) return "pointer";
   if (hit(local, r.list)) {
     const row = Math.floor((local[1] - r.list.y) / ROW_H);
     const idx = (node.__hpsScroll || 0) + row;
@@ -379,12 +459,13 @@ function setupSelectorNode(nodeType) {
     const r = selectorRects(this);
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
     drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
-    drawButton(ctx, r.pushLocalList, "🏹 Push to Local List", !this.__hpsLoading);
+    drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
     drawButton(ctx, r.up, "▲", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
     drawButton(ctx, r.down, "▼", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(this.__hpsStatus || "", 8, 54);
+    const statusLines = String(this.__hpsStatus || "").split("\n").slice(0, 4);
+    statusLines.forEach((line, i) => ctx.fillText(line, 8, 50 + i * 14));
     ctx.fillStyle = "rgba(0,0,0,0.22)";
     ctx.fillRect(r.list.x, r.list.y, r.list.w, r.list.h);
     ctx.strokeStyle = "rgba(180,220,255,0.35)";
@@ -419,9 +500,20 @@ function setupSelectorNode(nodeType) {
     const r = selectorRects(this);
     if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
     if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
-    if (hitAny(this, pos, r.pushLocalList)) { pushSelectedToLocalList(this); return true; }
+    if (hitAny(this, pos, r.pushLocalList)) { runSelectorAction(this); return true; }
     if (hitAny(this, pos, r.up)) { scrollSelector(this, -SELECTOR_VISIBLE_ROWS); return true; }
     if (hitAny(this, pos, r.down)) { scrollSelector(this, SELECTOR_VISIBLE_ROWS); return true; }
+    const sb = selectorScrollbar(this);
+    const sbHitPos = sb ? candidatePositions(this, pos).find((p) => hit(p, sb.track)) : null;
+    if (sb && sbHitPos) {
+      if (hit(sbHitPos, sb.thumb)) {
+        this.__hpsScrollbarDragging = true;
+        this.__hpsScrollbarDragOffset = sbHitPos[1] - sb.thumb.y;
+      } else {
+        setSelectorScrollFromScrollbarY(this, sbHitPos[1], sb.thumb.h);
+      }
+      return true;
+    }
     const listHitPos = candidatePositions(this, pos).find((p) => hit(p, r.list));
     if (listHitPos) {
       const row = Math.floor((listHitPos[1] - r.list.y) / ROW_H);
@@ -434,6 +526,31 @@ function setupSelectorNode(nodeType) {
       return true;
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+  };
+  const origMouseMove = nodeType.prototype.onMouseMove;
+  nodeType.prototype.onMouseMove = function (e, pos) {
+    if (this.__hpsScrollbarDragging) {
+      const sb = selectorScrollbar(this);
+      const local = selectorLocalFromEventOrPos(this, e, pos);
+      if (sb && local) setSelectorScrollFromScrollbarY(this, local[1], sb.thumb.h, this.__hpsScrollbarDragOffset || sb.thumb.h / 2);
+      return true;
+    }
+    return origMouseMove ? origMouseMove.apply(this, arguments) : false;
+  };
+  const origMouseUp = nodeType.prototype.onMouseUp;
+  nodeType.prototype.onMouseUp = function () {
+    if (this.__hpsScrollbarDragging) {
+      this.__hpsScrollbarDragging = false;
+      this.__hpsScrollbarDragOffset = 0;
+      app.graph.setDirtyCanvas(true, true);
+      return true;
+    }
+    return origMouseUp ? origMouseUp.apply(this, arguments) : false;
+  };
+  const origConnectionsChange = nodeType.prototype.onConnectionsChange;
+  nodeType.prototype.onConnectionsChange = function () {
+    app.graph.setDirtyCanvas(true, true);
+    return origConnectionsChange ? origConnectionsChange.apply(this, arguments) : undefined;
   };
   const origWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (e, pos) {
@@ -453,14 +570,20 @@ function currentTaggerPath(node) {
   return node.__hpsTaggerPath || getWidget(node, "ckpt_name_str")?.value || "";
 }
 function taggerButtons(node) {
+  const buttonW = 72;
+  const gap = 6;
+  const rightMargin = 12;
+  const totalW = TAGGER_STATUSES.length * buttonW + (TAGGER_STATUSES.length - 1) * gap;
+  const startX = Math.max(120, (node.size?.[0] || 450) - rightMargin - totalW);
   return TAGGER_STATUSES.map((status, i) => ({
     status,
-    x: 120 + i * 78,
+    x: startX + i * (buttonW + gap),
     y: 5,
-    w: 72,
+    w: buttonW,
     h: 24,
   }));
 }
+
 function taggerDeleteEnabled(node) {
   const current = node.__hpsTaggerStatus || "none";
   return current === "none" || current === "delete";
@@ -495,12 +618,12 @@ function taggerCursorAt(node, local) {
 }
 
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 500, 125);
+  installMinSize(nodeType, 450, 100);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 500, 125);
+    ensureSize(this, 450, 100);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
@@ -528,7 +651,7 @@ function setupTaggerNode(nodeType) {
     const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: — none" : `Current: ${STATUS_ICON[current]} ${STATUS_LABEL[current]}`);
     ctx.fillStyle = current === "none" ? "#888" : "#ddd";
     ctx.fillText(msg, 8, 72);
-    if (current !== "none" && current !== "delete") {
+    if (this.size[1] >= 110 && current !== "none" && current !== "delete") {
       ctx.fillStyle = "#aaa";
       ctx.fillText("Delete is available only from none.", 8, 90);
     }
