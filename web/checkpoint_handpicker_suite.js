@@ -12,12 +12,58 @@ const CYCLER_CLASS = "CheckpointNameCycler";
 const TAGGER_CLASS = "CheckpointStatusTagger";
 const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
+const HPS_TAB_ID = (globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
 const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
 const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
 const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
 
 function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
+}
+
+function isNodeClass(node, className) {
+  return node && (node.type === className || node.comfyClass === className);
+}
+
+function tabPayload(payload = {}) {
+  return { ...payload, tab_id: HPS_TAB_ID };
+}
+
+function isForThisTab(detail) {
+  return detail?.scope === "global" || detail?.tab_id === HPS_TAB_ID;
+}
+
+function nodeFromEvent(detail, className) {
+  if (!isForThisTab(detail)) return null;
+  const node = app.graph?.getNodeById(Number(detail?.node));
+  if (!isNodeClass(node, className)) return null;
+  return node;
+}
+
+function ensureHiddenTabIdWidget(node) {
+  const w = getWidget(node, "hps_tab_id");
+  if (!w) return;
+  w.value = HPS_TAB_ID;
+  w.type = "hidden";
+  w.computeSize = () => [0, -4];
+}
+
+function installTabIdSupport(nodeType) {
+  if (nodeType.prototype.__hpsTabIdInstalled) return;
+  nodeType.prototype.__hpsTabIdInstalled = true;
+  const origCreated = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function () {
+    const r = origCreated ? origCreated.apply(this, arguments) : undefined;
+    ensureHiddenTabIdWidget(this);
+    return r;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    ensureHiddenTabIdWidget(this);
+    return r;
+  };
 }
 
 function ensureSize(node, w, h) {
@@ -136,6 +182,7 @@ function installCursorCapture() {
 // ---------- Preview ----------
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
+  installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
@@ -147,17 +194,20 @@ function setupPreviewNode(nodeType) {
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
+    ensureHiddenTabIdWidget(this);
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const top = 30;
     const margin = 8;
+    const messageX = Math.min(Math.max(100, margin), Math.max(margin, this.size[0] - 40));
+    const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
     ctx.save();
     if (this.__hpsPreviewCaption) {
       ctx.fillStyle = "#ddd";
       ctx.font = "12px sans-serif";
-      ctx.fillText(this.__hpsPreviewCaption, margin, top - 6);
+      ctx.fillText(this.__hpsPreviewCaption, messageX, top - 6, messageW);
     }
     if (img) {
       let dw = w;
@@ -171,17 +221,18 @@ function setupPreviewNode(nodeType) {
       ctx.drawImage(img, x, y, dw, dh);
     } else {
       ctx.fillStyle = "rgba(255,255,255,0.15)";
-      ctx.fillText("no preview", margin, top + 16);
+      ctx.fillText(this.__hpsPreviewCaption || "no preview", messageX, top + 16, messageW);
     }
     ctx.restore();
   };
 }
 
 api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
-  const node = app.graph?.getNodeById(Number(detail.node));
-  if (!node) return;
+  if (!isForThisTab(detail)) return;
+  const node = app.graph?.getNodeById(Number(detail?.node));
+  if (!node || !PREVIEW_CLASSES.has(node.type || node.comfyClass)) return;
   if (detail.title) node.title = detail.title;
-  node.__hpsPreviewCaption = `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
+  node.__hpsPreviewCaption = detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   if (!detail.image) {
     node.__hpsPreview = null;
     app.graph.setDirtyCanvas(true, true);
@@ -190,6 +241,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const img = new Image();
   img.onload = () => {
     node.__hpsPreview = img;
+    node.__hpsPreviewCaption = detail.message || node.__hpsPreviewCaption;
     app.graph.setDirtyCanvas(true, true);
   };
   img.src = `data:image/${detail.format};base64,${detail.image}`;
@@ -231,10 +283,6 @@ function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
   return `${prefix}${s.total ?? 0} total (💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
 }
-function isNodeClass(node, className) {
-  return node && (node.type === className || node.comfyClass === className);
-}
-
 function getSelectorReviewTargets(node) {
   const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name_str") ?? -1;
   if (outIndex < 0) return { taggers: [], previews: [] };
@@ -315,11 +363,16 @@ async function pushSelectedToLocalList(node) {
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/local_list_append`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ckpt_name_str: selected }),
+    body: JSON.stringify(tabPayload({
+      ckpt_name_str: selected,
+      target_node_ids: (app.graph?._nodes || [])
+        .filter((n) => isNodeClass(n, CYCLER_CLASS) && n.__hpsUseLocalList !== false)
+        .map((n) => n.id),
+    })),
   });
   const result = await response.json();
   node.__hpsStatus = result.ok
-    ? `Pushed to Local List:\n${selected}\n\nUpdated Cyclers:\n${result.updated} Cycler(s)`
+    ? `pushed : ${selected} (${result.updated} Cycler)`
     : (result.error || "Push failed");
   app.graph.setDirtyCanvas(true, true);
 }
@@ -331,15 +384,15 @@ async function syncSelectedCheckpoint(node) {
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/review/sync_checkpoint`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    body: JSON.stringify(tabPayload({
       ckpt_name_str: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
-    }),
+    })),
   });
   const result = await response.json();
   if (result.ok) {
-    node.__hpsStatus = `Synced Checkpoint:\n${selected}\n\nSynced Tagger:\n${result.taggers} connected Tagger(s)\n\nSynced Preview:\n${result.previews} connected ImageDir Preview(s)`;
+    node.__hpsStatus = `synced : ${selected}`;
   } else {
     node.__hpsStatus = result.error || "Sync failed";
   }
@@ -465,7 +518,7 @@ function setupSelectorNode(nodeType) {
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
     const statusLines = String(this.__hpsStatus || "").split("\n").slice(0, 4);
-    statusLines.forEach((line, i) => ctx.fillText(line, 8, 50 + i * 14));
+    statusLines.forEach((line, i) => ctx.fillText(line, 8, 50 + i * 14, this.size[0] - 16));
     ctx.fillStyle = "rgba(0,0,0,0.22)";
     ctx.fillRect(r.list.x, r.list.y, r.list.w, r.list.h);
     ctx.strokeStyle = "rgba(180,220,255,0.35)";
@@ -595,7 +648,7 @@ async function setTaggerStatus(node, status) {
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tagger/set_status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ckpt_name_str: ckpt, status }),
+    body: JSON.stringify(tabPayload({ ckpt_name_str: ckpt, status })),
   });
   const result = await response.json();
   if (result.ok) {
@@ -619,6 +672,7 @@ function taggerCursorAt(node, local) {
 
 function setupTaggerNode(nodeType) {
   installMinSize(nodeType, 450, 100);
+  installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
@@ -629,6 +683,7 @@ function setupTaggerNode(nodeType) {
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
+    ensureHiddenTabIdWidget(this);
     ctx.save();
     const current = this.__hpsTaggerStatus || "none";
     for (const b of taggerButtons(this)) {
@@ -670,7 +725,7 @@ function setupTaggerNode(nodeType) {
   };
 }
 api.addEventListener(TAGGER_EVENT, ({ detail }) => {
-  const node = app.graph?.getNodeById(Number(detail.node));
+  const node = nodeFromEvent(detail, TAGGER_CLASS);
   if (!node) return;
   node.__hpsTaggerPath = detail.ckpt_name_str;
   node.__hpsTaggerStatus = detail.status;
@@ -678,14 +733,24 @@ api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   if (detail.title) node.title = detail.title;
   app.graph.setDirtyCanvas(true, true);
 });
-api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
-  for (const node of app.graph?._nodes || []) {
-    if (node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS) {
-      refreshSelector(node, false);
+let selectorGlobalRefreshTimer = null;
+function scheduleSelectorGlobalRefresh() {
+  clearTimeout(selectorGlobalRefreshTimer);
+  selectorGlobalRefreshTimer = setTimeout(() => {
+    for (const node of app.graph?._nodes || []) {
+      if (isNodeClass(node, SELECTOR_CLASS)) refreshSelector(node, false);
     }
-    if ((node.type === TAGGER_CLASS || node.comfyClass === TAGGER_CLASS) && node.__hpsTaggerPath === detail.ckpt_name_str) {
+  }, 400);
+}
+
+api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
+  if (detail?.scope !== "global") return;
+  scheduleSelectorGlobalRefresh();
+  for (const node of app.graph?._nodes || []) {
+    if (isNodeClass(node, TAGGER_CLASS) && node.__hpsTaggerPath === detail.ckpt_name_str) {
       node.__hpsTaggerStatus = detail.status;
       node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
+      node.title = detail.status === "none" ? `Tagger : ${detail.ckpt_name_str}` : `Tagger : ${STATUS_ICON[detail.status]} ${detail.ckpt_name_str}`;
       app.graph.setDirtyCanvas(true, true);
     }
   }
@@ -711,21 +776,21 @@ async function pushCyclerFlags(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id, use_local_list: !!node.__hpsUseLocalList }),
+    body: JSON.stringify(tabPayload({ node_id: node.id, use_local_list: !!node.__hpsUseLocalList })),
   });
 }
 async function pushCyclerFilter(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id, statuses: cyclerActiveFilter(node) }),
+    body: JSON.stringify(tabPayload({ node_id: node.id, statuses: cyclerActiveFilter(node) })),
   });
 }
 async function clearLocalList(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/clear_local_list`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id }),
+    body: JSON.stringify(tabPayload({ node_id: node.id })),
   });
 }
 function cyclerCursorAt(node, local) {
@@ -740,6 +805,7 @@ function cyclerCursorAt(node, local) {
 
 function setupCyclerNode(nodeType) {
   installMinSize(nodeType, 560, 260);
+  installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
@@ -753,6 +819,7 @@ function setupCyclerNode(nodeType) {
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
+    ensureHiddenTabIdWidget(this);
     const r = cyclerRects(this);
     drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
     drawButton(ctx, r.clearLocalList, "Clear Local List", true, false);
@@ -800,7 +867,7 @@ function setupCyclerNode(nodeType) {
   };
 }
 api.addEventListener(CYCLER_EVENT, ({ detail }) => {
-  const node = app.graph?.getNodeById(Number(detail.node));
+  const node = nodeFromEvent(detail, CYCLER_CLASS);
   if (!node) return;
   if (detail.title) node.title = detail.title;
   node.__hpsCyclerStatus = detail.status_text;

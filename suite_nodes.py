@@ -63,6 +63,18 @@ _STATE_LOCK = threading.Lock()
 _CYCLER_STATES: dict[str, dict] = {}
 
 
+def _clean_tab_id(value) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return "__legacy__"
+    value = re.sub(r"[^0-9A-Za-z_.:-]+", "_", value)[:128]
+    return value or "__legacy__"
+
+
+def _state_key(tab_id, node_id) -> str:
+    return f"{_clean_tab_id(tab_id)}:{str(node_id or '__none__')}"
+
+
 @dataclass
 class SheetLayout:
     cols: int
@@ -482,15 +494,17 @@ def _encode_jpeg(image: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _send_preview(node_id, title: str, image: Image.Image | None, extra: dict | None = None):
+def _send_preview(node_id, title: str, image: Image.Image | None, extra: dict | None = None, tab_id: str | None = None):
     payload = {
-        "node": int(node_id) if node_id is not None else None,
+        "node": int(node_id) if node_id is not None and str(node_id).isdigit() else None,
         "title": title,
         "format": "jpeg",
         "image": None,
         "width": 0,
         "height": 0,
     }
+    if tab_id is not None:
+        payload["tab_id"] = _clean_tab_id(tab_id)
     if image is not None:
         payload["image"] = _encode_jpeg(image)
         payload["width"] = image.width
@@ -498,6 +512,58 @@ def _send_preview(node_id, title: str, image: Image.Image | None, extra: dict | 
     if extra:
         payload.update(extra)
     _send_event(PREVIEW_EVENT, payload)
+
+
+def _image_dir_title(relpath: str) -> str:
+    status = _get_status(relpath)
+    return f"ImageDir : {STATUS_ICON[status]} {relpath}" if status != "none" else f"ImageDir : {relpath}"
+
+
+def _send_image_dir_progress(node_id, relpath: str, message: str, tab_id: str | None = None, root: str = ""):
+    _send_preview(
+        node_id,
+        _image_dir_title(relpath),
+        None,
+        {
+            "node_class": "ImageDirPreview",
+            "ckpt_name_str": relpath,
+            "search_directory": root,
+            "message": message,
+            "progress": True,
+        },
+        tab_id=tab_id,
+    )
+
+
+def _load_image_dir_preview(node_id, ckpt_name_str: str, search_directory: str | None = None, tab_id: str | None = None, send_progress: bool = True) -> tuple[Image.Image | None, dict]:
+    relpath = _normalize_relpath(ckpt_name_str)
+    title = _image_dir_title(relpath)
+    if send_progress:
+        _send_image_dir_progress(node_id, relpath, f"searching : {relpath}", tab_id=tab_id)
+    paths, root = _find_preview_images(relpath, search_directory)
+    if send_progress:
+        _send_image_dir_progress(node_id, relpath, f"found : {len(paths[:MAX_IMAGES])} image(s)", tab_id=tab_id, root=root)
+    pil_images = []
+    total = min(len(paths), MAX_IMAGES)
+    for index, path in enumerate(paths[:MAX_IMAGES], start=1):
+        if send_progress:
+            _send_image_dir_progress(node_id, relpath, f"loading : {index}/{total}", tab_id=tab_id, root=root)
+        try:
+            pil_images.append(Image.open(path).convert("RGB"))
+        except Exception:
+            logger.exception("Failed to open preview image: %s", path)
+    if send_progress:
+        _send_image_dir_progress(node_id, relpath, "building preview sheet", tab_id=tab_id, root=root)
+    sheet, meta = _build_contact_sheet(pil_images)
+    extra = {
+        "node_class": "ImageDirPreview",
+        "ckpt_name_str": relpath,
+        "search_directory": root,
+        "preview_found": bool(paths),
+        "message": "preview ready" if sheet is not None else f"no preview : {relpath}",
+    }
+    extra.update(meta)
+    return sheet, extra
 
 
 def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None) -> tuple[list[Path], str]:
@@ -525,12 +591,15 @@ def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None
     return found, str(roots[0]) if roots else ""
 
 
-def _send_cycler_update(node_id: str | None, title: str, status_text: str):
-    _send_event(CYCLER_EVENT, {
+def _send_cycler_update(node_id: str | None, title: str, status_text: str, tab_id: str | None = None):
+    payload = {
         "node": int(node_id) if node_id is not None and str(node_id).isdigit() else None,
         "title": title,
         "status_text": status_text,
-    })
+    }
+    if tab_id is not None:
+        payload["tab_id"] = _clean_tab_id(tab_id)
+    _send_event(CYCLER_EVENT, payload)
 
 
 def _get_cycler_state(node_key: str) -> dict:
@@ -733,8 +802,8 @@ def _build_cycler_pending_status_text(state: dict) -> str:
     )
 
 
-def _send_cycler_state_update(node_id: str, state: dict):
-    _send_cycler_update(node_id, "", _build_cycler_pending_status_text(state))
+def _send_cycler_state_update(node_id: str, state: dict, tab_id: str | None = None):
+    _send_cycler_update(node_id, "", _build_cycler_pending_status_text(state), tab_id=tab_id)
 
 
 class CheckpointListSelector:
@@ -749,7 +818,7 @@ class CheckpointListSelector:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_TYPES = (_get_checkpoint_list() if _get_checkpoint_list() else [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "select"
     CATEGORY = "checkpoint/handpicker"
@@ -773,6 +842,9 @@ class CheckpointNameCycler:
                 "mode": (["fixed", "increment", "randomize", "shuffle_once"], {"default": "increment"}),
                 "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
             },
+            "optional": {
+                "hps_tab_id": ("STRING", {"default": ""}),
+            },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
@@ -787,8 +859,10 @@ class CheckpointNameCycler:
     def IS_CHANGED(cls, **kwargs):
         return time.time_ns()
 
-    def cycle(self, start_checkpoint, mode, change_every, unique_id=None):
-        node_key = str(unique_id) if unique_id is not None else "__default__"
+    def cycle(self, start_checkpoint, mode, change_every, hps_tab_id="", unique_id=None):
+        node_id = str(unique_id) if unique_id is not None else "__default__"
+        tab_id = _clean_tab_id(hps_tab_id)
+        node_key = _state_key(tab_id, node_id)
         state = _get_cycler_state(node_key)
         all_checkpoints = _get_checkpoint_list()
         if not all_checkpoints:
@@ -836,7 +910,7 @@ class CheckpointNameCycler:
             state["last_hold_index"] = hold_index
             state["last_change_every"] = change_every
             state["last_mode"] = mode
-            _send_cycler_update(node_key, title, status_text)
+            _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
             return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
         elif skipped_local:
             state["local_list"] = []
@@ -929,7 +1003,7 @@ class CheckpointNameCycler:
         state["last_hold_index"] = hold_index
         state["last_change_every"] = change_every
         state["last_mode"] = mode
-        _send_cycler_update(node_key, title, status_text)
+        _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
 
@@ -939,6 +1013,9 @@ class CheckpointStatusTagger:
         return {
             "required": {
                 "ckpt_name_str": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                "hps_tab_id": ("STRING", {"default": ""}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -951,15 +1028,17 @@ class CheckpointStatusTagger:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, ckpt_name_str, unique_id=None):
+    def IS_CHANGED(cls, ckpt_name_str, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def tag(self, ckpt_name_str, unique_id=None):
+    def tag(self, ckpt_name_str, hps_tab_id="", unique_id=None):
         relpath = _normalize_relpath(ckpt_name_str)
         status = _get_status(relpath)
         title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
         _send_event(TAGGER_EVENT, {
             "node": int(unique_id) if unique_id is not None else None,
+            "tab_id": _clean_tab_id(hps_tab_id),
+            "node_class": "CheckpointStatusTagger",
             "ckpt_name_str": relpath,
             "status": status,
             "title": title,
@@ -972,6 +1051,7 @@ class EphemeralPreview:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",)},
+            "optional": {"hps_tab_id": ("STRING", {"default": ""})},
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -981,14 +1061,15 @@ class EphemeralPreview:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, image, unique_id=None):
+    def IS_CHANGED(cls, image, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def preview(self, image, unique_id=None):
+    def preview(self, image, hps_tab_id="", unique_id=None):
         try:
             pil_images = _tensor_batch_to_pil(image)
             sheet, meta = _build_contact_sheet(pil_images)
-            _send_preview(unique_id, "Ephemeral Preview", sheet, meta)
+            meta["node_class"] = "EphemeralPreview"
+            _send_preview(unique_id, "Ephemeral Preview", sheet, meta, tab_id=hps_tab_id)
         except Exception:
             logger.exception("EphemeralPreview failed")
         return ()
@@ -1003,6 +1084,7 @@ class ImageDirPreview:
             },
             "optional": {
                 "search_directory": ("STRING", {"forceInput": True}),
+                "hps_tab_id": ("STRING", {"default": ""}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1015,23 +1097,13 @@ class ImageDirPreview:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, ckpt_name_str, search_directory=None, unique_id=None):
+    def IS_CHANGED(cls, ckpt_name_str, search_directory=None, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def preview(self, ckpt_name_str, search_directory=None, unique_id=None):
+    def preview(self, ckpt_name_str, search_directory=None, hps_tab_id="", unique_id=None):
         relpath = _normalize_relpath(ckpt_name_str)
-        paths, root = _find_preview_images(relpath, search_directory)
-        pil_images = []
-        for path in paths[:MAX_IMAGES]:
-            try:
-                pil_images.append(Image.open(path).convert("RGB"))
-            except Exception:
-                logger.exception("Failed to open preview image: %s", path)
-        sheet, meta = _build_contact_sheet(pil_images)
-        title = f"ImageDir : {STATUS_ICON[_get_status(relpath)]} {relpath}" if _get_status(relpath) != "none" else f"ImageDir : {relpath}"
-        extra = {"ckpt_name_str": relpath, "search_directory": root, "preview_found": bool(paths)}
-        extra.update(meta)
-        _send_preview(unique_id, title, sheet, extra)
+        sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True)
+        _send_preview(unique_id, _image_dir_title(relpath), sheet, extra, tab_id=hps_tab_id)
         return ()
 
 
@@ -1114,6 +1186,7 @@ async def tagger_set_status(request):
             })
             _write_delete_script()
     payload = {
+        "scope": "global",
         "ok": True,
         "ckpt_name_str": relpath,
         "status": _get_status(relpath),
@@ -1131,6 +1204,7 @@ async def review_sync_checkpoint(request):
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
 
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
     tagger_ids = [str(x) for x in data.get("tagger_node_ids", []) if str(x).isdigit()]
     preview_ids = [str(x) for x in data.get("preview_node_ids", []) if str(x).isdigit()]
     status = _get_status(relpath)
@@ -1138,6 +1212,8 @@ async def review_sync_checkpoint(request):
     for node_id in tagger_ids:
         _send_event(TAGGER_EVENT, {
             "node": int(node_id),
+            "tab_id": tab_id,
+            "node_class": "CheckpointStatusTagger",
             "ckpt_name_str": relpath,
             "status": status,
             "title": title,
@@ -1145,18 +1221,8 @@ async def review_sync_checkpoint(request):
 
     preview_count = 0
     for node_id in preview_ids:
-        paths, root = _find_preview_images(relpath, None)
-        pil_images = []
-        for path in paths[:MAX_IMAGES]:
-            try:
-                pil_images.append(Image.open(path).convert("RGB"))
-            except Exception:
-                logger.exception("Failed to open preview image: %s", path)
-        sheet, meta = _build_contact_sheet(pil_images)
-        ptitle = f"ImageDir : {STATUS_ICON[status]} {relpath}" if status != "none" else f"ImageDir : {relpath}"
-        extra = {"ckpt_name_str": relpath, "search_directory": root, "preview_found": bool(paths)}
-        extra.update(meta)
-        _send_preview(node_id, ptitle, sheet, extra)
+        sheet, extra = _load_image_dir_preview(node_id, relpath, None, tab_id=tab_id, send_progress=True)
+        _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
         preview_count += 1
 
     return web.json_response({
@@ -1172,11 +1238,12 @@ async def review_sync_checkpoint(request):
 async def cycler_set_flags(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
-    state = _get_cycler_state(node_id)
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state = _get_cycler_state(_state_key(tab_id, node_id))
     if "use_local_list" in data:
         state["use_local_list"] = bool(data.get("use_local_list"))
         state["accept_queue"] = state["use_local_list"]
-    _send_cycler_state_update(node_id, state)
+    _send_cycler_state_update(node_id, state, tab_id=tab_id)
     return web.json_response({"ok": True, "use_local_list": state["use_local_list"]})
 
 
@@ -1184,11 +1251,12 @@ async def cycler_set_flags(request):
 async def cycler_set_filter(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
     statuses = [s for s in data.get("statuses", []) if s in STATUS_VALUES]
-    state = _get_cycler_state(node_id)
+    state = _get_cycler_state(_state_key(tab_id, node_id))
     state["active_filter"] = statuses.copy()
-    _send_cycler_state_update(node_id, state)
-    logger.info("[CheckpointHandpickerSuite] Updated cycler filter for node %s: %s", node_id, statuses or ["All"])
+    _send_cycler_state_update(node_id, state, tab_id=tab_id)
+    logger.info("[CheckpointHandpickerSuite] Updated cycler filter for tab %s node %s: %s", tab_id, node_id, statuses or ["All"])
     return web.json_response({"ok": True, "node_id": node_id, "statuses": statuses})
 
 
@@ -1198,16 +1266,17 @@ async def cycler_local_list_append(request):
     relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    target_node_ids = [str(x) for x in data.get("target_node_ids", []) if str(x).isdigit()]
     updated = 0
-    with _STATE_LOCK:
-        target_states = list(_CYCLER_STATES.items())
-    for node_id, state in target_states:
+    for node_id in target_node_ids:
+        state = _get_cycler_state(_state_key(tab_id, node_id))
         if state.get("use_local_list", True):
             state.setdefault("local_list", []).append(relpath)
             state["override_queue"] = state["local_list"]
             updated += 1
-            _send_cycler_state_update(node_id, state)
-    logger.info("[CheckpointHandpickerSuite] Pushed checkpoint to %s Local List(s): %s", updated, relpath)
+            _send_cycler_state_update(node_id, state, tab_id=tab_id)
+    logger.info("[CheckpointHandpickerSuite] Pushed checkpoint to %s Local List(s) in tab %s: %s", updated, tab_id, relpath)
     return web.json_response({"ok": True, "updated": updated})
 
 
@@ -1215,12 +1284,13 @@ async def cycler_local_list_append(request):
 async def cycler_clear_local_list(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
-    state = _get_cycler_state(node_id)
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state = _get_cycler_state(_state_key(tab_id, node_id))
     cleared = len(state.get("local_list", []))
     state["local_list"] = []
     state["override_queue"] = []
-    _send_cycler_state_update(node_id, state)
-    logger.info("[CheckpointHandpickerSuite] Cleared Local List for node %s: %s item(s)", node_id, cleared)
+    _send_cycler_state_update(node_id, state, tab_id=tab_id)
+    logger.info("[CheckpointHandpickerSuite] Cleared Local List for tab %s node %s: %s item(s)", tab_id, node_id, cleared)
     return web.json_response({"ok": True, "cleared": cleared})
 
 
