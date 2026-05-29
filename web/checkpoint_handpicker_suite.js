@@ -14,6 +14,48 @@ const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
 const HPS_TAB_ID = (globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
+function hpsExecutionStore() {
+  globalThis.__hpsExecutionState = globalThis.__hpsExecutionState || {};
+  return globalThis.__hpsExecutionState;
+}
+
+function getExecutionState() {
+  return hpsExecutionStore()[HPS_TAB_ID] || null;
+}
+
+function setExecutionState(detail) {
+  if (!detail?.ckpt_name_str) return;
+  const status = detail.status || "none";
+  hpsExecutionStore()[HPS_TAB_ID] = {
+    ckpt_name_str: detail.ckpt_name_str,
+    status,
+    status_icon: detail.status_icon || STATUS_ICON[status] || "",
+    cycler_node_id: detail.node ?? null,
+    source: detail.source || "",
+    mode: detail.mode || "",
+    updated_at: Date.now(),
+  };
+}
+
+function titleDisplayForCheckpoint(ckptName, status = "none") {
+  if (!ckptName) return "";
+  const icon = STATUS_ICON[status] || "";
+  return status && status !== "none" ? `${icon} ${ckptName}` : ckptName;
+}
+
+function setPreviewTitleFromCheckpoint(node, ckptName, status = "none") {
+  if (!node || !ckptName) return;
+  node.title = `Preview : ${titleDisplayForCheckpoint(ckptName, status)}`;
+}
+
+function patchCheckpointTitle(node, prefix, ckptName, status = "none") {
+  if (!node || !ckptName) return;
+  const oldTitle = String(node.title || "");
+  const idx = oldTitle.indexOf(ckptName);
+  const suffix = idx >= 0 ? oldTitle.slice(idx + ckptName.length) : "";
+  node.title = `${prefix} : ${titleDisplayForCheckpoint(ckptName, status)}${suffix}`;
+}
+
 const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
 const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
 const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
@@ -227,10 +269,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 72 : 30;
+    const top = isImageDir ? 100 : 30;
     const margin = 8;
-    const messageX = isImageDir ? Math.min(140, Math.max(margin, this.size[0] - 80)) : 100;
-    const captionY = isImageDir ? 36 : 20;
+    const messageX = isImageDir ? Math.min(120, Math.max(margin, this.size[0] - 80)) : margin;
+    const captionY = isImageDir ? 82 : top - 6;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -257,10 +299,18 @@ function setupPreviewNode(nodeType) {
       const y = top + (h - dh) / 2;
       ctx.drawImage(img, x, y, dw, dh);
     } else {
-      ctx.fillStyle = "rgba(255,255,255,0.15)";
-      //ctx.fillText(this.__hpsPreviewCaption || "no preview", messageX, top + 50, messageW);
-      ctx.fillText(this.__hpsPreviewCaption || "no preview",  this.size[0]/2 -30, this.size[1]/2 +top-50, messageW);
-
+      const st = this.__hpsPreviewState || {};
+      const isLoading = st.status === "loading" || !!st.progress;
+      if (!isLoading) {
+        const text = this.__hpsPreviewCaption || "no preview";
+        ctx.fillStyle = "rgba(255,255,255,0.15)";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, this.size[0] / 2, top + h / 2, Math.max(1, w - 16));
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+      }
     }
     ctx.restore();
   };
@@ -271,7 +321,22 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const node = app.graph?.getNodeById(Number(detail?.node));
   if (!node || !PREVIEW_CLASSES.has(node.type || node.comfyClass)) return;
   if (detail.node_class && !isNodeClass(node, detail.node_class)) return;
-  if (detail.title) node.title = detail.title;
+
+  const isEphemeral = isNodeClass(node, "EphemeralPreview");
+  if (isEphemeral && detail.image) {
+    const execution = getExecutionState();
+    if (execution?.ckpt_name_str) {
+      node.__hpsPreviewCkptName = execution.ckpt_name_str;
+      node.__hpsPreviewStatus = execution.status || "none";
+      node.__hpsPreviewStatusIcon = execution.status_icon || STATUS_ICON[node.__hpsPreviewStatus] || "";
+      setPreviewTitleFromCheckpoint(node, node.__hpsPreviewCkptName, node.__hpsPreviewStatus);
+    } else {
+      node.title = "Ephemeral Preview";
+    }
+  } else if (detail.title) {
+    node.title = detail.title;
+  }
+
   node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), ...detail };
   const caption = detail.progress_message || detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   node.__hpsPreviewCaption = caption;
@@ -910,11 +975,33 @@ function scheduleSelectorGlobalRefresh() {
 api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
   if (detail?.scope !== "global") return;
   scheduleSelectorGlobalRefresh();
+
+  const execution = getExecutionState();
+  if (execution?.ckpt_name_str === detail.ckpt_name_str) {
+    execution.status = detail.status || "none";
+    execution.status_icon = detail.status_icon || STATUS_ICON[execution.status] || "";
+    execution.updated_at = Date.now();
+  }
+
   for (const node of app.graph?._nodes || []) {
     if (isNodeClass(node, TAGGER_CLASS) && node.__hpsTaggerPath === detail.ckpt_name_str) {
       node.__hpsTaggerStatus = detail.status;
       node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
       node.title = detail.status === "none" ? `Tagger : ${detail.ckpt_name_str}` : `Tagger : ${STATUS_ICON[detail.status]} ${detail.ckpt_name_str}`;
+      app.graph.setDirtyCanvas(true, true);
+    }
+    if (isNodeClass(node, "EphemeralPreview") && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
+      node.__hpsPreviewStatus = detail.status || "none";
+      node.__hpsPreviewStatusIcon = detail.status_icon || STATUS_ICON[node.__hpsPreviewStatus] || "";
+      setPreviewTitleFromCheckpoint(node, detail.ckpt_name_str, node.__hpsPreviewStatus);
+      app.graph.setDirtyCanvas(true, true);
+    }
+    if (isNodeClass(node, "ImageDirPreview") && node.__hpsPreviewState?.ckpt_name_str === detail.ckpt_name_str) {
+      patchCheckpointTitle(node, "ImageDir", detail.ckpt_name_str, detail.status || "none");
+      app.graph.setDirtyCanvas(true, true);
+    }
+    if (isNodeClass(node, CYCLER_CLASS) && node.__hpsCyclerCkptName === detail.ckpt_name_str) {
+      patchCheckpointTitle(node, "Cycler", detail.ckpt_name_str, detail.status || "none");
       app.graph.setDirtyCanvas(true, true);
     }
   }
@@ -1033,6 +1120,11 @@ function setupCyclerNode(nodeType) {
 api.addEventListener(CYCLER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, CYCLER_CLASS);
   if (!node) return;
+  if (detail.ckpt_name_str) {
+    node.__hpsCyclerCkptName = detail.ckpt_name_str;
+    node.__hpsCyclerStatusValue = detail.status || "none";
+    setExecutionState(detail);
+  }
   if (detail.title) node.title = detail.title;
   node.__hpsCyclerStatus = detail.status_text;
   app.graph.setDirtyCanvas(true, true);

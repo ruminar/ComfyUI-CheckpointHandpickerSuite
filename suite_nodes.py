@@ -444,6 +444,29 @@ def _reference_image_size(images: list[Image.Image]) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def _layout_for_grid(count: int, ref_w: int, ref_h: int, cols: int, rows: int, allow_upscale: bool = False) -> SheetLayout | None:
+    scale = min(MAX_CONTENT_EDGE / max(1, cols * ref_w), MAX_CONTENT_EDGE / max(1, rows * ref_h))
+    if not allow_upscale:
+        scale = min(1.0, scale)
+    if scale <= 0:
+        return None
+    tile_w = max(1, int(ref_w * scale))
+    tile_h = max(1, int(ref_h * scale))
+    content_w = cols * tile_w
+    content_h = rows * tile_h
+    if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
+        return None
+    return SheetLayout(
+        cols,
+        rows,
+        tile_w,
+        tile_h,
+        content_w + GAP * max(0, cols - 1),
+        content_h + GAP * max(0, rows - 1),
+        count,
+    )
+
+
 def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool = False) -> SheetLayout:
     """Choose a contact-sheet layout using MAX_CONTENT_EDGE as the image-content limit.
 
@@ -454,6 +477,13 @@ def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool =
     count = max(1, int(count))
     ref_w = max(1, int(ref_w))
     ref_h = max(1, int(ref_h))
+    # Five images as a single 5x1 strip feels too wide in the preview UI.
+    # Prefer a compact 3x2 grid even if it leaves one empty cell.
+    if count == 5:
+        preferred = _layout_for_grid(count, ref_w, ref_h, 3, 2, allow_upscale=allow_upscale)
+        if preferred is not None:
+            return preferred
+
     landscape = ref_w >= ref_h
     best = None
     for cols in range(1, count + 1):
@@ -731,7 +761,17 @@ def _load_image_dir_preview(
     extra.update(meta)
     return sheet, extra
 
-def _send_cycler_update(node_id: str | None, title: str, status_text: str, tab_id: str | None = None):
+def _send_cycler_update(
+    node_id: str | None,
+    title: str,
+    status_text: str,
+    tab_id: str | None = None,
+    ckpt_name_str: str | None = None,
+    source: str | None = None,
+    mode: str | None = None,
+    hold_index: int | None = None,
+    change_every: int | None = None,
+):
     payload = {
         "node": int(node_id) if node_id is not None and str(node_id).isdigit() else None,
         "title": title,
@@ -739,6 +779,23 @@ def _send_cycler_update(node_id: str | None, title: str, status_text: str, tab_i
     }
     if tab_id is not None:
         payload["tab_id"] = _clean_tab_id(tab_id)
+    if ckpt_name_str:
+        relpath = _normalize_relpath(ckpt_name_str)
+        status = _get_status(relpath)
+        payload.update({
+            "ckpt_name_str": relpath,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+            "status": status,
+            "status_icon": STATUS_ICON[status],
+        })
+    if source is not None:
+        payload["source"] = source
+    if mode is not None:
+        payload["mode"] = mode
+    if hold_index is not None:
+        payload["hold_index"] = hold_index
+    if change_every is not None:
+        payload["change_every"] = change_every
     _send_event(CYCLER_EVENT, payload)
 
 
@@ -1050,7 +1107,17 @@ class CheckpointNameCycler:
             state["last_hold_index"] = hold_index
             state["last_change_every"] = change_every
             state["last_mode"] = mode
-            _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
+            _send_cycler_update(
+                node_id,
+                title,
+                status_text,
+                tab_id=tab_id,
+                ckpt_name_str=ckpt_name,
+                source="local_list",
+                mode=mode,
+                hold_index=hold_index,
+                change_every=1,
+            )
             return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
         elif skipped_local:
             state["local_list"] = []
@@ -1143,7 +1210,17 @@ class CheckpointNameCycler:
         state["last_hold_index"] = hold_index
         state["last_change_every"] = change_every
         state["last_mode"] = mode
-        _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
+        _send_cycler_update(
+            node_id,
+            title,
+            status_text,
+            tab_id=tab_id,
+            ckpt_name_str=ckpt_name,
+            source=source,
+            mode=mode,
+            hold_index=hold_index,
+            change_every=change_every,
+        )
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
 

@@ -91,6 +91,7 @@ Delete is a reservation only. It never deletes checkpoints immediately.
 ## Preview
 
 - `Ephemeral Preview` shows all images from the incoming `IMAGE` batch. It does not drop batch items.
+- When `Ephemeral Preview` receives images after a `Checkpoint Name Cycler` execution, it can display the checkpoint name from the tab-local execution state as `Preview : model.safetensors`. This is display-only; it is not used for tagging or delete operations.
 - `ImageDir Preview` searches output images for the selected checkpoint and shows a contact sheet.
 
 `ImageDir Preview` has `max_preview_images`:
@@ -105,6 +106,8 @@ Preview contact sheets do not upscale images. If the sheet fits within the 4096p
 ## Tab isolation
 
 UI operation events are tab-local. Local List updates, Cycler UI updates, Tagger sync, and preview/progress updates include a tab id and are ignored by other tabs.
+
+The Cycler also writes the last executed checkpoint to a tab-local frontend execution state. `Ephemeral Preview` may use that state to label previews. `Checkpoint Status Tagger` never uses this shared state; it only acts on an explicitly connected `ckpt_name_str` input.
 
 Checkpoint statuses are global. When a status changes, all tabs may refresh their own Selector lists, but global notifications do not directly modify arbitrary node titles by node id.
 
