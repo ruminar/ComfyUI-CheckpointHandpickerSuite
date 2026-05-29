@@ -35,7 +35,7 @@
 
 我がリポジトリを支える、シャドウガーデンの序列（4人の看板娘たちと5つの魔導具）を紹介しよう。それぞれが固有の役割を持ち、あなたのComfyUI（肉体）と脳内で非同期にリンクしておるのじゃ！
 
-### 1. 🤎 Checkpoint Name Cycler（心臓）
+### 1. 🤎 [Checkpoint Name Cycler（心臓）](CheckpointNameCycler.md)
 
 バックグラウンドで何百件ものジョブをノンストップで爆走させるための動力源じゃ。
 
@@ -43,7 +43,7 @@
 * KSamplerへモデルを渡す直前のフェーズでCheckpoint名を動的に注入する「ジョブの実行時遅延解決（Lazy Resolution）」を搭載。
 * さらに、現在のインデックスを汚さずに特定のモデルを最優先で割り込ませる緊急レーン「Local List」をも制御する、本Suiteの文字通りの「心臓」じゃ。
 
-### 2. 💜 Checkpoint List Selector（頭脳）
+### 2. 💜 [Checkpoint List Selector（頭脳）](CheckpointListSelector.md)
 
 リポジトリ内の全モデルを一手に統括し、状況に応じて役割を2変化させる司令塔じゃ。
 
@@ -51,14 +51,14 @@
 * 右手（Tagger）や目（Preview）とリンクした瞬間、UI動相同期モードである **`🎯 Sync Checkpoint`** へと動的に覚醒する！
 * ポチッと押すだけで、新モデルの追加や物理削除の結果を、**ComfyUIの再起動なしで1秒で同期する `🔄 Refresh All` アビリティ**も有しておるぞ。
 
-### 3. 💛 Checkpoint Status Tagger（右手）
+### 3. 💛 [Checkpoint Status Tagger（右手）](CheckpointStatusTagger.md)
 
 画像を見ながら、モデルに対して冷徹かつ瞬時に格付け（レイティング）を行う執行官じゃ。
 
 * ボタンは `favorite(💛)` / `nice(👍)` / `keep(✔)` / `delete(🗑)` の4つ。（`none` はトグルで解除）。
 * 特筆すべきは、「💛や👍がついている間は、deleteボタンが物理的にグレーアウトし、サーバー側でも絶対に削除予約を弾く」という、うっかり誤爆を100%許さない鉄壁のセーフティバリデーション。右手の誇りにかけて、神モデルを絶対に見捨てぬ設計じゃ！
 
-### 4. 💙 Ephemeral Preview ＆ ImageDir Preview（目）
+### 4. 💙 [Ephemeral Preview](EphemeralPreview.md) ＆ [ImageDir Preview（目）](ImageDirPreview.md)
 
 インジェクションされた情報とストレージをマッハで逆探知する、Suiteの「網膜」じゃ。
 
