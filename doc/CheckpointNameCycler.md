@@ -3,6 +3,10 @@
 `Checkpoint Name Cycler` は、本Suiteの「動力を司る心臓」じゃ。
 大量の生成ジョブをバックグラウンドで走らせながら、Checkpoint（.safetensors）を指定したルールに基づいて全自動で切り替え、KSamplerへインジェクション（注入）し続ける役割を担っておる。
 
+
+<img width="613" height="464" alt="image" src="https://github.com/user-attachments/assets/84d15700-eeb4-4df6-926d-dc7430a9d38d" />
+
+
 ---
 
 ## 🔌 入出力仕様（Specifications）
