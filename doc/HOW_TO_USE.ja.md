@@ -137,11 +137,11 @@ python delete_reserved_checkpoints.py
 > 本Suiteは、チェックポイントを極めて安全にレビューし、棚卸しするための最高峰のシステムです。
 > しかしながら、**長期的なディスク空き容量の増加を保証するものではありません。**
 > なぜなら、賢明なるユーザー諸氏（おぬしたち）は、SSDに空きができた瞬間に**「歓喜の雄叫びをあげながら、さらに多くの新しいCheckpointを狂ったようにダウンロードしてしまう」**からです。
->
-> This tool helps you safely review and clean up checkpoints.
-> It does not guarantee increased free disk space in the long term, because users may respond by downloading even more checkpoints.
 
 <img width="1448" height="1086" alt="ストレージ会議中" src="https://github.com/user-attachments/assets/a5317380-3014-4f7a-bf78-7ee3466faa6c" />
+
+> This tool helps you safely review and clean up checkpoints.
+> It does not guarantee increased free disk space in the long term, because users may respond by downloading even more checkpoints.
 
 <img width="1536" height="839" src="https://github.com/user-attachments/assets/4864351d-c8e4-4bbd-aa5b-a44b4b5a34de" />
 
