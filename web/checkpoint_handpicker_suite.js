@@ -269,10 +269,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 100 : 30;
+    const top = isImageDir ? 72 : 30;
     const margin = 8;
-    const messageX = Math.min(120, Math.max(margin, this.size[0] - 80));
-    const captionY = isImageDir ? 82 : top - 6;
+    const messageX = Math.min(140, Math.max(margin, this.size[0] - 80));
+    const captionY = isImageDir ? 36 : 20;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
