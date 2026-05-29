@@ -1,15 +1,31 @@
 # ComfyUI-CheckpointHandpickerSuite
 
-A smarter way to cycle, status-tag, review, and safely clean up ComfyUI checkpoints, with no guarantee of saving disk space.
+Turn your ComfyUI checkpoint workflow into a deluxe checkpoint jukebox with a review desk attached.
 
-## Draft status
+Cycle checkpoints during batch generation, preview the results, tag what deserves to stay, and prepare deletion candidates safely without deleting anything immediately.
 
-This is an experimental draft for discussion and testing.
+## Status
+
+This is the first experimental `0.1.0` release.
+
+## Installation
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
+```
+
+Restart ComfyUI.
+
+## Documentation
+
+- [How to use](doc/HOW_TO_USE.md)
+- [日本語ドキュメント](doc/README.ja.md)
 
 ## Nodes
 
-- Checkpoint List Selector
 - Checkpoint Name Cycler
+- Checkpoint List Selector
 - Checkpoint Status Tagger
 - Ephemeral Preview
 - ImageDir Preview
