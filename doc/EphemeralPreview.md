@@ -4,6 +4,8 @@
 
 最大の特徴は、一般的なComfyUIのプレビューノードとは異なり、**ストレージ（SSD/HDD）の `temp` ディレクトリへ一切のプレビュー用キャッシュファイルを書き出さない（ゼロ・ディスクドライブ）** という、徹底的なSSD保護＆高速化設計にあるのじゃ！
 
+<img width="746" height="755" alt="image" src="https://github.com/user-attachments/assets/4241b729-316f-430d-8d5f-f9e1dea8c4e2" />
+
 ---
 
 ## 🔌 入出力仕様（Specifications）
