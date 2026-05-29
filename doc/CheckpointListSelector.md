@@ -4,6 +4,9 @@
 
 最大の特徴は、ComfyUIの常識である「ノード同士を線（ワイヤー）で繋ぐ」という概念を飛び越え、**キャンバス上の他のノードへ好きなタイミングで遠隔から情報をインジェクション（無線通信）できる**点にあるのじゃ！
 
+<img width="565" height="554" alt="image" src="https://github.com/user-attachments/assets/70cbe803-1cfd-43be-bff1-077a1e50c0e9" />
+
+
 ---
 
 ## 🔌 入出力仕様（Specifications）
