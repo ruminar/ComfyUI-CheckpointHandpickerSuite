@@ -4,6 +4,8 @@
 
 最大の特徴は、不要と判断したモデルをその場ですぐに物理削除（消去）せず、一旦「削除予約（Delete Reservation）」という安全なバッファ状態に留める設計にあるのじゃ。
 
+<img width="510" height="177" alt="image" src="https://github.com/user-attachments/assets/53f8cb24-d505-4d0a-9936-ffd53e51a373" />
+
 ---
 
 ## 🔌 入出力仕様（Specifications）
