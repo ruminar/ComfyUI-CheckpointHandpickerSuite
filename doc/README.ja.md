@@ -74,7 +74,8 @@
 * **List, cycle, tag, preview ── four parts, one workflow.**
 * （リストし、巡回し、タグ打ちし、プレビューする ── 4つのパーツ、1つのワークフロー。）
 
-(画像を貼る)
+<img width="1491" height="1055" alt="HandpickerSuite構成要素紹介" src="https://github.com/user-attachments/assets/8ddeeebd-0122-4c4a-9c0c-a73feff1f5fb" />
+
 
 ---
 
@@ -88,3 +89,10 @@ Taggerで `delete（🗑）` を押したモデルは、その場では物理削
 ## 💎 ライセンス
 
 本Suiteは **GPL-3.0（ComfyUI本体の掟に従っておるぞ！）** のもとで世界に公開されておる。陰の叡智を、良識の範囲で自由に使い倒すがよい！
+
+---
+予告画像
+<img width="1448" height="1086" alt="統合版予告" src="https://github.com/user-attachments/assets/53f6c2c0-4a2a-4497-9f34-0d26adcf9340" />
+
+
+
