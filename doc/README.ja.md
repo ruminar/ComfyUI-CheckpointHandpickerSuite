@@ -94,5 +94,5 @@ Taggerで `delete（🗑）` を押したモデルは、その場では物理削
 予告画像
 <img width="1448" height="1086" alt="統合版予告" src="https://github.com/user-attachments/assets/53f6c2c0-4a2a-4497-9f34-0d26adcf9340" />
 
-
-
+構成要素画像別バージョン
+<img width="1536" height="1024" alt="構成要素画像別バージョン" src="https://github.com/user-attachments/assets/72e4d48b-f6b9-4f70-8fe9-74bccaa23268" />
