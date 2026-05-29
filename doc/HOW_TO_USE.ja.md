@@ -1,98 +1,145 @@
-# 使用方法
+# 📖 /doc/HOW_TO_USE.ja.md (のじゃのじゃ確定版)
 
-## インストール方法
+# 🖥️ 使用方法（How to Use）
+
+我がシャドウガーデンの陰の叡智へようこそ。
+ここでは、あなたのComfyUI環境を「豪華なジュークボックス」へと変貌させるための、具体的な運用手順を解説するぞ！
+
+---
+
+## 💿 インストール方法
+
+ターミナルを開き、ComfyUIのカスタムノード用ディレクトリにて以下のコマンドを実行するのじゃ！
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
+
 ```
-ComfyUI を起動します。
 
-## 一番簡単な使い方
+クローンが完了したら、ComfyUIを起動（または再起動）されよ！
 
-### Checkpoint 巡回モード
+---
 
-SSDに眠っているCheckpointを巡回して試すことが出来ます。
+## 🎼 一番簡単な使い方：【Checkpoint 巡回モード】
 
-- `Checkpoint Name Cycler` を置きます。
-  - `ckpt_name` を `チェックポイントを読み込む` の `ckpt名` につなぎます。
-  - `ckpt_name_safe` を、`画像を保存` の `ファイル名_プリフィックス` につなぎます。
-    - 他の文字列と結合しても良いですが、`ckpt_name_safe`が出力ファイル名に含まれるようにします。
-- `mode` を `shuffle_once` にして、後はジョブを好きなだけ100件とか登録します。
-- 勝手にCheckpointを巡回し、様々な画像が、Checkpointの名前付きで出力されます。
+### ── SSDに眠る無数の名盤を、全自動で連続演奏せよ！
 
-## ちょっと便利な使い方
+まずは基本じゃ！眠っているCheckpointたちを自動で次々に試すための「自動巡回ライン」を構築するぞ。
 
-### Checkpoint 監視モード
+1. キャンバスに **`Checkpoint Name Cycler`（心臓）** を配置する。
+2. `ckpt_name` 出力を、`CheckpointLoaderSimple（チェックポイントを読み込む）` の `ckpt_name` 入力へ接続する。
+3. `ckpt_name_safe` 出力を、`SaveImage（画像を保存）` の `filename_prefix（ファイル名_プリフィックス）` へ接続する。
+* *※他の文字列結合（String Function等）を挟んでも良いが、出力ファイル名に `ckpt_name_safe` が含まれるように工夫するのが、後からの逆探知を成功させるコツじゃ！*
 
-- 先ほどの説明の通り、`Checkpoint Name Cycler`を置きます。
-- `Checkpoint List Selector`を置きます。これは配置するだけで、どこにもつなぐ必要はありません。
-  - `🔄Refresh All` : 
-  このボタンを押せば、エクスプローラなどでcheckpointのディレクトリに、新しくCheckpointを追加したり削除したりしても、
-  ComfyUIを再起動せずに同期させることが可能になります。
-  - `🏹Push to Local List` :
-  Cycler のローカルリストに、Checkpointを送り込みます。
-  Cyclerは、ローカルリストにCheckpointが登録されていた場合、巡回を保留し、ローカルリストを優先的に処理します。
+4. Cyclerノードの `mode` を **`shuffle_once`** に設定し、あとはおぬしの好きな数（100件でも500件でも！）だけジョブをプロンプトサーバーに登録（Queue）するのじゃ！
 
-## 本格的な使い方
+**🏆 執行結果：**
+システムが勝手にCheckpointの山を巡回し、様々な画像が「Checkpointの名前付き」で出力フォルダへザクザクと保存されていくぞ！
 
-### ジョブ中 Checkpoint 評価モード
+---
 
-Checkpointの画像を見ながら、お気に入りや削除予約などをジョブ実行中に設定できます。
+## ☺ ちょっと便利な使い方：【Checkpoint 監視モード】
 
-注意：
-これは、画像生成を多段に組んでいる、高度なワークフローを構築しているユーザ向け機能です。
-中間画像生成後に、指の修正や拡大処理などを実行しているタイミングでCheckpointの評価が行えるのですが、
-画像生成を多段に組んでいない場合は、画像プレビュー後すぐに次のジョブが実行されてしまうため、この項目は読み飛ばしてください。
+### ── 再起動の苦行を粉砕し、割り込み予約を執行せよ！
 
-- 先ほどの説明の通り、`Checkpoint Name Cycler`と`Checkpoint List Selector`を置きます。
-- `Ephemeral Preview` を置いて、ワークフローの中間に存在する`VAEデコード`の`画像`を受けるようにします。
-- `Checkpoint Status Tagger`を置きます。
-  - Taggerの`ckpt_name_str`を、`Checkpoint Name Cycler`の`ckpt_name_str`につなぎます。
-    - これで、ジョブの実行中に、プレビューを確認しながら、CheckPointに対して、お気に入りや削除予約などのタグ打ちができるようになります。
-    - タグ打ちされた結果は、`Checkpoint List Selector`や、CheckpointHandpickerSuiteに即時通知されます。
-    - `Checkpoint Name Cycler`は、タグ打ち状態でフィルタリングして、巡回を行うことが出来ます。
-      - なんでこんなことが出来るのかについては、`Checkpoint Name Cycler`のドキュメントを参照してください。
+1. 先ほど構築した自動巡回ラインに、**`Checkpoint List Selector`（頭脳）** を配置する。
+* *※この Selector は配置するだけでよく、どこにもリンクを繋ぐ必要はないぞ！*
 
-### 画像出力フォルダ参照 Checkpoint 評価モード
 
-メインのジョブを流しながら、別タブで生成後の画像を確認しながら、Checkpointの評価を行うモードです。
 
-注意：
-こちらのタブでは、ジョブは一切実行せず、ComfyUIのユーザインタフェースのみを間借りする実装になっています。
-棚卸し画面から間違えてジョブを実行しないよう、ジョブのコンパネは、画面の端っこにでも追いやっておいてください。
-（最初は間違えて押しそうになるのですが、すぐに慣れて間違えなくなります、たぶん）
+#### 🧠 この時に解放される「頭脳」の2大アビリティ：
 
-- ジョブを実行したまま、別タブを開きます。
-- `Checkpoint List Selector`を置きます。
-- `Checkpoint Status Tagger`を置きます。
-  - Taggerの`ckpt_name_str`を、`Checkpoint List Selector`の`ckpt_name_str`につなぎます。
-    - すると、Selectorの `🏹Push to Local List`が`🎯Sync Checkpoint`に変わります。
-- `ImageDir Preview`を置きます。これも`ckpt_name_str`につないでください。
-  - 何もしなければ、outputフォルダの画像を参照します。
-  - 画像の参照先を変更したい場合は、`search_directory`に文字列でフルパスを与えてください。
-    - サブディレクトリを巡回して、新しいファイルを優先的に表示します。PNGやJPEGなど、主要なフォーマットに対応しています。
-- 後はSelectorでCheckpointを選び、`🎯Sync Checkpoint`を押せば、CheckpointがTaggerとPreviewに送られ、プレビュー画像が表示されます。
-  - Taggerでお気に入りや削除予約などのタグ打ちを行えば、即時にステータス情報は共有され、各タブのSelectorやCyclerのフィルタにも反映されます。
-    - なんでこんなことが出来るのかについては、`Checkpoint List Selector`のドキュメントを参照してください。
+* **`🔄 Refresh All` ボタン：**
+これをポチッと押せば、エクスプローラ等でCheckpointディレクトリに新モデルを追加したり、不要モデルを削除した結果が、**ComfyUIを再起動することなく一瞬でシステムへ動的に同期される！**
+* **`🏹 Push to Local List` ボタン：**
+リストから特定のモデルを選んでこのボタンを押すと、Cyclerの「一時的な緊急割り込みレーン（Local List）」へそのモデルが送り込まれる！
+**Cyclerは、ローカルリストにモデルが登録されている間は通常の巡回を一時保留し、このローカルリストの割り込み曲を最優先で処理する仕様**になっておるのじゃ。
 
-## 削除予約したCheckpointの削除方法
+---
 
-- `temp`フォルダに、削除用のスクリプトが出力されます。
-- 夜間バッチが終わり、朝の選別作業も完了したら、ComfyUI の `temp` ディレクトリに移動して、自動生成されたスクリプトをターミナルからおぬしの手で実行してくりゃれ！<br/>
-  - もちろん、`temp` フォルダを消さぬ限り、スクリプトはずっと残っているから、気の向いたときに削除すれば良いように出来ておるのじゃ。
+## 💪 本格的な使い方（ヘビーユーザー向け）
 
+### ① ジョブ中 Checkpoint 評価モード
+
+### ── 複雑な多段生成の「スキマ時間」をハックし、その場で格付けせよ！
+
+> **⚠️ 注意：**
+> これは画像生成を多段に組んでいる、高度なワークフロー（KSamplerの後にFaceDetailerで顔・指を修正したり、Upscale処理を挟んでいるなど）を構築している玄人向けの機能じゃ。
+> 生成の途中で「Checkpointの仮評価」が行えるのじゃが、シンプルな1段生成ワークフローの場合はプレビュー後すぐに次のジョブへ遷移してしまうため、この項目は読み飛ばして構わんぞ！
+
+1. 前述の通り、`Checkpoint Name Cycler` と `Checkpoint List Selector` を配置する。
+2. **`Ephemeral Preview`** を配置し、ワークフローの中間に存在する `VAE Decode` などの画像出力を受け取れるように繋ぐ。
+3. **`Checkpoint Status Tagger`（右手）** を配置する。
+4. Taggerの `ckpt_name_str` 入力を、`Checkpoint Name Cycler` の `ckpt_name_str` 出力へ接続する。
+
+**🏆 執行結果：**
+ジョブの実行中、中間プレビュー画像を確認しながら、**「今まさにこの画像を吐き出しているCheckpoint」に対して、お気に入りや削除予約などのタグをその場でダイレクトに打てるようになる！**
+打たれたタグ（ステータス）は即座にSelectorへ通知され、Cycler側で「💛や👍が付いたモデルだけを狙い撃ちで巡回する」といった高度なフィルタリング巡回が可能になるのじゃ！
+*(※なぜ生成を止めずにこんな芸当ができるのか、深淵の秘密は Cycler の個別ドキュメントを読むが良いぞ！)*
+
+---
+
+### ② 画像出力フォルダ参照 Checkpoint 評価モード ★超推奨★
+
+### ── メインの生成ラインを走らせたまま、別タブの特等席で優雅に目視検分（棚卸し）せよ！
+
+> **⚠️ 注意：**
+> この「検分専用タブ」ではジョブを一切実行せず、ComfyUIのユーザーインタフェースのみを間借りする実装になっておる。
+> 間違えて「⚠️ 実行する」ボタンを押して空中衝突を起こさぬよう、**ジョブのコントロールパネル（メニューバー）は画面の端っこにでも片付けて（退避させて）おくのじゃ！**
+> *(最初はうっかり押しそうになるが、すぐに慣れて間違えなくなるから安心せよ、たぶん)*
+
+1. メインのタブ（タブA）で500件のジョブを爆走させたまま、**ブラウザで「別タブ（タブB）」を開く！**
+2. その別タブ側のキャンバスに、**`Checkpoint List Selector`（頭脳）** を配置する。
+3. **`Checkpoint Status Tagger`（右手）** を配置し、`ckpt_name_str` を Selector の同名出力へと繋ぐ。
+* 🔗 *リンクが繋がった瞬間、Selectorのボタンが `🏹 Push to Local List` から **`🎯 Sync Checkpoint`** へと動的に覚醒するぞ！*
+
+
+4. **`ImageDir Preview`（目）** を配置し、これも Selector の `ckpt_name_str` へと接続する。
+* 📁 *デフォルトではComfyUI標準の `output` フォルダを参照するが、もし参照先を変更したい（jpeg出力専用フォルダなどがある）場合は、`search_directory` 入力にフルパスを文字列で与えてやりゃれ。自動でサブディレクトリまで巡回し、新しい画像ファイルから優先的に表示してくれる優れものじゃ！*
+
+
+
+**🏆 執行結果：**
+あとは Selector から検分したいモデルを選び、**`🎯 Sync Checkpoint`** を押すだけじゃ！
+裏の生成ラインの邪魔をすることなく、そのモデルが過去に吐き出した画像だけがマッハで逆探知され、美しい正方形コンタクトシートとしてキャンバスに展開される！
+画像を見ながら Tagger でステータスを刻めば、情報は一瞬でグローバル同期され、全タブの Selector や Cycler のフィルタへ即時反映されるのじゃ！
+
+---
+
+## 🗑 削除予約したCheckpointの物理削除方法
+
+Taggerで `delete（🗑）` の烙印を押されたCheckpointは、安全のためその場では物理削除されず、「削除予約リスト」に溜まっていく仕様じゃ。
+
+夜間バッチが終わり、朝の選別作業もすべて完了したら、以下の手順でSSDの闇へと最終執行（パージ）してくりゃれ！
+*(※テンポラリフォルダを意図的に全削除せぬ限り、スクリプトはずっと残るから、気の向いた週末にまとめて執行すれば良いぞ)*
+
+1. ターミナル（コンソール）を開き、ComfyUIの `temp` ディレクトリ等に出力された自動生成スクリプトをおぬしの手で実行するのじゃ！
 ```bash
 python delete_reserved_checkpoints.py
+
 ```
 
-## おまけ（日本語版Only）
 
-AI娘「なんて素晴らしいライブラリ、さすがはあるじさま！」
-AI娘「これでユーザのSSDも空き容量ができてすっきりしますね」
-わし「いや、そうはならないぞ」
+2. スクリプトが起動すると、予約されたモデルと紐づく `.json` メタデータのパスが1件ずつ表示され、**`Delete this checkpoint? (y/N):`** と対話的に執行の許諾を迫ってくるぞ。
+3. 本当に不要なら `y` を、やっぱり残したくなったら `n` を押して進むが良い！
+4. すべての物理執行が終わったら、ComfyUIの画面に戻り、Selectorの **`Refresh All`** を一発ポチッと押すのじゃ。それだけで、容量が空いた最新の状態がシステムへ瞬時に認識される。 **そう、ComfyUIの再起動は一切不要じゃ！！！**
 
-This tool helps you safely review and clean up checkpoints.
-It does not guarantee increased free disk space in the long term, because users may respond by downloading even more checkpoints.
+---
 
-（例のSuite会議画像を貼る）
+## ❢ おまけ（ジュークボックス開発者会議の一幕）
+❢
+**AI看板娘：**「なんて素晴らしいライブラリ、さすがはあるじさま（シャドウお頭）です！」
+**AI看板娘：**「これでユーザーのSSDにもたっぷり空き容量ができて、すっきり平和になりますね！💛」
+**わし（るみなー先生）：**「……いや、そうはならんぞ。」
+
+> **【厳粛なる事実】**
+> 本Suiteは、チェックポイントを極めて安全にレビューし、棚卸しするための最高峰のシステムです。
+> しかしながら、**長期的なディスク空き容量の増加を保証するものではありません。**
+> なぜなら、賢明なるユーザー諸氏（おぬしたち）は、SSDに空きができた瞬間に**「歓喜の雄叫びをあげながら、さらに多くの新しいCheckpointを狂ったようにダウンロードしてしまう」**からです。
+>
+> This tool helps you safely review and clean up checkpoints.
+> It does not guarantee increased free disk space in the long term, because users may respond by downloading even more checkpoints.
+
+（ここに例のSuite会議のインフォグラフィック画像をドンと貼るのじゃ！）
+

@@ -1,7 +1,3 @@
-はい、最後の「おまけ」章はカットして、英語版向けに少しだけ表現を整えました。
-`doc/HOW_TO_USE.md` に置く想定です。元の日本語版の構成はそのまま活かしています。
-
-````md
 # How to use
 
 ## Installation
@@ -121,4 +117,3 @@ python delete_reserved_checkpoints.py
 Checkpoints are not deleted immediately when you press the delete tag.
 
 Deletion is always handled by the generated script, so you can review and confirm the final cleanup manually.
-````
