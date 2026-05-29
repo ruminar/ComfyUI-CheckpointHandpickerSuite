@@ -100,8 +100,8 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 あとは Selector から検分したいモデルを選び、**`🎯 Sync Checkpoint`** を押すだけじゃ！
 裏の生成ラインの邪魔をすることなく、そのモデルが過去に吐き出した画像だけがマッハで逆探知され、美しい正方形コンタクトシートとしてキャンバスに展開される！  
 画像を見ながら Tagger でステータスを刻めば、情報は一瞬でグローバル同期され、全タブの Selector や Cycler のフィルタへ即時反映されるのじゃ！
-
-*(※なぜ生成を止めずにこんな芸当ができるのか、深淵の秘密は Cycler の個別ドキュメントを読むが良いぞ！)*
+<img width="1348" height="923" alt="image" src="https://github.com/user-attachments/assets/82ad36fe-1b04-457f-863c-6ca17b70ed8b" />
+*(※なぜ生成を止めずにこんな芸当ができるのか、深淵の秘密は Selector の個別ドキュメントを読むが良いぞ！)*
 
 ---
 
