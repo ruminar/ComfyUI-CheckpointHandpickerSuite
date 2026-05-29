@@ -271,7 +271,7 @@ function setupPreviewNode(nodeType) {
     const isImageDir = isNodeClass(this, "ImageDirPreview");
     const top = isImageDir ? 100 : 30;
     const margin = 8;
-    const messageX = isImageDir ? Math.min(120, Math.max(margin, this.size[0] - 80)) : margin;
+    const messageX = Math.min(120, Math.max(margin, this.size[0] - 80));
     const captionY = isImageDir ? 82 : top - 6;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);

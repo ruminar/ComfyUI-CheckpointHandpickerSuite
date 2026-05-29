@@ -471,52 +471,79 @@ def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool =
     """Choose a contact-sheet layout using MAX_CONTENT_EDGE as the image-content limit.
 
     GAP is intentionally ignored for the fit calculation and added only to the
-    final canvas size. This keeps the 8x10 / 512x384 style overview possible,
-    with the small gap overflow accepted by design.
+    final canvas size. This keeps overview sheets readable, with the small gap
+    overflow accepted by design.
+
+    The grid is chosen by scoring every possible column count and selecting the
+    layout whose final content area is closest to square. This avoids hard-coded
+    per-count tables while naturally choosing layouts such as:
+
+    - 5 portrait images  -> 3x2
+    - 10 portrait images -> 4x3
+    - 12 portrait images -> 4x3
+    - 80 landscape images -> 8x10
+
+    Tie-breakers prefer larger tile scale, fewer empty cells, and then a layout
+    that follows the source image orientation.
     """
     count = max(1, int(count))
     ref_w = max(1, int(ref_w))
     ref_h = max(1, int(ref_h))
-    # Five images as a single 5x1 strip feels too wide in the preview UI.
-    # Prefer a compact 3x2 grid even if it leaves one empty cell.
-    if count == 5:
-        preferred = _layout_for_grid(count, ref_w, ref_h, 3, 2, allow_upscale=allow_upscale)
-        if preferred is not None:
-            return preferred
 
+    eps = 1e-12
     landscape = ref_w >= ref_h
     best = None
+
     for cols in range(1, count + 1):
         rows = math.ceil(count / cols)
         cells = cols * rows
         empty = cells - count
-        scale = min(MAX_CONTENT_EDGE / (cols * ref_w), MAX_CONTENT_EDGE / (rows * ref_h))
+
+        raw_w = cols * ref_w
+        raw_h = rows * ref_h
+        scale = min(MAX_CONTENT_EDGE / max(1, raw_w), MAX_CONTENT_EDGE / max(1, raw_h))
         if not allow_upscale:
             scale = min(1.0, scale)
         if scale <= 0:
             continue
+
         tile_w = max(1, int(ref_w * scale))
         tile_h = max(1, int(ref_h * scale))
         content_w = cols * tile_w
         content_h = rows * tile_h
+        if content_w <= 0 or content_h <= 0:
+            continue
         if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
             continue
+
         canvas_w = content_w + GAP * max(0, cols - 1)
         canvas_h = content_h + GAP * max(0, rows - 1)
-        # Primary: largest tile scale. Secondary: fewer empty cells.
-        # Tie-breaker: landscape images prefer wider grids, portrait images taller grids.
+
+        # Gemini-style grid choice: make the whole sheet as close to square as
+        # possible. Use EPS so near-identical float results do not flap between
+        # layouts.
+        aspect_score = max(content_w, content_h) / max(1, min(content_w, content_h))
         orientation_bonus = 1 if ((cols >= rows) if landscape else (rows >= cols)) else 0
-        score = (
+        tie_score = (
             round(scale, 8),
             -empty,
             orientation_bonus,
-            -abs(content_w - content_h),
             cols if landscape else rows,
         )
-        if best is None or score > best[0]:
-            best = (score, SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, count))
+
+        layout = SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, count)
+        if best is None:
+            best = (aspect_score, tie_score, layout)
+            continue
+
+        best_aspect, best_tie, _ = best
+        if aspect_score < best_aspect - eps:
+            best = (aspect_score, tie_score, layout)
+        elif abs(aspect_score - best_aspect) <= eps and tie_score > best_tie:
+            best = (aspect_score, tie_score, layout)
+
     if best is not None:
-        return best[1]
+        return best[2]
     return SheetLayout(1, count, ref_w, ref_h, ref_w, count * ref_h + GAP * max(0, count - 1), count)
 
 
