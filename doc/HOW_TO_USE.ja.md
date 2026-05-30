@@ -27,12 +27,13 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 
 まずは基本じゃ！眠っているCheckpointたちを自動で次々に試すための「自動巡回ライン」を構築するぞ。
 
-1. キャンバスに **`Checkpoint Name Cycler`（心臓）** を配置する。
-2. `ckpt_name` 出力を、`CheckpointLoaderSimple（チェックポイントを読み込む）` の `ckpt_name` 入力へ接続する。
-3. `ckpt_name_safe` 出力を、`SaveImage（画像を保存）` の `filename_prefix（ファイル名_プリフィックス）` へ接続する。
+1. 今使っている、画像生成用のワークフローを開きます。(この導入のために、新しい専用ワークフローを組む必要はまったくないぞ！)
+2. キャンバスに **`Checkpoint Name Cycler`（心臓）** を配置する。
+3. `ckpt_name` 出力を、`CheckpointLoaderSimple（チェックポイントを読み込む）` の `ckpt_name` 入力へ接続する。
+4. `ckpt_name_safe` 出力を、`SaveImage（画像を保存）` の `filename_prefix（ファイル名_プリフィックス）` へ接続する。
 * *※他の文字列結合（String Function等）を挟んでも良いが、出力ファイル名に `ckpt_name_safe` が含まれるように工夫するのが、後からの逆探知を成功させるコツじゃ！*
 
-4. Cyclerノードの `mode` を **`shuffle_once`** に設定し、あとはおぬしの好きな数（100件でも500件でも！）だけジョブをプロンプトサーバーに登録（Queue）するのじゃ！
+5. Cyclerノードの `mode` を **`shuffle_once`** に設定し、あとはおぬしの好きな数（100件でも500件でも！）だけジョブをプロンプトサーバーに登録（Queue）するのじゃ！
 
 **🏆 執行結果：**
 システムが勝手にCheckpointの山を巡回し、様々な画像が「Checkpointの名前付き」で出力フォルダへザクザクと保存されていくぞ！

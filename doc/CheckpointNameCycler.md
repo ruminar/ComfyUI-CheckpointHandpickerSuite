@@ -31,7 +31,8 @@ Checkpointの巡回アルゴリズムを選択する（詳細は後述）。
 ### 📤 出力（Outputs）
 
 * **`ckpt_name` (COMBO):**
-現在選択（解決）されたCheckpointの名前。
+現在選択（解決）されたCheckpointの名前。  
+ざっくり言ってしまえば、これを今使っているワークフローの`チェックポイントを読み込む`に渡してやるだけで、簡単に今のワークフローに巡回機能を与えることが出来るのじゃ！  
 * **`ckpt_name_str` (STRING):**
 現在選択されたCheckpointのファイルパス文字列（TaggerやPreviewへの動的バインド用）。
 * **`ckpt_name_safe` (STRING):**
