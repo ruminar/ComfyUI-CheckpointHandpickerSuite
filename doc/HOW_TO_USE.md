@@ -71,6 +71,7 @@ Status changes are immediately shared with the Checkpoint Handpicker Suite UI, i
 
 `Checkpoint Name Cycler` can also use checkpoint status as a filter when cycling.
 
+<img width="1440" height="1150" alt="image" src="https://github.com/user-attachments/assets/90b43e08-e759-4b56-ad6f-0be0c64e4afd" />
 For details about how this works, see the `Checkpoint Name Cycler` documentation.
 
 ### Output-folder checkpoint review mode
@@ -102,6 +103,7 @@ The selected checkpoint will be sent to the connected Tagger and Preview nodes, 
 
 When you tag a checkpoint using the Tagger, the status is shared immediately. Other tabs can refresh or update their own Suite UI, and Cycler filters can use the updated status.
 
+<img width="1348" height="923" alt="image" src="https://github.com/user-attachments/assets/82ad36fe-1b04-457f-863c-6ca17b70ed8b" />
 For details about how this works, see the `Checkpoint List Selector` documentation.
 
 ## Deleting checkpoints marked for deletion
