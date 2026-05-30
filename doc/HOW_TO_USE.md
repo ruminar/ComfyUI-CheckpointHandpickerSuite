@@ -122,23 +122,30 @@ Deletion is always handled by the generated script, so you can review and confir
 
 ## Checkpoint review as a workflow
 
-Checkpoints are not just files.  
-Each model has its own strengths, weaknesses, habits, and moments where it works surprisingly well.
+Checkpoints are not just files.
 
-However, reviewing checkpoints has often been a vague process:
-generate a few images, keep some impressions in memory, maybe rename a file, maybe delete something later.
+Each model has its own strengths, weaknesses, habits, and moments where it works unexpectedly well.
 
-Checkpoint Handpicker Suite was designed to make that process more explicit and repeatable.
+However, checkpoint review often tends to be vague:
 
-The idea is simple:
+- generate a few images
+- remember a rough impression
+- search for outputs later by filename
+- hesitate to delete anything because the decision feels risky
 
-- checkpoints should be easy to cycle through
-- interesting checkpoints should be easy to test again
-- review results should be recorded as lightweight status tags
-- deletion should be reserved first, not executed immediately
-- reviewed statuses should be usable as filters for future cycling
-- checkpoint selection should be resolved at execution time, so refreshes and status changes can be reflected without restarting ComfyUI
-- review should be possible both during generation and from generated output images in another tab
+ComfyUI-CheckpointHandpickerSuite was designed to make this process more explicit and repeatable.
 
-In other words, this suite is not only a set of nodes.  
-It is an attempt to provide a practical workflow for discovering, reviewing, revisiting, and safely cleaning up checkpoints.
+The basic ideas are:
+
+1. You need checkpoint cycling before you can efficiently gather review targets.
+2. Interesting checkpoints should be easy to revisit by inserting them into the next jobs.
+3. Statuses should stay simple: `favorite`, `nice`, `keep`, `delete`, or `none`.
+4. `delete` should mean delete reservation, not immediate physical deletion.
+5. Review statuses should be usable as filters for future cycling.
+6. To make those filters meaningful, checkpoint selection should be resolved at execution time, not when the job is queued.
+7. Execution-time resolution makes it possible to follow checkpoint refreshes and status changes without restarting ComfyUI.
+8. Review should be possible both during generation and from generated output images in another tab.
+
+In other words, this suite is not only a set of nodes.
+
+It is a practical proposal for discovering, testing, reviewing, revisiting, and safely cleaning up checkpoints in checkpoint-heavy ComfyUI workflows.
