@@ -119,3 +119,26 @@ python delete_reserved_checkpoints.py
 Checkpoints are not deleted immediately when you press the delete tag.
 
 Deletion is always handled by the generated script, so you can review and confirm the final cleanup manually.
+
+## Checkpoint review as a workflow
+
+Checkpoints are not just files.  
+Each model has its own strengths, weaknesses, habits, and moments where it works surprisingly well.
+
+However, reviewing checkpoints has often been a vague process:
+generate a few images, keep some impressions in memory, maybe rename a file, maybe delete something later.
+
+Checkpoint Handpicker Suite was designed to make that process more explicit and repeatable.
+
+The idea is simple:
+
+- checkpoints should be easy to cycle through
+- interesting checkpoints should be easy to test again
+- review results should be recorded as lightweight status tags
+- deletion should be reserved first, not executed immediately
+- reviewed statuses should be usable as filters for future cycling
+- checkpoint selection should be resolved at execution time, so refreshes and status changes can be reflected without restarting ComfyUI
+- review should be possible both during generation and from generated output images in another tab
+
+In other words, this suite is not only a set of nodes.  
+It is an attempt to provide a practical workflow for discovering, reviewing, revisiting, and safely cleaning up checkpoints.
