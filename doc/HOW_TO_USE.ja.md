@@ -37,6 +37,11 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 **🏆 執行結果：**
 システムが勝手にCheckpointの山を巡回し、様々な画像が「Checkpointの名前付き」で出力フォルダへザクザクと保存されていくぞ！
 
+### 💡 賢者の応用ハック：【擬似XYプロット（厳密なモデル比較）モード】
+プロンプトの `KSampler` の `seed`（シード値）を `fixed（固定）` に設定した状態で、この巡回ジョブを走らせてやりゃれ！
+すると、構図やポーズを完全に固定したまま、Checkpointの違いによる絵柄の変化だけを1枚ずつ忠実にパフォーミング（比較）できるぞ。
+別タブの `ImageDir Preview` で大画面切り替え検分を行えば、重いXYプロットノードを組むよりも遥かにスマートに、最高峰のモデルソムリエ（格付け）が執行できるのじゃ！
+
 ---
 
 ## ☺ ちょっと便利な使い方：【Checkpoint 監視モード】
@@ -45,8 +50,6 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 
 1. 先ほど構築した自動巡回ラインに、**`Checkpoint List Selector`（頭脳）** を配置する。
 * *※この Selector は配置するだけでよく、どこにもリンクを繋ぐ必要はないぞ！*
-
-
 
 #### 🧠 この時に解放される「頭脳」の2大アビリティ：
 
