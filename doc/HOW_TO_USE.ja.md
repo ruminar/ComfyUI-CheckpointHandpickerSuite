@@ -80,6 +80,8 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 ジョブの実行中、中間プレビュー画像を確認しながら、**「今まさにこの画像を吐き出しているCheckpoint」に対して、お気に入りや削除予約などのタグをその場でダイレクトに打てるようになる！**
 打たれたタグ（ステータス）は即座にSelectorへ通知され、Cycler側で「💛や👍が付いたモデルだけを狙い撃ちで巡回する」といった高度なフィルタリング巡回が可能になるのじゃ！
 
+<img width="1440" height="1150" alt="image" src="https://github.com/user-attachments/assets/90b43e08-e759-4b56-ad6f-0be0c64e4afd" />
+
 ---
 
 ### ② 画像出力フォルダ参照 Checkpoint 評価モード ★超推奨★
