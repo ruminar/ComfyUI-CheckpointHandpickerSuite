@@ -81,6 +81,7 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 打たれたタグ（ステータス）は即座にSelectorへ通知され、Cycler側で「💛や👍が付いたモデルだけを狙い撃ちで巡回する」といった高度なフィルタリング巡回が可能になるのじゃ！
 
 <img width="1440" height="1150" alt="image" src="https://github.com/user-attachments/assets/90b43e08-e759-4b56-ad6f-0be0c64e4afd" />
+*(※なぜこんな巡回ワークフローが組めるのか、深淵の秘密は Cycler の個別ドキュメントを読むが良いぞ！)*
 
 ---
 
