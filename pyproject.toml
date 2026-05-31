@@ -1,7 +1,7 @@
 [project]
 name = "checkpoint-handpicker-suite"
 version = "0.1.0"
-description = "A deluxe checkpoint jukebox and review desk for ComfyUI."
+description = "A deluxe checkpoint jukebox and review desk for ComfyUI. Review-first checkpoint cycling and handpicking suite: non-invasive checkpoint switcher, rotation/cycler helper, random checkpoint selector, and cleanup workflow without replacing Load Checkpoint."
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
