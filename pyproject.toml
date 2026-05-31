@@ -1,12 +1,17 @@
 [project]
-name = "comfyui-checkpoint-handpicker-suite"
+name = "checkpoint-handpicker-suite"
 version = "0.1.0"
-description = "Checkpoint list selection, cycling, tagging, filtering, and lightweight preview tools for ComfyUI."
+description = "A deluxe checkpoint jukebox and review desk for ComfyUI."
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
 
+[project.urls]
+Repository = "https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite"
+Documentation = "https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite/blob/main/doc/HOW_TO_USE.md"
+"Bug Tracker" = "https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite/issues"
+
 [tool.comfy]
 PublisherId = "ruminar"
-DisplayName = "ComfyUI-CheckpointHandpickerSuite"
-Icon = ""
+DisplayName = "Checkpoint Handpicker Suite"
+Icon = "https://raw.githubusercontent.com/ruminar/ComfyUI-CheckpointHandpickerSuite/main/icon.png"
