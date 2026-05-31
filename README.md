@@ -4,6 +4,9 @@ Turn your ComfyUI checkpoint workflow into a deluxe checkpoint jukebox with a re
 
 Cycle checkpoints during batch generation, preview the results, tag what deserves to stay, and prepare deletion candidates safely without deleting anything immediately.
 
+In many cases, you do not need to rebuild your workflow.  
+Just place `CheckpointNameCycler` in front of the checkpoint input of your existing checkpoint loader, and you can build the review workflow in another tab.
+
 ## Status
 
 This is the first experimental `0.1.0` release.

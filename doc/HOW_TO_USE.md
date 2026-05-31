@@ -13,9 +13,9 @@ Start or restart ComfyUI.
 
 ### Checkpoint cycling mode
 
-Automatically cycle through the checkpoints stored on your SSD and test them in your existing generation workflow.
+You can add checkpoint cycling to your existing workflow with a small change: place `Checkpoint Name Cycler` in front of your checkpoint loader.
 
-You do not need to build a new dedicated workflow just to use this suite.
+You do not need to rebuild your workflow around this suite.
 
 1. Open the image generation workflow you already use.
 2. Add a `Checkpoint Name Cycler` node to the canvas.
