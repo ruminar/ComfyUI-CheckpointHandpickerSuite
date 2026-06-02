@@ -147,11 +147,20 @@ function arraysEqual(left, right) {
   return true;
 }
 
+function isCheckpointSlotName(name) {
+  const text = String(name ?? "").toLowerCase();
+  return text.includes("ckpt") || text.includes("checkpoint");
+}
+
 function patchCheckpointSlotTypes(node, checkpoints) {
   const values = [...(checkpoints || [])];
 
   for (const output of node?.outputs ?? []) {
-    if (String(output?.name ?? "") !== "ckpt_name") continue;
+    if (!isCheckpointSlotName(output?.name)) continue;
+
+    // For combo-like checkpoint outputs, the type itself is the allowed value
+    // list. This is the part that prevents type mismatch with downstream
+    // CheckpointNameSelector-style nodes after deletion + Refresh All.
     output.type = [...values];
 
     const links = Array.isArray(output.links) ? output.links : [];
@@ -160,18 +169,19 @@ function patchCheckpointSlotTypes(node, checkpoints) {
       if (!link) continue;
       const targetNode = app.graph?.getNodeById?.(link.target_id);
       const targetInput = targetNode?.inputs?.[link.target_slot];
-      if (targetInput && String(targetInput.name ?? "").toLowerCase().includes("ckpt")) {
+      if (targetInput && isCheckpointSlotName(targetInput.name)) {
         targetInput.type = [...values];
       }
     }
   }
 
   for (const input of node?.inputs ?? []) {
-    if (String(input?.name ?? "").toLowerCase().includes("ckpt")) {
+    if (isCheckpointSlotName(input?.name)) {
       input.type = [...values];
     }
   }
 }
+
 
 function updateCheckpointComboWidget(node, widget, checkpoints) {
   if (!widget || !Array.isArray(checkpoints) || checkpoints.length === 0) {

@@ -383,14 +383,17 @@ def _get_fresh_checkpoint_values() -> list[str]:
 
 
 def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]:
-    """Patch common checkpoint combo INPUT_TYPES after filesystem refresh.
+    """Patch common checkpoint combo INPUT_TYPES / RETURN_TYPES after refresh.
 
-    This mirrors the older ComfyUI-CheckpointWidgetRefresh behavior: refresh is
-    not only a frontend widget update. The backend class definitions are patched
-    too, so ComfyUI validation does not keep stale checkpoint choices.
+    This mirrors the important parts of the old ComfyUI-CheckpointWidgetRefresh
+    behavior. Updating browser widgets is not enough: ComfyUI also validates
+    links and combo values against backend class metadata. In particular,
+    CheckpointNameSelector-style nodes compare their input combo list against
+    the upstream ckpt_name output type, so both sides must be refreshed.
     """
     patched = []
     values = list(checkpoint_values) or [""]
+
     try:
         import nodes as comfy_nodes
     except Exception:
@@ -398,12 +401,14 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
         return patched
 
     mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {})
+
     for class_name, node_class in list(mappings.items()):
         name = str(class_name)
         try:
             if name == "CheckpointLoaderSimple":
                 def loader_input_types(cls, _values=values):
                     return {"required": {"ckpt_name": (list(_values),)}}
+
                 node_class.INPUT_TYPES = classmethod(loader_input_types)
                 patched.append(name)
                 continue
@@ -411,7 +416,28 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
             if "CheckpointNameSelector" in name:
                 def selector_input_types(cls, _values=values):
                     return {"required": {"ckpt_name": (list(_values),)}}
+
                 node_class.INPUT_TYPES = classmethod(selector_input_types)
+                # art-venture style CheckpointNameSelector returns a combo-typed
+                # ckpt_name output. If this remains stale while the input side is
+                # refreshed, ComfyUI can reject links with a type mismatch.
+                node_class.RETURN_TYPES = (list(values), "STRING")
+                patched.append(name)
+                continue
+
+            if name == "CheckpointListSelector":
+                def list_selector_input_types(cls, _values=values):
+                    return {
+                        "required": {
+                            "checkpoint": ("STRING", {"default": ""}),
+                        },
+                        "hidden": {
+                            "unique_id": "UNIQUE_ID",
+                        },
+                    }
+
+                node_class.INPUT_TYPES = classmethod(list_selector_input_types)
+                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
                 patched.append(name)
                 continue
 
@@ -430,11 +456,17 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
                             "unique_id": "UNIQUE_ID",
                         },
                     }
+
                 node_class.INPUT_TYPES = classmethod(cycler_input_types)
+                # Critical: refresh the combo-typed ckpt_name output as well as
+                # start_checkpoint. Otherwise downstream selector nodes may see
+                # different list types after checkpoint deletion.
+                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
                 patched.append(name)
                 continue
         except Exception as exc:
             logger.warning("[CheckpointHandpickerSuite] failed to patch %s: %s", name, exc)
+
     return patched
 
 
