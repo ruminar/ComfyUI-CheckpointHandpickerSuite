@@ -98,7 +98,9 @@ else:
 この計算速度はわずか数マイクロ秒。
 どれほど中途半端な画像枚数が渡されようとも、一瞬で「ユーザーの視線移動（眼球の負担）が最小限に抑えられる、最も美しい正方形のコンタクトシート」へと完璧にパッキングされ、オンメモリでブラウザへと転送・描画されるのじゃよ！
 
-## おまけ
+<br/>
+
+# 💖 おまけ
 
 ## 🤝 おすすめ画像出力ノード：GM Image JPEG Save
 
@@ -124,4 +126,7 @@ else:
 
 単独でも強いが、組み合わせるともっと便利じゃ！ぜひお試しあれ！
 
-![HandpickerSuite x GMImageSaver 連携図](画像のURLやパスをここに書くのじゃ)
+### 📣 宣伝画像
+
+<img width="1055" height="1491" alt="画像生成がもっと便利に！GMImageSaver紹介" src="https://github.com/user-attachments/assets/deb1f01c-d7fa-461d-b8e8-33df33d30ed7" />
+
