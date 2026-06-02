@@ -1,6 +1,6 @@
-# ComfyUI-CheckpointHandpickerSuite v0.1.0
+# ComfyUI-CheckpointHandpickerSuite v0.1.1
 
-First experimental release.
+v0.1.1 fixes the delete reservation workflow and Refresh All behavior after checkpoints are physically deleted.
 
 ## Highlights
 

@@ -7,10 +7,6 @@ Cycle checkpoints during batch generation, preview the results, tag what deserve
 In many cases, you do not need to rebuild your workflow.  
 Just place `CheckpointNameCycler` in front of the checkpoint input of your existing checkpoint loader, and you can build the review workflow in another tab.
 
-## Status
-
-This is the first experimental `0.1.0` release.
-
 ## Installation
 
 ```bash
