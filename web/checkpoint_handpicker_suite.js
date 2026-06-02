@@ -64,6 +64,268 @@ function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
 }
 
+let lastCheckpointValues = null;
+
+function getNodeTypeName(node) {
+  return String(node?.type ?? node?.comfyClass ?? node?.constructor?.type ?? "");
+}
+
+function getNodeDataName(nodeData) {
+  return String(nodeData?.name ?? "");
+}
+
+function findWidget(node, name) {
+  return (node?.widgets ?? []).find((widget) => widget?.name === name);
+}
+
+function findComboWidget(node, name) {
+  const widget = findWidget(node, name);
+  if (!widget) return null;
+  if (Array.isArray(widget?.options?.values) || widget?.type === "combo") return widget;
+  return null;
+}
+
+function findCheckpointWidget(node) {
+  return findComboWidget(node, "ckpt_name")
+    || findComboWidget(node, "checkpoint")
+    || findComboWidget(node, "checkpoint_name");
+}
+
+function findStartCheckpointWidget(node) {
+  return findComboWidget(node, "start_checkpoint");
+}
+
+function outputNames(node) {
+  return (node?.outputs ?? []).map((output) => String(output?.name ?? "").toLowerCase());
+}
+
+function hasSelectorOutputs(node) {
+  const names = outputNames(node);
+  return names.includes("ckpt_name") && names.includes("ckpt_name_str");
+}
+
+function hasLoaderOutputs(node) {
+  const names = outputNames(node);
+  return names.includes("model") && names.includes("clip") && names.includes("vae");
+}
+
+function isCheckpointSelectorLikeNode(node) {
+  if (!node) return false;
+  const typeName = getNodeTypeName(node);
+  if (typeName.includes("CheckpointNameSelector")) return true;
+  if (typeName === "CheckpointLoaderSimple") return true;
+  if (hasSelectorOutputs(node) && Boolean(findCheckpointWidget(node))) return true;
+  if (hasLoaderOutputs(node) && Boolean(findCheckpointWidget(node))) return true;
+  return false;
+}
+
+function chooseCheckpointReplacement(oldValues, newValues, currentValue) {
+  if (!Array.isArray(newValues) || newValues.length === 0) return "";
+  if (newValues.includes(currentValue)) return currentValue;
+
+  const oldIndex = Array.isArray(oldValues) ? oldValues.indexOf(currentValue) : -1;
+  if (oldIndex >= 0) {
+    for (let index = oldIndex + 1; index < oldValues.length; index++) {
+      const candidate = oldValues[index];
+      if (newValues.includes(candidate)) return candidate;
+    }
+    for (let index = oldIndex - 1; index >= 0; index--) {
+      const candidate = oldValues[index];
+      if (newValues.includes(candidate)) return candidate;
+    }
+    return newValues[Math.min(oldIndex, newValues.length - 1)] ?? newValues[0];
+  }
+  return newValues[0];
+}
+
+function arraysEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function patchCheckpointSlotTypes(node, checkpoints) {
+  const values = [...(checkpoints || [])];
+
+  for (const output of node?.outputs ?? []) {
+    if (String(output?.name ?? "") !== "ckpt_name") continue;
+    output.type = [...values];
+
+    const links = Array.isArray(output.links) ? output.links : [];
+    for (const linkId of links) {
+      const link = app.graph?.links?.[linkId];
+      if (!link) continue;
+      const targetNode = app.graph?.getNodeById?.(link.target_id);
+      const targetInput = targetNode?.inputs?.[link.target_slot];
+      if (targetInput && String(targetInput.name ?? "").toLowerCase().includes("ckpt")) {
+        targetInput.type = [...values];
+      }
+    }
+  }
+
+  for (const input of node?.inputs ?? []) {
+    if (String(input?.name ?? "").toLowerCase().includes("ckpt")) {
+      input.type = [...values];
+    }
+  }
+}
+
+function updateCheckpointComboWidget(node, widget, checkpoints) {
+  if (!widget || !Array.isArray(checkpoints) || checkpoints.length === 0) {
+    return { changed: false, valueChanged: false, oldValue: widget?.value, newValue: widget?.value };
+  }
+
+  if (!widget.options) widget.options = {};
+  const oldValues = Array.isArray(widget.options.values) ? [...widget.options.values] : [];
+  const oldValue = widget.value;
+  const newValues = [...checkpoints];
+  const newValue = chooseCheckpointReplacement(oldValues, newValues, oldValue);
+
+  widget.options.values = newValues;
+  widget.value = newValue;
+
+  const valuesChanged = !arraysEqual(oldValues, newValues);
+  const valueChanged = oldValue !== newValue;
+
+  if (valueChanged && typeof widget.callback === "function") {
+    try {
+      widget.callback(widget.value);
+    } catch (error) {
+      console.warn("[CheckpointHandpickerSuite] checkpoint widget callback failed", error);
+    }
+  }
+
+  if (valuesChanged || valueChanged) {
+    node?.setDirtyCanvas?.(true, true);
+  }
+
+  return { changed: valuesChanged || valueChanged, valueChanged, oldValue, newValue };
+}
+
+function applyCheckpointListToWidgetNode(node, checkpoints) {
+  if (!isCheckpointSelectorLikeNode(node)) {
+    return { matched: false, changed: false, valueChanged: false };
+  }
+  const widget = findCheckpointWidget(node);
+  if (!widget) {
+    patchCheckpointSlotTypes(node, checkpoints);
+    return { matched: true, changed: false, valueChanged: false, reason: "checkpoint widget not found" };
+  }
+  const result = updateCheckpointComboWidget(node, widget, checkpoints);
+  patchCheckpointSlotTypes(node, checkpoints);
+  return { matched: true, ...result };
+}
+
+function applyCheckpointListToCyclerNode(node, checkpoints) {
+  if (!isNodeClass(node, CYCLER_CLASS)) {
+    return { matched: false, changed: false, valueChanged: false };
+  }
+  const widget = findStartCheckpointWidget(node);
+  if (!widget) {
+    patchCheckpointSlotTypes(node, checkpoints);
+    node?.setDirtyCanvas?.(true, true);
+    return { matched: true, changed: false, valueChanged: false, reason: "start_checkpoint widget not found" };
+  }
+  const result = updateCheckpointComboWidget(node, widget, checkpoints);
+  patchCheckpointSlotTypes(node, checkpoints);
+  return { matched: true, ...result };
+}
+
+function applyCheckpointValuesToGraph(checkpoints) {
+  if (!Array.isArray(checkpoints) || checkpoints.length === 0) {
+    return { widgetMatched: 0, widgetChanged: 0, valueChanged: 0, cyclerMatched: 0, cyclerChanged: 0, cyclerValueChanged: 0 };
+  }
+
+  let widgetMatched = 0;
+  let widgetChanged = 0;
+  let valueChanged = 0;
+  let cyclerMatched = 0;
+  let cyclerChanged = 0;
+  let cyclerValueChanged = 0;
+
+  for (const node of app.graph?._nodes ?? []) {
+    const widgetResult = applyCheckpointListToWidgetNode(node, checkpoints);
+    if (widgetResult.matched) {
+      widgetMatched += 1;
+      if (widgetResult.changed) widgetChanged += 1;
+      if (widgetResult.valueChanged) {
+        valueChanged += 1;
+        console.log(
+          `[CheckpointHandpickerSuite] ${getNodeTypeName(node)} #${node.id}: `
+          + `${widgetResult.oldValue} -> ${widgetResult.newValue}`
+        );
+      }
+    }
+
+    const cyclerResult = applyCheckpointListToCyclerNode(node, checkpoints);
+    if (cyclerResult.matched) {
+      cyclerMatched += 1;
+      if (cyclerResult.changed) cyclerChanged += 1;
+      if (cyclerResult.valueChanged) cyclerValueChanged += 1;
+    }
+  }
+
+  app.graph?.setDirtyCanvas?.(true, true);
+  return { widgetMatched, widgetChanged, valueChanged, cyclerMatched, cyclerChanged, cyclerValueChanged };
+}
+
+async function checkpointValuesFromObjectInfoFallback() {
+  try {
+    const info = await api.fetchApi("/object_info", { cache: "no-store" });
+    if (!info.ok) return [];
+    const objectInfo = await info.json();
+    const loaderValues = objectInfo?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0];
+    if (Array.isArray(loaderValues)) return loaderValues;
+    const cyclerValues = objectInfo?.CheckpointNameCycler?.input?.required?.start_checkpoint?.[0];
+    if (Array.isArray(cyclerValues)) return cyclerValues;
+  } catch (error) {
+    console.warn("[CheckpointHandpickerSuite] object_info fallback failed", error);
+  }
+  return [];
+}
+
+async function checkpointValuesFromRefreshPayload(result) {
+  if (Array.isArray(result?.checkpoint_values) && result.checkpoint_values.length) {
+    return result.checkpoint_values;
+  }
+  const fallback = await checkpointValuesFromObjectInfoFallback();
+  if (fallback.length) return fallback;
+  if (Array.isArray(result?.items)) return result.items.map((item) => item.ckpt_name_str).filter(Boolean);
+  return [];
+}
+
+function installCheckpointRefreshFuturePatch(nodeType, nodeData) {
+  const name = getNodeDataName(nodeData);
+  if (
+    name !== CYCLER_CLASS
+    && name !== "CheckpointLoaderSimple"
+    && !name.includes("CheckpointNameSelector")
+    && !name.includes("CheckpointListSelector")
+  ) {
+    return;
+  }
+
+  if (nodeType.prototype.__hpsCheckpointRefreshFuturePatchInstalled) return;
+  nodeType.prototype.__hpsCheckpointRefreshFuturePatchInstalled = true;
+
+  const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function (...args) {
+    const result = originalOnNodeCreated?.apply(this, args);
+    if (lastCheckpointValues) {
+      setTimeout(() => {
+        applyCheckpointListToWidgetNode(this, lastCheckpointValues);
+        applyCheckpointListToCyclerNode(this, lastCheckpointValues);
+        app.graph?.setDirtyCanvas?.(true, true);
+      }, 0);
+    }
+    return result;
+  };
+}
+
+
 function isNodeClass(node, className) {
   return node && (node.type === className || node.comfyClass === className);
 }
@@ -542,26 +804,24 @@ async function refreshSelector(node, all = false) {
     const result = await response.json();
     node.__hpsItems = result.items || [];
     node.__hpsStatus = result.status_text || selectorStatusText(result);
-    if (!selectorSelected(node) && node.__hpsItems.length) setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
+
+    if (!selectorSelected(node) && node.__hpsItems.length) {
+      setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
+    }
     const selected = selectorSelected(node);
     if (selected && !node.__hpsItems.find((x) => x.ckpt_name_str === selected) && node.__hpsItems.length) {
       setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
     }
-    const info = await api.fetchApi("/object_info");
-    const objectInfo = await info.json();
-    const values = objectInfo?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] ?? [];
-    if (all && Array.isArray(values)) {
-      let updated = 0;
-      for (const n of app.graph._nodes || []) {
-        for (const w of n.widgets || []) {
-          if (["ckpt_name", "checkpoint_name", "start_checkpoint", "checkpoint"].includes(w.name)) {
-            if (!w.options) w.options = {};
-            w.options.values = values;
-            updated++;
-          }
-        }
-      }
-      console.log(`[CheckpointHandpickerSuite] Updated checkpoint widgets: ${updated}`);
+
+    if (all) {
+      const checkpointValues = await checkpointValuesFromRefreshPayload(result);
+      lastCheckpointValues = checkpointValues;
+      const stats = applyCheckpointValuesToGraph(checkpointValues);
+      node.__hpsStatus = `${node.__hpsStatus || "Refresh All"}\nUpdated ${stats.widgetChanged}/${stats.widgetMatched} checkpoint widgets, ${stats.cyclerMatched} cycler(s), ${checkpointValues.length} checkpoint choices`;
+      console.log("[CheckpointHandpickerSuite] Refresh All widget sync", stats, {
+        checkpointCount: checkpointValues.length,
+        patchedClasses: result.patched_classes || [],
+      });
     }
   } catch (e) {
     node.__hpsStatus = String(e);
@@ -1133,6 +1393,7 @@ api.addEventListener(CYCLER_EVENT, ({ detail }) => {
 app.registerExtension({
   name: EXT,
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    installCheckpointRefreshFuturePatch(nodeType, nodeData);
     if (PREVIEW_CLASSES.has(nodeData.name)) return setupPreviewNode(nodeType);
     if (nodeData.name === SELECTOR_CLASS) return setupSelectorNode(nodeType);
     if (nodeData.name === TAGGER_CLASS) return setupTaggerNode(nodeType);
