@@ -107,4 +107,6 @@ Checkpointの巡回アルゴリズムを選択する（詳細は後述）。
 
 という、圧倒的な堅牢性と常時稼働（ノンストップ・運用）が実現されておるのじゃよ！
 
+## 宣伝画像
+
 <img width="1491" height="1055" alt="CheckpointNameCycler説明画像" src="https://github.com/user-attachments/assets/8c283202-ffa1-4a28-887b-f0128e23900d" />

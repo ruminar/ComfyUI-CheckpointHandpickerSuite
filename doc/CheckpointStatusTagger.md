@@ -97,4 +97,6 @@ python delete_reserved_checkpoints.py
 3. **本当に不要なら `y` を、やっぱり残したくなったら `n` を押すのじゃ！**（ここで心変わりしてもセーフじゃ！）
 4. 物理削除が完了したら、ComfyUIの画面に戻って Selector の **`Refresh All`** ボタンをポチッと一発叩くのじゃ。それだけで、空き容量ができた最新のストレージ状態が再起動なしで一瞬でシステムへ反映されるぞ！
 
+## 宣伝画像
+
 <img width="1122" height="1402" alt="CheckpointStatusTagger説明画像" src="https://github.com/user-attachments/assets/ceb63ecc-fb62-459a-938d-7d24eb8c1b1d" />
