@@ -297,6 +297,75 @@ def _append_delete_record(record: dict):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+
+def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> int:
+    """Prune active delete reservations whose checkpoint file is already gone.
+
+    The delete script removes files outside ComfyUI, while the queue is an
+    append-only JSONL log. During Refresh All, cancel active delete reservations
+    that clearly point to checkpoints no longer present on disk, and clear their
+    delete status so they disappear from the active delete plan.
+
+    To avoid removing a reservation during temporary path/root glitches, keep
+    the reservation if the checkpoint relpath still appears in the freshly
+    scanned checkpoint list.
+    """
+    active = _active_delete_records()
+    if not active:
+        return 0
+
+    current_names = {
+        _normalize_relpath(value)
+        for value in (checkpoint_values if checkpoint_values is not None else _get_fresh_checkpoint_values())
+    }
+    pruned = 0
+
+    for relpath, rec in list(active.items()):
+        relpath = _normalize_relpath(relpath)
+        rid = rec.get("id")
+        if not rid:
+            continue
+
+        # If ComfyUI can still see the checkpoint by relpath, do not prune the
+        # reservation just because the old resolved_path is missing. This avoids
+        # dropping a delete reservation after a root/path change or duplicate
+        # model-folder situation.
+        if relpath in current_names:
+            continue
+
+        raw_path = rec.get("resolved_path") or rec.get("safetensors_path") or ""
+        if raw_path:
+            try:
+                if Path(raw_path).expanduser().resolve().exists():
+                    continue
+            except Exception:
+                # If the path cannot be resolved and the checkpoint is no longer
+                # listed, treat the reservation as stale and cancel it below.
+                pass
+
+        _append_delete_record({
+            "version": 1,
+            "type": "cancel",
+            "id": rid,
+            "ckpt_name_str": relpath,
+            "reason": "missing_on_refresh",
+            "cancelled_at": _now_iso(),
+        })
+
+        if _get_status(relpath) == "delete":
+            _set_status(relpath, "none")
+
+        pruned += 1
+
+    if pruned:
+        try:
+            _write_delete_script()
+        except Exception:
+            logger.exception("Failed to rewrite delete script after pruning missing delete reservations")
+
+    return pruned
+
+
 def _checkpoint_roots() -> list[Path]:
     try:
         roots = folder_paths.get_folder_paths("checkpoints")
@@ -1645,6 +1714,7 @@ async def list_checkpoints(_request):
 @routes.post(f"/{EXTENSION_PREFIX}/refresh_all")
 async def refresh_all(_request):
     checkpoint_values = _get_fresh_checkpoint_values()
+    pruned_delete_records = _prune_missing_delete_records_on_refresh(checkpoint_values)
     patched_classes = _patch_backend_checkpoint_classes(checkpoint_values)
     items = _checkpoint_items()
     summary = _delete_status_summary()
@@ -1655,6 +1725,8 @@ async def refresh_all(_request):
         summary["total"], summary["favorite"], summary["nice"], summary["keep"], summary["delete"], summary["none"],
     )
     logger.info("[CheckpointHandpickerSuite] Backend checkpoint classes patched: %s", patched_classes)
+    if pruned_delete_records:
+        logger.info("[CheckpointHandpickerSuite] Pruned missing delete reservation(s): %s", pruned_delete_records)
     _log_widget_refresh(updated)
     return web.json_response({
         "ok": True,
@@ -1664,6 +1736,7 @@ async def refresh_all(_request):
         "checkpoint_values": checkpoint_values,
         "patched_classes": patched_classes,
         "patched_class_count": len(patched_classes),
+        "pruned_delete_records": pruned_delete_records,
     })
 
 
