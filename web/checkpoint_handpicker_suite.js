@@ -356,9 +356,17 @@ function nodeFromEvent(detail, className) {
 }
 
 function ensureHiddenWidgetValue(node, name, value) {
-  const w = getWidget(node, name);
+  let w = getWidget(node, name);
+  if (!w && typeof node?.addWidget === "function") {
+    try {
+      w = node.addWidget("text", name, value ?? "", () => {}, {});
+      w.serialize = true;
+    } catch (error) {
+      console.warn("[CheckpointHandpickerSuite] failed to add hidden widget", name, error);
+    }
+  }
   if (!w) return false;
-  w.value = value;
+  if (value !== undefined) w.value = value;
 
   // Different ComfyUI/LiteGraph builds hide widgets through different flags.
   // Set all harmless hints, and do it repeatedly from lifecycle hooks so the
@@ -366,14 +374,67 @@ function ensureHiddenWidgetValue(node, name, value) {
   w.type = "hidden";
   w.hidden = true;
   w.disabled = true;
+  w.serialize = true;
   w.options = { ...(w.options || {}), hidden: true };
   w.computeSize = () => [0, -4];
   w.draw = () => {};
   return true;
 }
 
+function normalizeCyclerFilterStatuses(value) {
+  let raw = value;
+  if (Array.isArray(raw)) {
+    // already usable
+  } else {
+    const text = String(raw ?? "").trim();
+    if (!text) return [];
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      raw = text.split(",").map((x) => x.trim());
+    }
+  }
+  if (typeof raw === "string") raw = [raw];
+  if (!Array.isArray(raw)) return [];
+  const set = new Set(raw.map((x) => String(x).trim()).filter((x) => CYCLER_FILTER_STATUSES.includes(x)));
+  return CYCLER_FILTER_STATUSES.filter((x) => set.has(x));
+}
+
+function serializeCyclerFilterStatuses(statuses) {
+  return JSON.stringify(normalizeCyclerFilterStatuses(statuses));
+}
+
+function parseSavedBool(value, fallback) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) return fallback;
+  if (["1", "true", "yes", "on"].includes(text)) return true;
+  if (["0", "false", "no", "off"].includes(text)) return false;
+  return fallback;
+}
+
 function ensureHiddenTabIdWidget(node) {
   return ensureHiddenWidgetValue(node, "hps_tab_id", HPS_TAB_ID);
+}
+
+function restoreCyclerSettingsFromWidgets(node) {
+  const filterWidget = getWidget(node, "hps_filter_statuses");
+  const filterText = String(filterWidget?.value ?? "").trim();
+  if (filterText) {
+    node.__hpsFilterStatuses = normalizeCyclerFilterStatuses(filterText);
+  } else if (!Array.isArray(node.__hpsFilterStatuses)) {
+    node.__hpsFilterStatuses = [];
+  }
+
+  const useLocalWidget = getWidget(node, "hps_use_local_list");
+  node.__hpsUseLocalList = parseSavedBool(useLocalWidget?.value, node.__hpsUseLocalList ?? true);
+
+  ensureHiddenWidgetValue(node, "hps_filter_statuses", serializeCyclerFilterStatuses(node.__hpsFilterStatuses));
+  ensureHiddenWidgetValue(node, "hps_use_local_list", node.__hpsUseLocalList ? "true" : "false");
+}
+
+function syncCyclerSettingsWidgets(node) {
+  ensureHiddenWidgetValue(node, "hps_filter_statuses", serializeCyclerFilterStatuses(node.__hpsFilterStatuses || []));
+  ensureHiddenWidgetValue(node, "hps_use_local_list", node.__hpsUseLocalList ? "true" : "false");
 }
 
 function scheduleHideTabIdWidget(node) {
@@ -1294,6 +1355,7 @@ function cyclerActiveFilter(node) {
   return node.__hpsFilterStatuses || [];
 }
 async function pushCyclerFlags(node) {
+  syncCyclerSettingsWidgets(node);
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1301,6 +1363,7 @@ async function pushCyclerFlags(node) {
   });
 }
 async function pushCyclerFilter(node) {
+  syncCyclerSettingsWidgets(node);
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1334,13 +1397,22 @@ function setupCyclerNode(nodeType) {
     ensureSize(this, 560, 260);
     this.__hpsUseLocalList = true;
     this.__hpsFilterStatuses = [];
-    setTimeout(() => { pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
+    restoreCyclerSettingsFromWidgets(this);
+    setTimeout(() => { restoreCyclerSettingsFromWidgets(this); pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
+    return r;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    restoreCyclerSettingsFromWidgets(this);
+    setTimeout(() => { restoreCyclerSettingsFromWidgets(this); pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     ensureHiddenTabIdWidget(this);
+    syncCyclerSettingsWidgets(this);
     const r = cyclerRects(this);
     drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
     drawButton(ctx, r.clearLocalList, "Clear Local List", true, false);
@@ -1363,6 +1435,7 @@ function setupCyclerNode(nodeType) {
     const r = cyclerRects(this);
     if (hitAny(this, pos, r.localListToggle)) {
       this.__hpsUseLocalList = !this.__hpsUseLocalList;
+      syncCyclerSettingsWidgets(this);
       pushCyclerFlags(this);
       app.graph.setDirtyCanvas(true, true);
       return true;
@@ -1380,6 +1453,7 @@ function setupCyclerNode(nodeType) {
         if (set.has(b.status)) set.delete(b.status); else set.add(b.status);
         this.__hpsFilterStatuses = CYCLER_FILTER_STATUSES.filter((x) => set.has(x));
       }
+      syncCyclerSettingsWidgets(this);
       pushCyclerFilter(this);
       app.graph.setDirtyCanvas(true, true);
       return true;
