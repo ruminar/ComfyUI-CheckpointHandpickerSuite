@@ -520,6 +520,8 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
                         },
                         "optional": {
                             "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
+                            "hps_filter_statuses": ("STRING", {"default": "", "hidden": True}),
+                            "hps_use_local_list": ("STRING", {"default": "", "hidden": True}),
                         },
                         "hidden": {
                             "unique_id": "UNIQUE_ID",
@@ -1234,6 +1236,46 @@ def _active_filter_values(statuses: list[str] | None) -> list[str]:
     return [s for s in (statuses or []) if s in STATUS_VALUES]
 
 
+def _parse_saved_filter_statuses(value) -> list[str] | None:
+    """Parse persisted Cycler filter settings.
+
+    None means "no persisted value was supplied" and keeps the current
+    in-memory state. An empty list means an explicit All filter.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = [part.strip() for part in text.split(",")]
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    selected = []
+    for item in parsed:
+        status = str(item).strip()
+        if status in STATUS_VALUES and status not in selected:
+            selected.append(status)
+    return selected
+
+
+def _parse_saved_bool(value) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "":
+        return None
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def _filter_match_count(checkpoints: list[str], statuses: list[str] | None) -> int:
     active = _active_filter_values(statuses)
     if not active:
@@ -1413,6 +1455,8 @@ class CheckpointNameCycler:
             },
             "optional": {
                 "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
+                "hps_filter_statuses": ("STRING", {"default": "", "hidden": True}),
+                "hps_use_local_list": ("STRING", {"default": "", "hidden": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1428,11 +1472,20 @@ class CheckpointNameCycler:
     def IS_CHANGED(cls, **kwargs):
         return time.time_ns()
 
-    def cycle(self, start_checkpoint, mode, change_every, hps_tab_id="", unique_id=None):
+    def cycle(self, start_checkpoint, mode, change_every, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", unique_id=None):
         node_id = str(unique_id) if unique_id is not None else "__default__"
         tab_id = _clean_tab_id(hps_tab_id)
         node_key = _state_key(tab_id, node_id)
         state = _get_cycler_state(node_key)
+
+        saved_filter = _parse_saved_filter_statuses(hps_filter_statuses)
+        if saved_filter is not None:
+            state["active_filter"] = saved_filter
+        saved_use_local_list = _parse_saved_bool(hps_use_local_list)
+        if saved_use_local_list is not None:
+            state["use_local_list"] = saved_use_local_list
+            state["accept_queue"] = saved_use_local_list
+
         all_checkpoints = _get_checkpoint_list()
         if not all_checkpoints:
             return ("", "", "checkpoint")
