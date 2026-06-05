@@ -1,6 +1,15 @@
-# ComfyUI-CheckpointHandpickerSuite v0.1.1
+# ComfyUI-CheckpointHandpickerSuite v0.1.2
 
-v0.1.1 fixes the delete reservation workflow and Refresh All behavior after checkpoints are physically deleted.
+## v0.1.2 - Cycler filter persistence and UI collapse fixes
+
+This is a bugfix release for Cycler workflow persistence and collapsed node UI behavior.
+
+### Fixed
+
+- Fixed an issue where `Checkpoint Name Cycler` status filter settings were reset after saving, loading, switching tabs, or frontend redraws.
+- `Use Local List` ON/OFF state is now preserved with the workflow.
+- Runtime-only state such as Local List contents, current index, repeat count, and shuffle deck is intentionally not saved.
+- Fixed custom controls remaining visible when Suite nodes are collapsed.
 
 ## Highlights
 
