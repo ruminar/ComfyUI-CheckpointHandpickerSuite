@@ -557,6 +557,10 @@ function graphEventToLocal(node, event) {
   return [graphPos[0] - (node.pos?.[0] || 0), graphPos[1] - (node.pos?.[1] || 0)];
 }
 
+function hpsNodeCollapsed(node) {
+  return Boolean(node?.flags?.collapsed);
+}
+
 let cursorCaptureInstalled = false;
 function installCursorCapture() {
   if (cursorCaptureInstalled) return;
@@ -1069,6 +1073,11 @@ function setupSelectorNode(nodeType) {
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     hideSelectorWidget(this);
+    if (hpsNodeCollapsed(this)) {
+      this.__hpsScrollbarDragging = false;
+      this.__hpsScrollbarDragOffset = 0;
+      return;
+    }
     const r = selectorRects(this);
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
     drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
@@ -1110,6 +1119,7 @@ function setupSelectorNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
+    if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     const r = selectorRects(this);
     if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
     if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
@@ -1142,6 +1152,11 @@ function setupSelectorNode(nodeType) {
   };
   const origMouseMove = nodeType.prototype.onMouseMove;
   nodeType.prototype.onMouseMove = function (e, pos) {
+    if (hpsNodeCollapsed(this)) {
+      this.__hpsScrollbarDragging = false;
+      this.__hpsScrollbarDragOffset = 0;
+      return origMouseMove ? origMouseMove.apply(this, arguments) : false;
+    }
     if (this.__hpsScrollbarDragging) {
       const sb = selectorScrollbar(this);
       const local = selectorLocalFromEventOrPos(this, e, pos);
@@ -1167,6 +1182,7 @@ function setupSelectorNode(nodeType) {
   };
   const origWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (e, pos) {
+    if (hpsNodeCollapsed(this)) return origWheel ? origWheel.apply(this, arguments) : false;
     const r = selectorRects(this).list;
     if (hitAny(this, pos, r)) {
       e?.preventDefault?.(); e?.stopPropagation?.();
@@ -1244,6 +1260,7 @@ function setupTaggerNode(nodeType) {
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     ensureHiddenTabIdWidget(this);
+    if (hpsNodeCollapsed(this)) return;
     ctx.save();
     const current = this.__hpsTaggerStatus || "none";
     for (const b of taggerButtons(this)) {
@@ -1274,6 +1291,7 @@ function setupTaggerNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
+    if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     for (const b of taggerButtons(this)) {
       if (hitAny(this, pos, b)) {
         if (b.status === "delete" && !taggerDeleteEnabled(this)) return true;
@@ -1413,6 +1431,7 @@ function setupCyclerNode(nodeType) {
     if (origDraw) origDraw.apply(this, arguments);
     ensureHiddenTabIdWidget(this);
     syncCyclerSettingsWidgets(this);
+    if (hpsNodeCollapsed(this)) return;
     const r = cyclerRects(this);
     drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
     drawButton(ctx, r.clearLocalList, "Clear Local List", true, false);
@@ -1432,6 +1451,7 @@ function setupCyclerNode(nodeType) {
   };
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
+    if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     const r = cyclerRects(this);
     if (hitAny(this, pos, r.localListToggle)) {
       this.__hpsUseLocalList = !this.__hpsUseLocalList;
