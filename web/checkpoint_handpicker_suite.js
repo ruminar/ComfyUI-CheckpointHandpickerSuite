@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v8a: v7-based stable UI rebuild. Restores ListSelector page scroll, wheel capture, and scrollbar drag.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
@@ -1022,8 +1023,11 @@ async function syncSelectedCheckpoint(node) {
       ckpt_name_str: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
-      search_directories: Object.fromEntries(targets.previews.map((n) => [String(n.id), imageDirSearchDirectory(n)])),
-      max_preview_images: Object.fromEntries(targets.previews.map((n) => [String(n.id), imageDirMaxPreviewImages(n)])),
+      preview_targets: targets.previews.map((n) => ({
+        node_id: n.id,
+        search_directory: imageDirSearchDirectory(n),
+        max_preview_images: imageDirMaxPreviewImages(n),
+      })),
     })),
   });
   const result = await response.json();
@@ -1046,18 +1050,82 @@ function selectorScrollbar(node) {
   const items = selectorItems(node);
   if (items.length <= SELECTOR_VISIBLE_ROWS) return null;
   const r = selectorRects(node).list;
-  const scroll = node.__hpsScroll || 0;
-  const ratio = SELECTOR_VISIBLE_ROWS / items.length;
-  const h = Math.max(20, r.h * ratio);
+  const scroll = Math.max(0, Math.min(node.__hpsScroll || 0, maxSelectorScroll(node)));
+  const thumbH = Math.max(24, r.h * (SELECTOR_VISIBLE_ROWS / items.length));
+  const range = Math.max(1, maxSelectorScroll(node));
+  const y = r.y + (r.h - thumbH) * (scroll / range);
+  return {
+    list: r,
+    track: { x: r.x + r.w - 16, y: r.y, w: 16, h: r.h },
+    thumb: { x: r.x + r.w - 12, y, w: 8, h: thumbH },
+    thumbH,
+    maxScroll: maxSelectorScroll(node),
+    scroll,
+  };
+}
+
+function setSelectorScrollFromScrollbarY(node, localY, thumbH, dragOffset = thumbH / 2) {
+  const r = selectorRects(node).list;
   const maxScroll = maxSelectorScroll(node);
-  const y = r.y + (maxScroll ? ((r.h - h) * scroll / maxScroll) : 0);
-  return { x: r.x + r.w - 8, y, w: 6, h };
+  const usable = Math.max(1, r.h - thumbH);
+  const y = Math.max(r.y, Math.min(r.y + usable, localY - dragOffset));
+  node.__hpsScroll = Math.round(((y - r.y) / usable) * maxScroll);
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function selectorLocalFromEventOrPos(node, event, pos) {
+  const fromEvent = event ? graphEventToLocal(node, event) : null;
+  if (fromEvent) return fromEvent;
+  return candidatePositions(node, pos)?.[0] || null;
+}
+
+let selectorWheelCaptureInstalled = false;
+function installSelectorWheelCapture() {
+  if (selectorWheelCaptureInstalled) return;
+  selectorWheelCaptureInstalled = true;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+
+  // Capture before LiteGraph consumes the wheel event for canvas zoom/pan.
+  canvasEl.addEventListener("wheel", (event) => {
+    const canvas = app.canvas;
+    const graph = app.graph;
+    if (!canvas || !graph) return;
+
+    let graphPos = null;
+    try {
+      graphPos = canvas.convertEventToCanvasOffset?.(event);
+    } catch {
+      graphPos = null;
+    }
+    if (!graphPos) return;
+
+    const nodes = [...(graph._nodes || [])].reverse();
+    for (const node of nodes) {
+      if (!(node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS)) continue;
+      if (node.flags?.collapsed) continue;
+
+      const local = [
+        graphPos[0] - (node.pos?.[0] || 0),
+        graphPos[1] - (node.pos?.[1] || 0),
+      ];
+      if (!hit(local, selectorRects(node).list)) continue;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      scrollSelector(node, event.deltaY > 0 ? 3 : -3);
+      return;
+    }
+  }, { passive: false, capture: true });
 }
 
 function selectorCursorAt(node, local) {
   if (!local) return "";
   const r = selectorRects(node);
   if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
+  const sb = selectorScrollbar(node);
+  if (sb && hit(local, sb.track)) return "pointer";
   const list = selectorItems(node);
   const base = node.__hpsScroll || 0;
   for (let i = 0; i < Math.min(SELECTOR_VISIBLE_ROWS, list.length - base); i++) {
@@ -1091,8 +1159,10 @@ function drawSelectorRows(ctx, node) {
   }
   const sb = selectorScrollbar(node);
   if (sb) {
-    ctx.fillStyle = "rgba(255,255,255,0.35)";
-    ctx.fillRect(sb.x, sb.y, sb.w, sb.h);
+    ctx.fillStyle = "rgba(220,220,220,0.18)";
+    ctx.fillRect(sb.track.x + 6, sb.track.y, 4, sb.track.h);
+    ctx.fillStyle = node.__hpsScrollbarDragging ? "rgba(255,255,255,0.70)" : "rgba(230,230,230,0.55)";
+    ctx.fillRect(sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h);
   }
   ctx.restore();
 }
@@ -1101,6 +1171,7 @@ function setupSelectorNode(nodeType) {
   installMinSize(nodeType, 520, 540);
   installTabIdSupport(nodeType);
   installCursorCapture();
+  installSelectorWheelCapture();
 
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
@@ -1140,18 +1211,70 @@ function setupSelectorNode(nodeType) {
   };
 
   const origMouseDown = nodeType.prototype.onMouseDown;
-  nodeType.prototype.onMouseDown = function (e, pos) {
+  nodeType.prototype.onMouseDown = function (event, pos, canvas) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+
     const r = selectorRects(this);
-    if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
-    if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
+    if (hitAny(this, pos, r.refreshAll)) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      refreshSelector(this, true);
+      return true;
+    }
+    if (hitAny(this, pos, r.listOnly)) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      refreshSelector(this, false);
+      return true;
+    }
     if (hitAny(this, pos, r.pushLocalList)) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
       if (selectorActionMode(this) === "sync") syncSelectedCheckpoint(this);
       else pushSelectedToLocalList(this);
       return true;
     }
-    if (hitAny(this, pos, r.up)) { scrollSelector(this, -1); return true; }
-    if (hitAny(this, pos, r.down)) { scrollSelector(this, 1); return true; }
+    if (hitAny(this, pos, r.up)) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
+      return true;
+    }
+    if (hitAny(this, pos, r.down)) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      scrollSelector(this, SELECTOR_VISIBLE_ROWS);
+      return true;
+    }
+
+    const sb = selectorScrollbar(this);
+    if (sb) {
+      const hitPositions = candidatePositions(this, pos);
+      const thumbHitPos = hitPositions.find((p) => hit(p, sb.thumb));
+      const trackHitPos = hitPositions.find((p) => hit(p, sb.track));
+
+      if (thumbHitPos) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        this.__hpsScrollbarDragging = true;
+        this.__hpsScrollbarDragOffset = thumbHitPos[1] - sb.thumb.y;
+        this.__hpsScrollbarStartY = thumbHitPos[1];
+        this.__hpsScrollbarStartScroll = sb.scroll;
+        app.graph?.setDirtyCanvas?.(true, true);
+        return true;
+      }
+
+      if (trackHitPos) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        if (trackHitPos[1] < sb.thumb.y) {
+          scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
+        } else {
+          scrollSelector(this, SELECTOR_VISIBLE_ROWS);
+        }
+        return true;
+      }
+    }
 
     const positions = candidatePositions(this, pos);
     for (const p of positions) {
@@ -1159,6 +1282,8 @@ function setupSelectorNode(nodeType) {
       const row = Math.floor((p[1] - r.list.y) / ROW_H);
       const item = selectorItems(this)[(this.__hpsScroll || 0) + row];
       if (item) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
         setSelectorSelected(this, item.ckpt_name_str);
         app.graph.setDirtyCanvas(true, true);
         return true;
@@ -1167,11 +1292,56 @@ function setupSelectorNode(nodeType) {
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 
+  const origMouseMove = nodeType.prototype.onMouseMove;
+  nodeType.prototype.onMouseMove = function (event, pos, canvas) {
+    if (this.__hpsScrollbarDragging && event?.buttons === 0) {
+      this.__hpsScrollbarDragging = false;
+      app.graph?.setDirtyCanvas?.(true, true);
+      return true;
+    }
+
+    if (this.__hpsScrollbarDragging) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+
+      const sb = selectorScrollbar(this);
+      if (!sb) {
+        this.__hpsScrollbarDragging = false;
+        app.graph?.setDirtyCanvas?.(true, true);
+        return true;
+      }
+
+      const local = selectorLocalFromEventOrPos(this, event, pos);
+      if (!local) return true;
+
+      setSelectorScrollFromScrollbarY(this, local[1], sb.thumbH, this.__hpsScrollbarDragOffset ?? sb.thumbH / 2);
+      return true;
+    }
+
+    return origMouseMove ? origMouseMove.apply(this, arguments) : false;
+  };
+
+  const origMouseUp = nodeType.prototype.onMouseUp;
+  nodeType.prototype.onMouseUp = function (event, pos, canvas) {
+    if (this.__hpsScrollbarDragging) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      this.__hpsScrollbarDragging = false;
+      app.graph?.setDirtyCanvas?.(true, true);
+      return true;
+    }
+
+    return origMouseUp ? origMouseUp.apply(this, arguments) : false;
+  };
+
   const origMouseWheel = nodeType.prototype.onMouseWheel;
-  nodeType.prototype.onMouseWheel = function (e, pos) {
+  nodeType.prototype.onMouseWheel = function (event, pos, canvas) {
     const r = selectorRects(this);
     if (candidatePositions(this, pos).some((p) => hit(p, r.list))) {
-      scrollSelector(this, e.deltaY > 0 ? 3 : -3);
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
+      scrollSelector(this, event.deltaY > 0 ? 3 : -3);
       return true;
     }
     return origMouseWheel ? origMouseWheel.apply(this, arguments) : false;
