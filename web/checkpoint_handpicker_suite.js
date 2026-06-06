@@ -643,7 +643,7 @@ function drawButton(ctx, rect, label, enabled = true, active = false, color = nu
   ctx.font = `${active ? "bold " : ""}12px sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2);
+  ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2, Math.max(1, rect.w - 8));
   ctx.restore();
 }
 
@@ -774,10 +774,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 92 : 30;
+    const top = isImageDir ? 122 : 30;
     const margin = 8;
     const messageX = isImageDir ? margin : Math.min(140, Math.max(margin, this.size[0] - 80));
-    const captionY = isImageDir ? 76 : 20;
+    const captionY = isImageDir ? 108 : 20;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -786,7 +786,7 @@ function setupPreviewNode(nodeType) {
       const st = this.__hpsPreviewState || {};
       const isWarning = st.status && !["ready", "loading"].includes(st.status);
       if (isImageDir) {
-        ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.22)";
+        ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.28)";
         ctx.fillRect(messageX - 4, captionY - 14, messageW + 8, 20);
       }
       ctx.fillStyle = isWarning ? "#FFD28A" : "#ddd";
@@ -798,7 +798,7 @@ function setupPreviewNode(nodeType) {
       const total = Math.max(1, Number(st.progress_total || st.max_preview_images || 1));
       const value = Math.max(0, Math.min(total, Number(st.progress_value || 0)));
       const barX = margin;
-      const barY = 52;
+      const barY = 0;
       const barW = Math.max(1, this.size[0] - margin * 2);
       const barH = 6;
       ctx.fillStyle = "rgba(255,255,255,0.14)";
@@ -896,7 +896,7 @@ function selectorRects(node) {
   const arrowW = 32;
   const refreshW = 102;
   const listOnlyW = 92;
-  const pushW = selectorActionMode(node) === "sync" ? 150 : 132;
+  const pushW = selectorActionMode(node) === "sync" ? 150 : 174;
   const pushX = margin + refreshW + gap + listOnlyW + gap;
   // Keep scroll buttons close to the toolbar action buttons instead of anchoring
   // them to the right edge. The right edge belongs to ComfyUI output pins.
@@ -1063,7 +1063,7 @@ function selectorActionMode(node) {
 }
 
 function selectorActionLabel(node) {
-  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push Local";
+  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push to Local List";
 }
 
 async function loadSelector(node, mode = "list") {

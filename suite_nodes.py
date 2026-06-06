@@ -1298,10 +1298,10 @@ def _checkpoint_total_count() -> int:
 
 def _build_local_list_lines(local_items: list[str], max_items: int = 20) -> list[str]:
     shown = []
-    for item in list(local_items[:max_items]):
+    for index, item in enumerate(list(local_items[:max_items]), start=1):
         status = _get_status(item)
         icon = STATUS_ICON[status] if status != "none" else " "
-        shown.append(f"{icon} {item}")
+        shown.append(f"{index}. {icon} {item}")
     if len(local_items) > max_items:
         shown.append(f"... and {len(local_items) - max_items} more")
     return shown
