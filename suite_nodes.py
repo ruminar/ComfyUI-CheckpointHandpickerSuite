@@ -21,7 +21,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
-# v8d: Local List execution/status separation, Tagger cleanup, and regression guardrails.
+# v8e: Local List queue consumption, UI restoration, and regression guardrails.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -413,7 +413,10 @@ def _cycler_state_payload(state: dict) -> dict:
     local_count = len(valid_local_items)
     filter_matches = _filter_match_count(active_filter)
     use_local = bool(state.get("use_local_list", True))
-    display_source = "local_list" if use_local and state.get("last_source") == "local_list" and local_count else "cycle"
+    # Current job title/source is a snapshot of the last resolved job. Local List
+    # ON/OFF and Clear must not rewrite it; they only affect future selection and
+    # the pending Local List display.
+    display_source = "local_list" if state.get("last_source") == "local_list" else "cycle"
     hold_index = max(0, _parse_saved_int(state.get("last_hold_index"), 0))
     change_every = _valid_change_every(state.get("last_change_every", 1))
     title = _build_cycler_title(display_source, ckpt, hold_index, change_every, active_filter, False, local_count if use_local else 0) if ckpt else "Checkpoint Name Cycler"
@@ -432,6 +435,7 @@ def _cycler_state_payload(state: dict) -> dict:
         "use_local_list": bool(state.get("use_local_list", True)),
         "active_filter": active_filter,
         "filter_matches": filter_matches,
+        "filter_total": _checkpoint_total_count(),
         "settings_revision": _parse_saved_int(state.get("settings_revision"), 0),
         "local_list_count": len(valid_local_items),
         "local_list_items": valid_local_items,
@@ -1104,14 +1108,17 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
 
 
 def _valid_local_list(local_list: list[str] | None) -> list[str]:
-    all_checkpoints = _get_checkpoint_list()
-    all_set = set(all_checkpoints)
+    """Return valid Local List entries while preserving order and duplicates.
+
+    Local List is a manual per-Cycler queue, not a set. The same checkpoint may
+    intentionally be pushed multiple times, and each entry must be consumed
+    independently.
+    """
+    all_set = set(_get_checkpoint_list())
     local = []
-    seen = set()
     for item in local_list or []:
         rel = _normalize_relpath(item)
-        if rel in all_set and rel not in seen:
-            seen.add(rel)
+        if rel in all_set:
             local.append(rel)
     return local
 
@@ -1121,6 +1128,10 @@ def _filter_match_count(active_filter: list[str]) -> int:
     if not active_filter:
         return len(all_checkpoints)
     return sum(1 for ckpt in all_checkpoints if _get_status(ckpt) in active_filter)
+
+
+def _checkpoint_total_count() -> int:
+    return len(_get_checkpoint_list())
 
 
 def _build_local_list_lines(local_items: list[str], max_items: int = 20) -> list[str]:
@@ -1138,7 +1149,7 @@ def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filt
         prefix += f" [{_status_icons_for_filter(active_filter)}]"
     if fallback_all:
         prefix += " [fallback all]"
-    if source == "local_list":
+    if source == "local_list" and local_count > 0:
         prefix += f" [local:{local_count}]"
     body = f"{icon} {ckpt_name}".strip() if ckpt_name else "(none)"
     if source == "local_list":
@@ -1152,7 +1163,7 @@ def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, qu
     lines = [
         f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (none)",
         f"Mode: {display_mode}" if source == "local_list" else f"Mode: {mode}  Hold: {hold_index}/{change_every}",
-        f"Filter: {_filter_display(active_filter)}  Matches: {match_count}",
+        f"Filter: {_filter_display(active_filter)}  Matches: {match_count} / {_checkpoint_total_count()}",
     ]
     if fallback_all:
         lines.append("Filter fallback: all checkpoints")
@@ -1177,12 +1188,12 @@ def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -
     change_every = _valid_change_every(state.get("last_change_every", 1))
     current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (not executed yet)"
     use_local = bool(state.get("use_local_list", True))
-    local_job_active = use_local and state.get("last_source") == "local_list" and bool(local_items)
+    local_job_active = state.get("last_source") == "local_list"
     mode_line = "Mode: local list" if local_job_active else f"Mode: {mode}  Hold: {hold_index}/{change_every}"
     lines = [
         current,
         mode_line,
-        f"Filter: {_filter_display(active_filter)}  Matches: {_filter_match_count(active_filter)}",
+        f"Filter: {_filter_display(active_filter)}  Matches: {_filter_match_count(active_filter)} / {_checkpoint_total_count()}",
     ]
     if use_local:
         lines.append(f"Local List: {local_count} item(s)")
@@ -1302,13 +1313,16 @@ class CheckpointNameCycler:
 
         if use_local_source:
             # Local List is a manual per-Cycler queue. It must not advance the
-            # normal change_every/repeat/shuffle state.
-            local_index = max(0, _parse_saved_int(state.get("local_index"), 0))
-            local_pos = local_index % len(local_items)
-            ckpt_name = local_items[local_pos]
-            state["local_index"] = (local_pos + 1) % len(local_items)
+            # normal change_every/repeat/shuffle state, and it must consume one
+            # queued entry per execution. Duplicates are allowed and consumed
+            # independently.
+            ckpt_name = local_items[0]
+            remaining_local_items = local_items[1:]
+            state["local_list"] = remaining_local_items
+            state["override_queue"] = remaining_local_items
+            state["local_index"] = 0
             selected_index = all_checkpoints.index(ckpt_name)
-            title = _build_cycler_title("local_list", ckpt_name, 1, change_every, state.get("active_filter", []), False, len(local_items))
+            title = _build_cycler_title("local_list", ckpt_name, 1, change_every, state.get("active_filter", []), False, len(remaining_local_items))
             status_text = _build_cycler_status_text(
                 "local_list",
                 ckpt_name,
@@ -1318,11 +1332,12 @@ class CheckpointNameCycler:
                 1,
                 change_every,
                 global_match_count,
-                len(local_items),
+                len(remaining_local_items),
                 mode,
-                local_items=local_items,
+                local_items=remaining_local_items,
                 use_local_list=True,
             )
+            local_items = remaining_local_items
         else:
             repeat_count = max(0, int(state.get("repeat_count", 0)))
             last_ckpt = _normalize_relpath(state.get("last_normal_ckpt_name") or state.get("last_ckpt_name", ""))
@@ -1447,7 +1462,9 @@ class CheckpointNameCycler:
             hold_index=hold_index,
             change_every=change_every,
             local_list_count=len(local_items),
+            local_list_items=list(local_items),
             filter_matches=global_match_count,
+            filter_total=_checkpoint_total_count(),
             execution_revision=state["execution_revision"],
         )
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
@@ -1758,8 +1775,7 @@ async def cycler_local_list_append(request):
         state = _get_cycler_state(_state_key(tab_id, node_id))
         if state.get("use_local_list", True):
             local_list = state.setdefault("local_list", [])
-            if relpath not in local_list:
-                local_list.append(relpath)
+            local_list.append(relpath)
             state["override_queue"] = local_list
             state["last_status_text"] = _build_cycler_idle_status_text("", state)
             updated += 1

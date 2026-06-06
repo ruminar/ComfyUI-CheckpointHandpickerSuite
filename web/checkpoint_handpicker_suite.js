@@ -1,7 +1,7 @@
-import { app } from "../../scripts/app.js";
-import { api } from "../../scripts/api.js";
+import { app } from "../scripts/app.js";
+import { api } from "../scripts/api.js";
 
-// v8c: v8b/v8a conservative rebuild with ListSelector/Cycler/Tagger UI-state fixes.
+// v8e: Local List queue consumption, UI restoration, and regression guardrails.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
@@ -61,6 +61,7 @@ const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
 const TAGGER_STATUS_ORDER = ["favorite", "nice", "keep", "delete"];
 const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
 const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
+const STATUS_CURRENT_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "Marked for deletion", none: "none" };
 
 function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
@@ -684,8 +685,8 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
         node.__hpsTaggerPath = result.ckpt_name_str;
         node.__hpsTaggerStatus = result.status || "none";
         node.__hpsTaggerMessage = node.__hpsTaggerStatus === "none"
-          ? "Current: — none"
-          : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_LABEL[node.__hpsTaggerStatus]}`;
+          ? "Current: none"
+          : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_CURRENT_LABEL[node.__hpsTaggerStatus] || STATUS_LABEL[node.__hpsTaggerStatus]}`;
         node.title = node.__hpsTaggerStatus === "none"
           ? `Tagger : ${result.ckpt_name_str}`
           : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${result.ckpt_name_str}`;
@@ -829,9 +830,9 @@ function hideSelectorWidget(node) {
 function selectorRects(node) {
   const margin = 8;
   return {
-    refreshAll: { x: margin, y: 8, w: 100, h: 24 },
-    listOnly: { x: 114, y: 8, w: 80, h: 24 },
-    pushLocalList: { x: 200, y: 8, w: 148, h: 24 },
+    refreshAll: { x: margin, y: 8, w: 110, h: 24 },
+    listOnly: { x: 124, y: 8, w: 104, h: 24 },
+    pushLocalList: { x: 236, y: 8, w: 154, h: 24 },
     up: { x: 360, y: 8, w: 34, h: 24 },
     down: { x: 400, y: 8, w: 34, h: 24 },
     list: { x: margin, y: 104, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
@@ -1201,7 +1202,12 @@ function drawSelectorRows(ctx, node) {
     ctx.fillStyle = active ? "rgba(75,125,190,0.58)" : (i % 2 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.06)");
     ctx.fillRect(r.list.x + 1, y + 1, r.list.w - 2, ROW_H - 2);
     ctx.fillStyle = active ? "#fff" : "#ddd";
-    ctx.fillText(`${selectorStatusIcon(status)} ${ckpt}`, r.list.x + 6, y + ROW_H / 2, r.list.w - 20);
+    const icon = selectorStatusIcon(status);
+    // Keep the checkpoint-name column aligned even when status is none.
+    ctx.textAlign = "center";
+    ctx.fillText(icon, r.list.x + 14, y + ROW_H / 2, 18);
+    ctx.textAlign = "left";
+    ctx.fillText(ckpt, r.list.x + 28, y + ROW_H / 2, r.list.w - 42);
   }
   const sb = selectorScrollbar(node);
   if (sb) {
@@ -1241,7 +1247,7 @@ function setupSelectorNode(nodeType) {
     if (hpsNodeCollapsed(this)) return;
     const r = selectorRects(this);
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.listOnly, "List", !this.__hpsLoading);
+    drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
     drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
     drawButton(ctx, r.up, "▲", true);
     drawButton(ctx, r.down, "▼", true);
@@ -1399,12 +1405,17 @@ function currentTaggerPath(node) {
   return node.__hpsTaggerPath || linkedInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
-  // Keep the controls away from LiteGraph input pins/labels.
+  // Keep controls right-aligned and away from LiteGraph input pins/labels.
+  const buttonW = 76;
+  const gap = 6;
+  const totalW = TAGGER_STATUS_ORDER.length * buttonW + (TAGGER_STATUS_ORDER.length - 1) * gap;
+  const right = Math.max(442, (node.size?.[0] || 450) - 8);
+  const startX = right - totalW;
   return TAGGER_STATUS_ORDER.map((status, i) => ({
     status,
-    x: 120 + i * 82,
+    x: startX + i * (buttonW + gap),
     y: 3,
-    w: 76,
+    w: buttonW,
     h: 26,
   }));
 }
@@ -1424,7 +1435,7 @@ async function setTaggerStatus(node, status) {
   const result = await response.json();
   if (result.ok) {
     node.__hpsTaggerStatus = result.status;
-    node.__hpsTaggerMessage = result.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[result.status]} ${STATUS_LABEL[result.status]}`;
+    node.__hpsTaggerMessage = result.status === "none" ? "Current: none" : `Current: ${STATUS_ICON[result.status]} ${STATUS_CURRENT_LABEL[result.status] || STATUS_LABEL[result.status]}`;
     node.title = result.status === "none" ? `Tagger : ${ckpt}` : `Tagger : ${STATUS_ICON[result.status]} ${ckpt}`;
   } else {
     node.__hpsTaggerMessage = result.error || "Failed";
@@ -1482,7 +1493,7 @@ function setupTaggerNode(nodeType) {
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
     ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 50);
-    const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: — none" : `Current: ${STATUS_ICON[current]} ${STATUS_LABEL[current]}`);
+    const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: none" : `Current: ${STATUS_ICON[current]} ${STATUS_CURRENT_LABEL[current] || STATUS_LABEL[current]}`);
     ctx.fillStyle = current === "none" ? "#888" : "#ddd";
     ctx.fillText(msg, 8, 70);
     if (this.size[1] >= 124 && current !== "none" && current !== "delete") {
@@ -1509,7 +1520,7 @@ api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   if (!node) return;
   node.__hpsTaggerPath = detail.ckpt_name_str;
   node.__hpsTaggerStatus = detail.status;
-  node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
+  node.__hpsTaggerMessage = detail.status === "none" ? "Current: none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_CURRENT_LABEL[detail.status] || STATUS_LABEL[detail.status]}`;
   if (detail.title) node.title = detail.title;
   app.graph.setDirtyCanvas(true, true);
 });
@@ -1538,7 +1549,7 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
     }
     if (isNodeClass(node, TAGGER_CLASS) && currentTaggerPath(node) === detail.ckpt_name_str) {
       node.__hpsTaggerStatus = detail.status || "none";
-      node.__hpsTaggerMessage = node.__hpsTaggerStatus === "none" ? "Current: — none" : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_LABEL[node.__hpsTaggerStatus]}`;
+      node.__hpsTaggerMessage = node.__hpsTaggerStatus === "none" ? "Current: none" : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_CURRENT_LABEL[node.__hpsTaggerStatus] || STATUS_LABEL[node.__hpsTaggerStatus]}`;
       patchCheckpointTitle(node, "Tagger", detail.ckpt_name_str, node.__hpsTaggerStatus);
     }
     if (isNodeClass(node, CYCLER_CLASS) && node.__hpsCyclerCkptName === detail.ckpt_name_str) {
@@ -1555,8 +1566,8 @@ function cyclerRects(node) {
   const filter = [{ status: "all", x: 8, y: filterY, w: 54, h: 24 }];
   CYCLER_FILTER_STATUSES.forEach((status, i) => filter.push({ status, x: 68 + i * 48, y: filterY, w: 42, h: 24 }));
   return {
-    localListToggle: { x: 8, y: 4, w: 122, h: 24 },
-    clearLocalList: { x: 136, y: 4, w: 122, h: 24 },
+    localListToggle: { x: 8, y: 4, w: 150, h: 24 },
+    clearLocalList: { x: 164, y: 4, w: 122, h: 24 },
     filter,
     statusBox: { x: 8, y: 140, w: node.size[0] - 16, h: Math.max(80, node.size[1] - 150) },
   };
@@ -1644,18 +1655,13 @@ function setupCyclerNode(nodeType) {
     const active = cyclerActiveFilter(this);
     ctx.save();
 
-    drawButton(ctx, r.localListToggle, this.__hpsUseLocalList === false ? "Local List OFF" : "Local List ON", true, this.__hpsUseLocalList !== false);
+    drawButton(ctx, r.localListToggle, this.__hpsUseLocalList === false ? "☐ Use Local List" : "☑ Use Local List", true, this.__hpsUseLocalList !== false);
     drawButton(ctx, r.clearLocalList, "Clear Local List", true, false, "rgba(105,90,90,0.65)");
     for (const b of r.filter) {
       const isAll = b.status === "all";
       const on = isAll ? active.length === 0 : active.includes(b.status);
       drawButton(ctx, b, isAll ? "all" : STATUS_ICON[b.status], true, on);
     }
-
-    ctx.fillStyle = "#aaa";
-    ctx.font = "12px sans-serif";
-    ctx.fillText(`filter: ${statusIconDisplay(active)}`, 8, 78);
-    ctx.fillText(`settings revision: ${this.__hpsSettingsRevision ?? 0}`, 8, 96);
 
     ctx.fillStyle = "rgba(0,0,0,0.18)";
     ctx.fillRect(r.statusBox.x, r.statusBox.y, r.statusBox.w, r.statusBox.h);
