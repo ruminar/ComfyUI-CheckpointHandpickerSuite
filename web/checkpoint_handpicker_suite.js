@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// v8a: v7-based stable UI rebuild. Restores ListSelector page scroll, wheel capture, and scrollbar drag.
+// v8c: v8b/v8a conservative rebuild with ListSelector/Cycler/Tagger UI-state fixes.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
@@ -399,6 +399,36 @@ function serializeCyclerFilterStatuses(statuses) {
   return JSON.stringify(normalizeCyclerFilterStatuses(statuses));
 }
 
+function statusIconDisplay(statuses) {
+  const normalized = normalizeCyclerFilterStatuses(statuses);
+  return normalized.length ? normalized.map((status) => STATUS_ICON[status] || status).join("") : "all";
+}
+
+function applyCyclerStatePayload(node, detail) {
+  if (!node || !detail) return;
+  if (detail.active_filter !== undefined) {
+    node.__hpsFilterStatuses = normalizeCyclerFilterStatuses(detail.active_filter);
+  }
+  if (detail.use_local_list !== undefined) {
+    node.__hpsUseLocalList = !!detail.use_local_list;
+  }
+  if (detail.settings_revision !== undefined) {
+    node.__hpsSettingsRevision = parseSavedInt(detail.settings_revision, node.__hpsSettingsRevision ?? 0);
+  }
+  if (detail.ckpt_name_str) {
+    node.__hpsCyclerCkptName = detail.ckpt_name_str;
+    node.__hpsCyclerStatusValue = detail.status || "none";
+    setExecutionState(detail);
+  }
+  if (detail.status_text !== undefined) {
+    node.__hpsCyclerStatus = detail.status_text;
+  }
+  if (detail.title) {
+    node.title = detail.title;
+  }
+  syncCyclerSettingsWidgets(node);
+}
+
 function parseSavedBool(value, fallback) {
   const text = String(value ?? "").trim().toLowerCase();
   if (!text) return fallback;
@@ -647,12 +677,7 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
           : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${result.ckpt_name_str}`;
       }
     } else if (nodeClass === CYCLER_CLASS) {
-      if (result.ckpt_name_str) {
-        node.__hpsCyclerCkptName = result.ckpt_name_str;
-        node.__hpsCyclerStatusValue = result.status || "none";
-      }
-      if (result.status_text) node.__hpsCyclerStatus = result.status_text;
-      if (result.title) node.title = result.title;
+      applyCyclerStatePayload(node, result);
     }
     app.graph?.setDirtyCanvas?.(true, true);
   } catch (error) {
@@ -994,11 +1019,18 @@ async function pushSelectedToLocalList(node) {
     body: JSON.stringify(tabPayload({
       ckpt_name_str: selected,
       target_node_ids: (app.graph?._nodes || [])
-        .filter((n) => isNodeClass(n, CYCLER_CLASS) && n.__hpsUseLocalList !== false)
+        .filter((n) => isNodeClass(n, CYCLER_CLASS))
         .map((n) => n.id),
     })),
   });
   const result = await response.json();
+  if (result.ok && Array.isArray(result.states)) {
+    for (const state of result.states) {
+      const cycler = app.graph?.getNodeById?.(Number(state.node_id));
+      if (cycler && isNodeClass(cycler, CYCLER_CLASS)) applyCyclerStatePayload(cycler, state);
+    }
+  }
+  console.info(`[INFO] [CheckpointHandpickerSuite] Push Local List: ${selected} -> ${result.updated ?? 0} Cycler(s)`);
   node.__hpsStatus = result.ok
     ? `pushed : ${selected} (${result.updated} Cycler)`
     : (result.error || "Push failed");
@@ -1194,7 +1226,7 @@ function setupSelectorNode(nodeType) {
     hideSelectorWidget(this);
     if (hpsNodeCollapsed(this)) return;
     const r = selectorRects(this);
-    drawButton(ctx, r.refreshAll, "Refresh All", !this.__hpsLoading);
+    drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
     drawButton(ctx, r.listOnly, "List", !this.__hpsLoading);
     drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
     drawButton(ctx, r.up, "▲", true);
@@ -1353,9 +1385,10 @@ function currentTaggerPath(node) {
   return node.__hpsTaggerPath || linkedInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
+  // Keep the controls below LiteGraph input pins/labels.
   return STATUS_ORDER.map((status, i) => ({
     status,
-    x: 8 + i * 84,
+    x: 128 + i * 84,
     y: 8,
     w: 78,
     h: 26,
@@ -1395,13 +1428,13 @@ function taggerCursorAt(node, local) {
 }
 
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 450, 100);
+  installMinSize(nodeType, 450, 130);
   installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 450, 100);
+    ensureSize(this, 450, 130);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -1434,13 +1467,13 @@ function setupTaggerNode(nodeType) {
     const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 54);
+    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 78);
     const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: — none" : `Current: ${STATUS_ICON[current]} ${STATUS_LABEL[current]}`);
     ctx.fillStyle = current === "none" ? "#888" : "#ddd";
-    ctx.fillText(msg, 8, 72);
-    if (this.size[1] >= 110 && current !== "none" && current !== "delete") {
+    ctx.fillText(msg, 8, 96);
+    if (this.size[1] >= 124 && current !== "none" && current !== "delete") {
       ctx.fillStyle = "#aaa";
-      ctx.fillText("Delete is available only from none.", 8, 90);
+      ctx.fillText("Delete is available only from none.", 8, 114);
     }
     ctx.restore();
   };
@@ -1519,7 +1552,7 @@ function cyclerActiveFilter(node) {
 }
 async function pushCyclerFlags(node) {
   syncCyclerSettingsWidgets(node);
-  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(tabPayload({
@@ -1529,10 +1562,12 @@ async function pushCyclerFlags(node) {
       ...getCyclerRuntimeControls(node),
     })),
   });
+  const result = await response.json();
+  if (result?.ok) applyCyclerStatePayload(node, result);
 }
 async function pushCyclerFilter(node) {
   syncCyclerSettingsWidgets(node);
-  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(tabPayload({
@@ -1542,13 +1577,19 @@ async function pushCyclerFilter(node) {
       ...getCyclerRuntimeControls(node),
     })),
   });
+  const result = await response.json();
+  if (result?.ok) applyCyclerStatePayload(node, result);
 }
 async function clearLocalList(node) {
-  await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/clear_local_list`, {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/clear_local_list`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(tabPayload({ node_id: node.id })),
   });
+  const result = await response.json();
+  if (result?.ok && result.state) applyCyclerStatePayload(node, result.state);
+  console.info(`[INFO] [CheckpointHandpickerSuite] Clear Local List: ${result?.cleared ?? 0} item(s)`);
+  app.graph?.setDirtyCanvas?.(true, true);
 }
 function cyclerCursorAt(node, local) {
   if (!local) return "";
@@ -1599,7 +1640,7 @@ function setupCyclerNode(nodeType) {
 
     ctx.fillStyle = "#aaa";
     ctx.font = "12px sans-serif";
-    ctx.fillText(`filter: ${active.length ? active.join(", ") : "all"}`, 8, 78);
+    ctx.fillText(`filter: ${statusIconDisplay(active)}`, 8, 78);
     ctx.fillText(`settings revision: ${this.__hpsSettingsRevision ?? 0}`, 8, 96);
 
     ctx.fillStyle = "rgba(0,0,0,0.18)";
@@ -1649,13 +1690,7 @@ function setupCyclerNode(nodeType) {
 api.addEventListener(CYCLER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, CYCLER_CLASS);
   if (!node) return;
-  if (detail.ckpt_name_str) {
-    node.__hpsCyclerCkptName = detail.ckpt_name_str;
-    node.__hpsCyclerStatusValue = detail.status || "none";
-    setExecutionState(detail);
-  }
-  if (detail.title) node.title = detail.title;
-  node.__hpsCyclerStatus = detail.status_text;
+  applyCyclerStatePayload(node, detail);
   app.graph.setDirtyCanvas(true, true);
 });
 

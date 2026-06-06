@@ -21,6 +21,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v8c: conservative rebuild from v8b/v8a with Cycler/ListSelector UI-state fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -203,6 +204,13 @@ def _checkpoint_roots() -> list[Path]:
 
 
 def _get_checkpoint_list() -> list[str]:
+    """Return ComfyUI's normal checkpoint list order.
+
+    This order is intentionally not re-sorted here. Before Refresh All has patched
+    every checkpoint combo type, CheckpointNameCycler must expose the same combo
+    ordering as ComfyUI's standard CheckpointLoaderSimple, otherwise combo output
+    types can diverge and fail when the queue starts.
+    """
     try:
         names = folder_paths.get_filename_list("checkpoints")
     except Exception:
@@ -216,7 +224,7 @@ def _get_checkpoint_list() -> list[str]:
             continue
         seen.add(relpath)
         out.append(relpath)
-    return sorted(out, key=lambda x: x.lower())
+    return out
 
 
 def _scan_registered_checkpoint_folders() -> list[str]:
@@ -294,6 +302,11 @@ def _status_summary_text(prefix: str) -> str:
 
 def _status_icons_for_filter(active_statuses: list[str]) -> str:
     return "".join(STATUS_ICON[s] for s in ["favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
+
+
+def _filter_display(active_statuses: list[str]) -> str:
+    icons = _status_icons_for_filter(active_statuses)
+    return icons or "all"
 
 
 def _log_widget_refresh(updated_count: int):
@@ -1091,7 +1104,7 @@ def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, qu
     lines = [
         f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (none)",
         f"Mode: {mode}  Hold: {hold_index}/{change_every}",
-        f"Filter: {', '.join(active_filter) if active_filter else 'all'}  Matches: {match_count}",
+        f"Filter: {_filter_display(active_filter)}  Matches: {match_count}",
     ]
     if fallback_all:
         lines.append("Filter fallback: all checkpoints")
@@ -1099,6 +1112,29 @@ def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, qu
         lines.append(f"Local List: {local_count} item(s)")
     if queue:
         lines.append(f"Queue: {len(queue)} item(s)")
+    return "\n".join(lines)
+
+
+def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -> str:
+    """Build a status panel for UI-only operations such as Push/Clear Local List."""
+    ckpt_name = state.get("last_ckpt_name", "") or ""
+    status = _get_status(ckpt_name) if ckpt_name else "none"
+    active_filter = list(state.get("active_filter", []))
+    local_count = len(state.get("local_list", []))
+    mode = state.get("last_mode", "increment")
+    hold_index = max(0, _parse_saved_int(state.get("last_hold_index"), 0))
+    change_every = _valid_change_every(state.get("last_change_every", 1))
+    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (not executed yet)"
+    lines = [
+        current,
+        f"Mode: {mode}  Hold: {hold_index}/{change_every}",
+        f"Filter: {_filter_display(active_filter)}",
+        f"Local List: {local_count} item(s)",
+    ]
+    if action:
+        lines.append(action)
+    if detail:
+        lines.append(detail)
     return "\n".join(lines)
 
 
@@ -1146,7 +1182,7 @@ class CheckpointListSelector:
 class CheckpointNameCycler:
     @classmethod
     def INPUT_TYPES(cls):
-        values = _get_fresh_checkpoint_values() or [""]
+        values = _get_checkpoint_list() or [""]
         return {
             "required": {
                 "start_checkpoint": (values,),
@@ -1162,7 +1198,7 @@ class CheckpointNameCycler:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = (_get_fresh_checkpoint_values() or [""], "STRING", "STRING")
+    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "cycle"
     CATEGORY = "checkpoint/handpicker"
@@ -1621,15 +1657,21 @@ async def cycler_local_list_append(request):
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     target_node_ids = [str(x) for x in data.get("target_node_ids", []) if str(x).isdigit()]
     updated = 0
+    states = []
     for node_id in target_node_ids:
         state = _get_cycler_state(_state_key(tab_id, node_id))
         if state.get("use_local_list", True):
-            state.setdefault("local_list", []).append(relpath)
-            state["override_queue"] = state["local_list"]
+            local_list = state.setdefault("local_list", [])
+            local_list.append(relpath)
+            state["override_queue"] = local_list
+            state["last_status_text"] = _build_cycler_idle_status_text("Pushed to Local List", state, relpath)
             updated += 1
             _send_cycler_state_update(node_id, state, tab_id=tab_id)
+            payload = _cycler_state_payload(state)
+            payload.update({"node_id": node_id})
+            states.append(payload)
     logger.info("[CheckpointHandpickerSuite] Pushed checkpoint to %s Local List(s) in tab %s: %s", updated, tab_id, relpath)
-    return web.json_response({"ok": True, "updated": updated})
+    return web.json_response({"ok": True, "updated": updated, "states": states})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/clear_local_list")
@@ -1641,9 +1683,12 @@ async def cycler_clear_local_list(request):
     cleared = len(state.get("local_list", []))
     state["local_list"] = []
     state["override_queue"] = []
+    state["last_status_text"] = _build_cycler_idle_status_text("Cleared Local List", state, f"Cleared: {cleared} item(s)")
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
     logger.info("[CheckpointHandpickerSuite] Cleared Local List for tab %s node %s: %s item(s)", tab_id, node_id, cleared)
-    return web.json_response({"ok": True, "cleared": cleared})
+    payload = _cycler_state_payload(state)
+    payload.update({"node_id": node_id})
+    return web.json_response({"ok": True, "cleared": cleared, "state": payload})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/review/sync_checkpoint")
