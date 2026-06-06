@@ -13,16 +13,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Iterable
 
 import folder_paths
 import numpy as np
 from aiohttp import web
-from PIL import Image, ImageOps
+from PIL import Image
 from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
-# v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -30,36 +30,40 @@ TAGGER_EVENT = "ruminar.checkpoint_handpicker_suite.tagger"
 STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed"
 
 STATUS_VALUES = ["favorite", "nice", "keep", "delete", "none"]
-STATUS_ICON = {"favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
-STATUS_LABEL = {"favorite": "favorite", "nice": "nice", "keep": "keep", "delete": "delete", "none": "none"}
+STATUS_ICON = {
+    "favorite": "💛",
+    "nice": "👍",
+    "keep": "✔",
+    "delete": "🗑",
+    "none": "—",
+}
+STATUS_LABEL = {
+    "favorite": "favorite",
+    "nice": "nice",
+    "keep": "keep",
+    "delete": "delete",
+    "none": "none",
+}
 
 NODE_DIR = Path(__file__).resolve().parent
 DATA_DIR = NODE_DIR / "data"
 STATUS_DB_PATH = DATA_DIR / "checkpoint_statuses.json"
 FAVORITES_COMPAT_PATH = DATA_DIR / "checkpoint_favorites.json"
-try:
-    TEMP_DIR = Path(folder_paths.get_temp_directory()).resolve()
-except Exception:
-    TEMP_DIR = NODE_DIR / "temp"
-DELETE_QUEUE_PATH = TEMP_DIR / "checkpoint_delete_queue.jsonl"
-DELETE_SCRIPT_PATH = TEMP_DIR / "delete_reserved_checkpoints.py"
+DELETE_QUEUE_PATH = Path(folder_paths.get_temp_directory()).resolve() / "checkpoint_delete_queue.jsonl"
+DELETE_SCRIPT_PATH = Path(folder_paths.get_temp_directory()).resolve() / "delete_reserved_checkpoints.py"
 
 JPEG_QUALITY = 80
 JPEG_OPTIMIZE = False
 GAP = 6
 IMAGE_DIR_DEFAULT_MAX_IMAGES = 12
 IMAGE_DIR_MAX_IMAGES = 80
-IMAGE_DIR_SCAN_LIMIT = 3000
+MAX_LONG_EDGE = 512
 MAX_CONTENT_EDGE = 4096
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 ALLOWED_CHECKPOINT_SUFFIX = ".safetensors"
 
 _STATE_LOCK = threading.Lock()
 _CYCLER_STATES: dict[str, dict] = {}
-_TAGGER_STATES: dict[str, dict] = {}
-_PREVIEW_STATES: dict[str, dict] = {}
-_TAB_EXECUTION_STATES: dict[str, dict] = {}
-_EXECUTION_REVISION = 0
 
 
 def _clean_tab_id(value) -> str:
@@ -143,6 +147,7 @@ def _load_status_db() -> dict:
 
 def _save_status_db(data: dict):
     _safe_json_write(STATUS_DB_PATH, data)
+    # compatibility file for older tools that only know favorites
     favorites = {}
     for relpath, entry in data.get("statuses", {}).items():
         if entry.get("status") == "favorite":
@@ -160,7 +165,9 @@ def _get_status(relpath: str) -> str:
     db = _load_status_db()
     entry = db.get("statuses", {}).get(relpath) or {}
     status = entry.get("status", "none")
-    return status if status in STATUS_VALUES else "none"
+    if status not in STATUS_VALUES:
+        status = "none"
+    return status
 
 
 def _set_status(relpath: str, status: str):
@@ -182,36 +189,19 @@ def _set_status(relpath: str, status: str):
     _save_status_db(db)
 
 
-def _get_supported_checkpoint_extensions() -> set[str]:
-    default_extensions = {".ckpt", ".pt", ".bin", ".pth", ".safetensors"}
-    extensions = getattr(folder_paths, "supported_pt_extensions", None)
-    if not extensions:
-        return default_extensions
-    return {str(ext).lower() for ext in extensions}
-
-
-def _clear_checkpoint_filename_cache():
-    cache = getattr(folder_paths, "filename_list_cache", None)
-    if isinstance(cache, dict):
-        cache.pop("checkpoints", None)
-
-
-def _checkpoint_roots() -> list[Path]:
-    try:
-        roots = folder_paths.get_folder_paths("checkpoints")
-    except Exception:
-        roots = []
-    return [Path(p).resolve() for p in roots]
+def _delete_status_summary() -> dict[str, int]:
+    checkpoints = _get_checkpoint_list()
+    counts = {s: 0 for s in STATUS_VALUES if s != "none"}
+    for relpath in checkpoints:
+        status = _get_status(relpath)
+        if status in counts:
+            counts[status] += 1
+    counts["none"] = len(checkpoints) - sum(counts.values())
+    counts["total"] = len(checkpoints)
+    return counts
 
 
 def _get_checkpoint_list() -> list[str]:
-    """Return ComfyUI's normal checkpoint list order.
-
-    This order is intentionally not re-sorted here. Before Refresh All has patched
-    every checkpoint combo type, CheckpointNameCycler must expose the same combo
-    ordering as ComfyUI's standard CheckpointLoaderSimple, otherwise combo output
-    types can diverge and fail when the queue starts.
-    """
     try:
         names = folder_paths.get_filename_list("checkpoints")
     except Exception:
@@ -226,42 +216,6 @@ def _get_checkpoint_list() -> list[str]:
         seen.add(relpath)
         out.append(relpath)
     return out
-
-
-def _scan_registered_checkpoint_folders() -> list[str]:
-    results = set()
-    extensions = _get_supported_checkpoint_extensions()
-    for root in _checkpoint_roots():
-        try:
-            if not root.exists() or not root.is_dir():
-                continue
-            for dirpath, _dirnames, filenames in os.walk(root):
-                dirpath = Path(dirpath)
-                for filename in filenames:
-                    if Path(filename).suffix.lower() not in extensions:
-                        continue
-                    try:
-                        relpath = Path(dirpath, filename).resolve().relative_to(root).as_posix()
-                    except Exception:
-                        continue
-                    results.add(_normalize_relpath(relpath))
-        except Exception:
-            logger.exception("Failed to scan checkpoint root: %s", root)
-    return sorted(results, key=lambda value: value.lower())
-
-
-def _get_fresh_checkpoint_values() -> list[str]:
-    results = set()
-    _clear_checkpoint_filename_cache()
-    try:
-        results.update(_normalize_relpath(name) for name in folder_paths.get_filename_list("checkpoints"))
-    except Exception:
-        logger.exception("Failed to refresh checkpoint list through folder_paths")
-    try:
-        results.update(_scan_registered_checkpoint_folders())
-    except Exception:
-        logger.exception("Failed to refresh checkpoint list by scanning folders")
-    return sorted((x for x in results if x), key=lambda value: value.lower())
 
 
 def _checkpoint_items() -> list[dict]:
@@ -281,16 +235,17 @@ def _checkpoint_items() -> list[dict]:
     return items
 
 
-def _delete_status_summary() -> dict[str, int]:
-    checkpoints = _get_checkpoint_list()
-    counts = {s: 0 for s in STATUS_VALUES if s != "none"}
-    for relpath in checkpoints:
-        status = _get_status(relpath)
-        if status in counts:
-            counts[status] += 1
-    counts["none"] = len(checkpoints) - sum(counts.values())
-    counts["total"] = len(checkpoints)
-    return counts
+def _select_checkpoint_value(value: str | None) -> tuple[str, str]:
+    relpath = _normalize_relpath(value or "")
+    items = _checkpoint_items()
+    if _is_valid_checkpoint_relpath(relpath):
+        for item in items:
+            if item["ckpt_name_str"] == relpath:
+                return item["ckpt_name_str"], item["ckpt_name_safe"]
+    if items:
+        first = items[0]
+        return first["ckpt_name_str"], first["ckpt_name_safe"]
+    return "", "checkpoint"
 
 
 def _status_summary_text(prefix: str) -> str:
@@ -302,367 +257,15 @@ def _status_summary_text(prefix: str) -> str:
 
 
 def _status_icons_for_filter(active_statuses: list[str]) -> str:
-    return "".join(STATUS_ICON[s] for s in ["favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
-
-
-def _filter_display(active_statuses: list[str]) -> str:
-    icons = _status_icons_for_filter(active_statuses)
-    return icons or "all"
+    icons = []
+    for s in ["favorite", "nice", "keep", "delete", "none"]:
+        if s in active_statuses:
+            icons.append(STATUS_ICON[s])
+    return "".join(icons)
 
 
 def _log_widget_refresh(updated_count: int):
     logger.info("[CheckpointHandpickerSuite] Updated checkpoint widgets: %s", updated_count)
-
-
-def _parse_saved_int(value, fallback: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return fallback
-
-
-def _parse_saved_bool(value, fallback: bool = True) -> bool:
-    text = str(value or "").strip().lower()
-    if not text:
-        return fallback
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return fallback
-
-
-def _normalize_status_list(value) -> list[str]:
-    raw = value
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        try:
-            raw = json.loads(text)
-        except Exception:
-            raw = [x.strip() for x in text.split(",")]
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
-    seen = {str(x).strip() for x in raw if str(x).strip() in STATUS_VALUES}
-    return [s for s in STATUS_VALUES if s in seen]
-
-
-def _valid_mode(value) -> str:
-    value = str(value or "increment")
-    return value if value in {"fixed", "increment", "randomize", "shuffle_once"} else "increment"
-
-
-def _valid_change_every(value) -> int:
-    try:
-        n = int(value)
-    except Exception:
-        n = 1
-    return max(1, min(999999, n))
-
-
-def _get_default_cycler_state() -> dict:
-    return {
-        # runtime_controls are the live controls used by the next execution.
-        # Python function arguments are only a fallback when the frontend state
-        # has not been initialized yet.
-        "runtime_controls": {
-            "mode": "increment",
-            "change_every": 1,
-            "start_checkpoint": "",
-            "active_filter": [],
-            "use_local_list": True,
-            "settings_revision": 0,
-        },
-        "runtime_controls_initialized": False,
-        # runtime_state: mutable execution inventory/decks/counters.
-        "local_list": [],
-        "local_index": 0,
-        "override_queue": [],
-        "current_index": 0,
-        "repeat_count": 0,
-        "cycle_count": 0,
-        "shuffle_deck": [],
-        # last_execution_snapshot is the original record of the last checkpoint
-        # that was actually returned downstream. Local List contents are NOT
-        # stored here; they are a separate runtime_state ledger.
-        "last_execution_snapshot": None,
-        # legacy mirrors kept for old JS/payload compatibility.
-        "use_local_list": True,
-        "accept_queue": True,
-        "active_filter": [],
-        "settings_revision": 0,
-        "last_ckpt_name": "",
-        "last_normal_ckpt_name": "",
-        "last_source": "cycle",
-        "last_title": "Checkpoint Name Cycler",
-        "last_status_text": "Current: (not executed yet)",
-        "last_hold_index": 0,
-        "last_change_every": 1,
-        "last_mode": "increment",
-        "last_start_checkpoint": "",
-        "execution_revision": 0,
-    }
-
-
-def _get_cycler_state(key: str) -> dict:
-    with _STATE_LOCK:
-        state = _CYCLER_STATES.get(key)
-        if state is None:
-            state = _get_default_cycler_state()
-            _CYCLER_STATES[key] = state
-        return state
-
-
-def _runtime_controls_from_state(state: dict) -> dict:
-    raw = state.get("runtime_controls")
-    if not isinstance(raw, dict):
-        raw = {}
-    controls = {
-        "mode": _valid_mode(raw.get("mode", state.get("last_mode", "increment"))),
-        "change_every": _valid_change_every(raw.get("change_every", state.get("last_change_every", 1))),
-        "start_checkpoint": _normalize_relpath(raw.get("start_checkpoint", state.get("last_start_checkpoint", ""))),
-        "active_filter": _normalize_status_list(raw.get("active_filter", state.get("active_filter", []))),
-        "use_local_list": bool(raw.get("use_local_list", state.get("use_local_list", True))),
-        "settings_revision": _parse_saved_int(raw.get("settings_revision", state.get("settings_revision", 0)), 0),
-    }
-    state["runtime_controls"] = controls
-    # Keep legacy mirrors in sync. These mirrors are runtime controls, not last
-    # execution facts.
-    state["last_mode"] = controls["mode"]
-    state["last_change_every"] = controls["change_every"]
-    state["last_start_checkpoint"] = controls["start_checkpoint"]
-    state["active_filter"] = list(controls["active_filter"])
-    state["use_local_list"] = controls["use_local_list"]
-    state["accept_queue"] = controls["use_local_list"]
-    state["settings_revision"] = controls["settings_revision"]
-    return controls
-
-
-def _set_runtime_controls(state: dict, *, mode=None, change_every=None, start_checkpoint=None, active_filter=None, use_local_list=None, settings_revision=None, mark_initialized=True) -> dict:
-    controls = _runtime_controls_from_state(state)
-    if mode is not None:
-        controls["mode"] = _valid_mode(mode)
-    if change_every is not None:
-        controls["change_every"] = _valid_change_every(change_every)
-    if start_checkpoint is not None:
-        controls["start_checkpoint"] = _normalize_relpath(start_checkpoint)
-    if active_filter is not None:
-        controls["active_filter"] = _normalize_status_list(active_filter)
-    if use_local_list is not None:
-        controls["use_local_list"] = bool(use_local_list)
-    if settings_revision is not None:
-        controls["settings_revision"] = max(0, _parse_saved_int(settings_revision, controls.get("settings_revision", 0)))
-    state["runtime_controls"] = controls
-    if mark_initialized:
-        state["runtime_controls_initialized"] = True
-    return _runtime_controls_from_state(state)
-
-
-def _last_execution_snapshot(state: dict) -> dict:
-    snap = state.get("last_execution_snapshot")
-    if isinstance(snap, dict) and snap.get("ckpt_name"):
-        return snap
-    # Migrate old last_* fields if present.
-    ckpt = state.get("last_ckpt_name", "") or ""
-    if not ckpt:
-        return {}
-    return {
-        "ckpt_name": ckpt,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt),
-        "source": state.get("last_source", "cycle"),
-        "mode_used": state.get("last_mode", "increment"),
-        "base_mode": state.get("last_mode", "increment"),
-        "change_every_used": _valid_change_every(state.get("last_change_every", 1)),
-        "hold_index": max(0, _parse_saved_int(state.get("last_hold_index"), 0)),
-        "filter_used": list(state.get("active_filter", [])),
-        "fallback_all": False,
-    }
-
-
-def _should_accept_settings_update(state: dict, revision: int) -> tuple[bool, int]:
-    revision = max(0, _parse_saved_int(revision, 0))
-    current = max(0, _parse_saved_int(state.get("settings_revision"), 0))
-    if revision >= current:
-        return True, revision
-    return False, current
-
-
-def _cycler_state_payload(state: dict) -> dict:
-    controls = _runtime_controls_from_state(state)
-    snap = _last_execution_snapshot(state)
-    ckpt = snap.get("ckpt_name", "") or ""
-    status = _get_status(ckpt) if ckpt else "none"
-    active_filter = list(controls.get("active_filter", []))
-    valid_local_items = _valid_local_list(state.get("local_list", []))
-    local_count = len(valid_local_items)
-    filter_matches = _filter_match_count(active_filter)
-    use_local = bool(controls.get("use_local_list", True))
-
-    if ckpt:
-        display_source = snap.get("source", "cycle")
-        hold_index = max(0, _parse_saved_int(snap.get("hold_index"), 0))
-        change_every = _valid_change_every(snap.get("change_every_used", controls.get("change_every", 1)))
-        mode_used = snap.get("mode_used", controls.get("mode", "increment"))
-        fallback_all = bool(snap.get("fallback_all", False))
-        title = _build_cycler_title(display_source, ckpt, hold_index, change_every, active_filter, fallback_all, local_count if use_local else 0)
-        status_text = _build_cycler_status_text(
-            display_source,
-            ckpt,
-            active_filter,
-            fallback_all,
-            [],
-            hold_index,
-            change_every,
-            filter_matches,
-            local_count,
-            mode_used,
-            local_items=valid_local_items,
-            use_local_list=use_local,
-        )
-        if snap.get("base_mode", mode_used) == "shuffle_once" or mode_used == "shuffle_once":
-            status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
-    else:
-        title = "Checkpoint Name Cycler"
-        status_text = _build_cycler_idle_status_text("", state)
-
-    state["last_title"] = title
-    state["last_status_text"] = status_text
-    return {
-        "ckpt_name_str": ckpt,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt) if ckpt else "",
-        "status": status,
-        "status_icon": STATUS_ICON[status],
-        "title": title,
-        "status_text": status_text,
-        "use_local_list": bool(controls.get("use_local_list", True)),
-        "active_filter": active_filter,
-        "filter_matches": filter_matches,
-        "filter_total": _checkpoint_total_count(),
-        "settings_revision": _parse_saved_int(controls.get("settings_revision"), 0),
-        "local_list_count": len(valid_local_items),
-        "local_list_items": valid_local_items,
-        "runtime_controls": {
-            "mode": controls.get("mode", "increment"),
-            "change_every": controls.get("change_every", 1),
-            "start_checkpoint": controls.get("start_checkpoint", ""),
-            "active_filter": active_filter,
-            "use_local_list": bool(controls.get("use_local_list", True)),
-            "settings_revision": _parse_saved_int(controls.get("settings_revision"), 0),
-        },
-        "runtime_controls_initialized": bool(state.get("runtime_controls_initialized", False)),
-        "shuffle_deck_remaining": len(state.get("shuffle_deck", [])),
-        "mode": controls.get("mode", "increment"),
-        "change_every": controls.get("change_every", 1),
-        "start_checkpoint": controls.get("start_checkpoint", ""),
-        "last_execution_snapshot": snap,
-        "execution_revision": state.get("execution_revision", 0),
-    }
-
-
-def _store_tagger_state(tab_id, node_id, ckpt_name_str, status):
-    key = _state_key(tab_id, node_id)
-    with _STATE_LOCK:
-        _TAGGER_STATES[key] = {
-            "ckpt_name_str": ckpt_name_str,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name_str) if ckpt_name_str else "",
-            "status": status,
-            "status_icon": STATUS_ICON.get(status, "—"),
-            "updated_at": _now_iso(),
-        }
-
-
-def _store_preview_state(tab_id, node_id, ckpt_name_str, status, **extra):
-    key = _state_key(tab_id, node_id)
-    with _STATE_LOCK:
-        _PREVIEW_STATES[key] = {
-            "ckpt_name_str": ckpt_name_str,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name_str) if ckpt_name_str else "",
-            "status": status,
-            "status_icon": STATUS_ICON.get(status, "—"),
-            "updated_at": _now_iso(),
-            **extra,
-        }
-
-
-def _store_tab_execution_state(tab_id, payload: dict):
-    global _EXECUTION_REVISION
-    with _STATE_LOCK:
-        _EXECUTION_REVISION += 1
-        payload = dict(payload)
-        payload["execution_revision"] = _EXECUTION_REVISION
-        payload["updated_at"] = _now_iso()
-        _TAB_EXECUTION_STATES[_clean_tab_id(tab_id)] = payload
-        return payload
-
-
-def _get_tab_execution_state(tab_id) -> dict:
-    with _STATE_LOCK:
-        return dict(_TAB_EXECUTION_STATES.get(_clean_tab_id(tab_id), {}))
-
-
-def _send_event(name: str, payload: dict, client_id=None):
-    try:
-        server = PromptServer.instance
-        client_id = client_id or getattr(server, "client_id", None)
-        if client_id:
-            server.send_sync(name, payload, client_id)
-        else:
-            server.send_sync(name, payload)
-    except Exception:
-        logger.exception("[CheckpointHandpickerSuite] failed to send event: %s", name)
-
-
-def _send_status_changed(relpath: str, tab_id: str = "", node_id=None):
-    status = _get_status(relpath)
-    _send_event(STATUS_CHANGED_EVENT, {
-        "node": int(node_id) if str(node_id or "").isdigit() else None,
-        "tab_id": _clean_tab_id(tab_id),
-        "node_class": "CheckpointStatusTagger",
-        "ckpt_name_str": relpath,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-        "status": status,
-        "status_icon": STATUS_ICON[status],
-    })
-
-
-def _send_cycler_state_update(node_id, state: dict, tab_id: str = ""):
-    payload = _cycler_state_payload(state)
-    payload.update({
-        "node": int(node_id) if str(node_id or "").isdigit() else None,
-        "tab_id": _clean_tab_id(tab_id),
-        "node_class": "CheckpointNameCycler",
-    })
-    _send_event(CYCLER_EVENT, payload)
-
-
-def _send_cycler_update(node_id, title, status_text, tab_id="", **extra):
-    payload = {
-        "node": int(node_id) if str(node_id or "").isdigit() else None,
-        "tab_id": _clean_tab_id(tab_id),
-        "node_class": "CheckpointNameCycler",
-        "title": title,
-        "status_text": status_text,
-        **extra,
-    }
-    _send_event(CYCLER_EVENT, payload)
-
-
-def _send_preview(node_id, title, image: Image.Image | None, extra: dict | None = None, tab_id: str = ""):
-    extra = dict(extra or {})
-    payload = {
-        "node": int(node_id) if str(node_id or "").isdigit() else None,
-        "tab_id": _clean_tab_id(tab_id),
-        "title": title,
-        **extra,
-    }
-    if image is None:
-        payload.update({"image": None, "format": "jpeg"})
-    else:
-        payload.update(_encode_preview_payload(image))
-    _send_event(PREVIEW_EVENT, payload)
 
 
 def _active_delete_records() -> dict[str, dict]:
@@ -670,7 +273,7 @@ def _active_delete_records() -> dict[str, dict]:
     if not DELETE_QUEUE_PATH.exists():
         return active
     try:
-        for line in DELETE_QUEUE_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in DELETE_QUEUE_PATH.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             rec = json.loads(line)
@@ -679,13 +282,10 @@ def _active_delete_records() -> dict[str, dict]:
             rid = rec.get("id")
             if typ == "reserve" and rid and relpath:
                 active[relpath] = rec
-            elif typ == "cancel":
-                if relpath:
-                    active.pop(relpath, None)
-                elif rid:
-                    for key, value in list(active.items()):
-                        if value.get("id") == rid:
-                            active.pop(key, None)
+            elif typ == "cancel" and rid:
+                for key, value in list(active.items()):
+                    if value.get("id") == rid:
+                        active.pop(key, None)
     except Exception:
         logger.exception("Failed to parse delete queue")
     return active
@@ -695,6 +295,83 @@ def _append_delete_record(record: dict):
     DELETE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DELETE_QUEUE_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+
+def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> int:
+    """Prune active delete reservations whose checkpoint file is already gone.
+
+    The delete script removes files outside ComfyUI, while the queue is an
+    append-only JSONL log. During Refresh All, cancel active delete reservations
+    that clearly point to checkpoints no longer present on disk, and clear their
+    delete status so they disappear from the active delete plan.
+
+    To avoid removing a reservation during temporary path/root glitches, keep
+    the reservation if the checkpoint relpath still appears in the freshly
+    scanned checkpoint list.
+    """
+    active = _active_delete_records()
+    if not active:
+        return 0
+
+    current_names = {
+        _normalize_relpath(value)
+        for value in (checkpoint_values if checkpoint_values is not None else _get_fresh_checkpoint_values())
+    }
+    pruned = 0
+
+    for relpath, rec in list(active.items()):
+        relpath = _normalize_relpath(relpath)
+        rid = rec.get("id")
+        if not rid:
+            continue
+
+        # If ComfyUI can still see the checkpoint by relpath, do not prune the
+        # reservation just because the old resolved_path is missing. This avoids
+        # dropping a delete reservation after a root/path change or duplicate
+        # model-folder situation.
+        if relpath in current_names:
+            continue
+
+        raw_path = rec.get("resolved_path") or rec.get("safetensors_path") or ""
+        if raw_path:
+            try:
+                if Path(raw_path).expanduser().resolve().exists():
+                    continue
+            except Exception:
+                # If the path cannot be resolved and the checkpoint is no longer
+                # listed, treat the reservation as stale and cancel it below.
+                pass
+
+        _append_delete_record({
+            "version": 1,
+            "type": "cancel",
+            "id": rid,
+            "ckpt_name_str": relpath,
+            "reason": "missing_on_refresh",
+            "cancelled_at": _now_iso(),
+        })
+
+        if _get_status(relpath) == "delete":
+            _set_status(relpath, "none")
+
+        pruned += 1
+
+    if pruned:
+        try:
+            _write_delete_script()
+        except Exception:
+            logger.exception("Failed to rewrite delete script after pruning missing delete reservations")
+
+    return pruned
+
+
+def _checkpoint_roots() -> list[Path]:
+    try:
+        roots = folder_paths.get_folder_paths("checkpoints")
+    except Exception:
+        roots = []
+    return [Path(p).resolve() for p in roots]
 
 
 def _resolve_checkpoint_unique(ckpt_name_str: str):
@@ -714,6 +391,155 @@ def _resolve_checkpoint_unique(ckpt_name_str: str):
         return None
     path = candidates[0]
     return {"path": str(path), "root": str(path.parent), "json_path": str(path.with_suffix(".json"))}
+
+
+
+def _get_supported_checkpoint_extensions() -> set[str]:
+    default_extensions = {".ckpt", ".pt", ".bin", ".pth", ".safetensors"}
+    extensions = getattr(folder_paths, "supported_pt_extensions", None)
+    if not extensions:
+        return default_extensions
+    return {str(ext).lower() for ext in extensions}
+
+
+def _clear_checkpoint_filename_cache():
+    cache = getattr(folder_paths, "filename_list_cache", None)
+    if isinstance(cache, dict):
+        cache.pop("checkpoints", None)
+
+
+def _scan_registered_checkpoint_folders() -> list[str]:
+    results = set()
+    extensions = _get_supported_checkpoint_extensions()
+    for root in _checkpoint_roots():
+        try:
+            root = Path(root).resolve()
+            if not root.exists() or not root.is_dir():
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                dirpath = Path(dirpath)
+                for filename in filenames:
+                    if Path(filename).suffix.lower() not in extensions:
+                        continue
+                    try:
+                        relpath = Path(dirpath, filename).resolve().relative_to(root).as_posix()
+                    except Exception:
+                        continue
+                    results.add(_normalize_relpath(relpath))
+        except Exception:
+            logger.exception("Failed to scan checkpoint root: %s", root)
+    return sorted(results, key=lambda value: value.lower())
+
+
+def _get_fresh_checkpoint_values() -> list[str]:
+    """Return a fresh checkpoint list for ComfyUI combo widgets.
+
+    This intentionally includes every supported checkpoint extension, while the
+    Suite's review/tag workflow still filters to .safetensors via
+    _is_valid_checkpoint_relpath().
+    """
+    results = set()
+    _clear_checkpoint_filename_cache()
+    try:
+        results.update(_normalize_relpath(name) for name in folder_paths.get_filename_list("checkpoints"))
+    except Exception:
+        logger.exception("Failed to refresh checkpoint list through folder_paths")
+    try:
+        results.update(_scan_registered_checkpoint_folders())
+    except Exception:
+        logger.exception("Failed to refresh checkpoint list by scanning folders")
+    return sorted((x for x in results if x), key=lambda value: value.lower())
+
+
+def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]:
+    """Patch common checkpoint combo INPUT_TYPES / RETURN_TYPES after refresh.
+
+    This mirrors the important parts of the old ComfyUI-CheckpointWidgetRefresh
+    behavior. Updating browser widgets is not enough: ComfyUI also validates
+    links and combo values against backend class metadata. In particular,
+    CheckpointNameSelector-style nodes compare their input combo list against
+    the upstream ckpt_name output type, so both sides must be refreshed.
+    """
+    patched = []
+    values = list(checkpoint_values) or [""]
+
+    try:
+        import nodes as comfy_nodes
+    except Exception:
+        logger.exception("Failed to import ComfyUI nodes for checkpoint refresh patch")
+        return patched
+
+    mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {})
+
+    for class_name, node_class in list(mappings.items()):
+        name = str(class_name)
+        try:
+            if name == "CheckpointLoaderSimple":
+                def loader_input_types(cls, _values=values):
+                    return {"required": {"ckpt_name": (list(_values),)}}
+
+                node_class.INPUT_TYPES = classmethod(loader_input_types)
+                patched.append(name)
+                continue
+
+            if "CheckpointNameSelector" in name:
+                def selector_input_types(cls, _values=values):
+                    return {"required": {"ckpt_name": (list(_values),)}}
+
+                node_class.INPUT_TYPES = classmethod(selector_input_types)
+                # art-venture style CheckpointNameSelector returns a combo-typed
+                # ckpt_name output. If this remains stale while the input side is
+                # refreshed, ComfyUI can reject links with a type mismatch.
+                node_class.RETURN_TYPES = (list(values), "STRING")
+                patched.append(name)
+                continue
+
+            if name == "CheckpointListSelector":
+                def list_selector_input_types(cls, _values=values):
+                    return {
+                        "required": {
+                            "checkpoint": ("STRING", {"default": ""}),
+                        },
+                        "hidden": {
+                            "unique_id": "UNIQUE_ID",
+                        },
+                    }
+
+                node_class.INPUT_TYPES = classmethod(list_selector_input_types)
+                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
+                patched.append(name)
+                continue
+
+            if name == "CheckpointNameCycler":
+                def cycler_input_types(cls, _values=values):
+                    return {
+                        "required": {
+                            "start_checkpoint": (list(_values),),
+                            "mode": (["fixed", "increment", "randomize", "shuffle_once"], {"default": "increment"}),
+                            "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
+                        },
+                        "optional": {
+                            "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
+                            "hps_filter_statuses": ("STRING", {"default": "", "hidden": True}),
+                            "hps_use_local_list": ("STRING", {"default": "", "hidden": True}),
+                            "hps_settings_revision": ("STRING", {"default": "0", "hidden": True}),
+                        },
+                        "hidden": {
+                            "unique_id": "UNIQUE_ID",
+                        },
+                    }
+
+                node_class.INPUT_TYPES = classmethod(cycler_input_types)
+                # Critical: refresh the combo-typed ckpt_name output as well as
+                # start_checkpoint. Otherwise downstream selector nodes may see
+                # different list types after checkpoint deletion.
+                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
+                patched.append(name)
+                continue
+        except Exception as exc:
+            logger.warning("[CheckpointHandpickerSuite] failed to patch %s: %s", name, exc)
+
+    return patched
 
 
 def _is_path_under_root(path: Path, root: Path) -> bool:
@@ -737,10 +563,12 @@ def _delete_plan_targets() -> list[dict]:
             if not resolved:
                 continue
             safetensors_path = Path(resolved["path"]).resolve()
+
         if safetensors_path.suffix.lower() != ALLOWED_CHECKPOINT_SUFFIX:
             continue
         if roots and not any(_is_path_under_root(safetensors_path, root) for root in roots):
             continue
+
         raw_json_path = rec.get("json_path") or ""
         json_path = Path(raw_json_path).resolve() if raw_json_path else safetensors_path.with_suffix(".json")
         targets.append({
@@ -757,10 +585,13 @@ def _write_delete_script():
     script_path = DELETE_SCRIPT_PATH
     plan_path = DELETE_SCRIPT_PATH.with_name("checkpoint_delete_plan.txt")
     targets = _delete_plan_targets()
+
     roots_json = json.dumps([str(root) for root in _checkpoint_roots()], ensure_ascii=False, indent=2)
+
     script_lines = [
         "#!/usr/bin/env python3",
         "# Generated by ComfyUI-CheckpointHandpickerSuite.",
+        "# This script reads checkpoint_delete_queue.jsonl from the same directory at execution time.",
         "# Review each prompt carefully. Default answer is No.",
         "",
         "import json",
@@ -780,7 +611,10 @@ def _write_delete_script():
         "    path = Path(path).resolve()",
         "    if path.suffix.lower() not in ALLOWED_SUFFIXES:",
         "        return False",
-        "    return any(is_under_root(path, root) for root in ALLOWED_ROOTS)",
+        "    for root in ALLOWED_ROOTS:",
+        "        if is_under_root(path, root):",
+        "            return True",
+        "    return False",
         "",
         "def read_records():",
         "    if not QUEUE_PATH.exists():",
@@ -791,7 +625,8 @@ def _write_delete_script():
         "            continue",
         "        try:",
         "            rec = json.loads(line)",
-        "            if isinstance(rec, dict): records.append(rec)",
+        "            if isinstance(rec, dict):",
+        "                records.append(rec)",
         "        except Exception as exc:",
         "            print('Skipping invalid queue record:', exc)",
         "    return records",
@@ -800,56 +635,79 @@ def _write_delete_script():
         "    active = {}",
         "    for rec in read_records():",
         "        rec_type = rec.get('type')",
-        "        relpath = rec.get('ckpt_name_str') or ''",
+        "        relpath = rec.get('ckpt_name_str') or rec.get('ckpt_name_relpath') or ''",
         "        rid = rec.get('id')",
         "        if rec_type == 'reserve' and relpath:",
         "            active[relpath] = rec",
         "        elif rec_type == 'cancel':",
-        "            if relpath: active.pop(relpath, None)",
+        "            if relpath:",
+        "                active.pop(relpath, None)",
         "            elif rid:",
         "                for key, value in list(active.items()):",
-        "                    if value.get('id') == rid: active.pop(key, None)",
+        "                    if value.get('id') == rid:",
+        "                        active.pop(key, None)",
         "    return active",
+        "",
+        "def active_targets():",
+        "    targets = []",
+        "    for relpath, rec in sorted(active_records().items(), key=lambda item: item[0].lower()):",
+        "        raw_ckpt_path = rec.get('resolved_path') or rec.get('safetensors_path') or ''",
+        "        if not raw_ckpt_path:",
+        "            print('Skipping target without resolved_path:', relpath)",
+        "            continue",
+        "        safetensors_path = Path(raw_ckpt_path).resolve()",
+        "        raw_json_path = rec.get('json_path') or ''",
+        "        json_path = Path(raw_json_path).resolve() if raw_json_path else safetensors_path.with_suffix('.json')",
+        "        targets.append({",
+        "            'ckpt_name_str': relpath,",
+        "            'safetensors_path': str(safetensors_path),",
+        "            'json_path': str(json_path),",
+        "            'reserved_at': rec.get('reserved_at', ''),",
+        "        })",
+        "    return targets",
         "",
         "def delete_file(path):",
         "    path = Path(path).resolve()",
         "    if not is_safe_target(path):",
-        "        print('Unsafe target, skipped:', path); return",
+        "        print('Unsafe target, skipped:', path)",
+        "        return",
         "    if not path.exists():",
-        "        print('Not found:', path); return",
+        "        print('Not found:', path)",
+        "        return",
         "    if not path.is_file():",
-        "        print('Not a file, skipped:', path); return",
-        "    path.unlink(); print('Deleted:', path)",
+        "        print('Not a file, skipped:', path)",
+        "        return",
+        "    path.unlink()",
+        "    print('Deleted:', path)",
         "",
         "def main():",
-        "    targets = []",
-        "    for relpath, rec in sorted(active_records().items(), key=lambda item: item[0].lower()):",
-        "        raw = rec.get('resolved_path') or rec.get('safetensors_path') or ''",
-        "        if not raw:",
-        "            print('Skipping target without resolved_path:', relpath); continue",
-        "        safetensors_path = Path(raw).resolve()",
-        "        json_path = Path(rec.get('json_path') or safetensors_path.with_suffix('.json')).resolve()",
-        "        targets.append((relpath, safetensors_path, json_path, rec.get('reserved_at', '')))",
+        "    targets = active_targets()",
         "    print('Checkpoint delete script')",
         "    print('Queue file:', QUEUE_PATH)",
         "    print('Targets:', len(targets))",
-        "    for idx, (relpath, safetensors_path, json_path, reserved_at) in enumerate(targets, start=1):",
+        "    for idx, item in enumerate(targets, start=1):",
         "        print()",
         "        print('[{}/{}] Delete checkpoint?'.format(idx, len(targets)))",
-        "        print('  relpath:', relpath)",
-        "        print('  safetensors:', safetensors_path)",
-        "        print('  json:', json_path)",
+        "        print('  relpath:', item['ckpt_name_str'])",
+        "        print('  safetensors:', item['safetensors_path'])",
+        "        print('  json:', item['json_path'])",
         "        answer = input('Delete this checkpoint? (y/N): ').strip().lower()",
-        "        if answer != 'y': print('Skipped.'); continue",
-        "        delete_file(safetensors_path)",
-        "        delete_file(json_path)",
+        "        if answer != 'y':",
+        "            print('Skipped.')",
+        "            continue",
+        "        delete_file(item['safetensors_path'])",
+        "        delete_file(item['json_path'])",
         "    print()",
-        "    print('Deletion completed. Please return to ComfyUI and click Refresh All.')",
+        "    print('Deletion completed.')",
+        "    print('Please return to ComfyUI and click:')",
+        "    print('Checkpoint List Selector -> Refresh All')",
         "",
-        "if __name__ == '__main__': main()",
+        "if __name__ == '__main__':",
+        "    main()",
         "",
     ]
     script_path.write_text("\n".join(script_lines), encoding="utf-8", newline="\n")
+
     plan_lines = [
         "Checkpoint delete plan",
         f"Generated at: {_now_iso()}",
@@ -869,98 +727,13 @@ def _write_delete_script():
     return script_path, plan_path, len(targets)
 
 
-def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> int:
-    active = _active_delete_records()
-    if not active:
-        return 0
-    current_names = {_normalize_relpath(value) for value in (checkpoint_values if checkpoint_values is not None else _get_fresh_checkpoint_values())}
-    pruned = 0
-    for relpath, rec in list(active.items()):
-        relpath = _normalize_relpath(relpath)
-        rid = rec.get("id")
-        if not rid or relpath in current_names:
-            continue
-        raw_path = rec.get("resolved_path") or rec.get("safetensors_path") or ""
-        if raw_path:
-            try:
-                if Path(raw_path).expanduser().resolve().exists():
-                    continue
-            except Exception:
-                pass
-        _append_delete_record({
-            "version": 1,
-            "type": "cancel",
-            "id": rid,
-            "ckpt_name_str": relpath,
-            "reason": "missing_on_refresh",
-            "cancelled_at": _now_iso(),
-        })
-        if _get_status(relpath) == "delete":
-            _set_status(relpath, "none")
-        pruned += 1
-    if pruned:
-        try:
-            _write_delete_script()
-        except Exception:
-            logger.exception("Failed to rewrite delete script after pruning missing delete reservations")
-    return pruned
-
-
-def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]:
-    patched = []
-    values = list(checkpoint_values) or [""]
-    try:
-        import nodes as comfy_nodes
-    except Exception:
-        logger.exception("Failed to import ComfyUI nodes for checkpoint refresh patch")
-        return patched
-    mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {})
-    for class_name, node_class in list(mappings.items()):
-        name = str(class_name)
-        try:
-            if name == "CheckpointLoaderSimple":
-                def loader_input_types(cls, _values=values):
-                    return {"required": {"ckpt_name": (list(_values),)}}
-                node_class.INPUT_TYPES = classmethod(loader_input_types)
-                patched.append(name)
-                continue
-            if "CheckpointNameSelector" in name:
-                def selector_input_types(cls, _values=values):
-                    return {"required": {"ckpt_name": (list(_values),)}}
-                node_class.INPUT_TYPES = classmethod(selector_input_types)
-                node_class.RETURN_TYPES = (list(values), "STRING")
-                patched.append(name)
-                continue
-            if name == "CheckpointListSelector":
-                def list_selector_input_types(cls, _values=values):
-                    return {"required": {"checkpoint": ("STRING", {"default": ""})}, "hidden": {"unique_id": "UNIQUE_ID"}}
-                node_class.INPUT_TYPES = classmethod(list_selector_input_types)
-                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
-                patched.append(name)
-                continue
-            if name == "CheckpointNameCycler":
-                def cycler_input_types(cls, _values=values):
-                    return {
-                        "required": {
-                            "start_checkpoint": (list(_values),),
-                            "mode": (["fixed", "increment", "randomize", "shuffle_once"], {"default": "increment"}),
-                            "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
-                        },
-                        "optional": {
-                            "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
-                            "hps_filter_statuses": ("STRING", {"default": "", "hidden": True}),
-                            "hps_use_local_list": ("STRING", {"default": "", "hidden": True}),
-                            "hps_settings_revision": ("STRING", {"default": "0", "hidden": True}),
-                        },
-                        "hidden": {"unique_id": "UNIQUE_ID"},
-                    }
-                node_class.INPUT_TYPES = classmethod(cycler_input_types)
-                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
-                patched.append(name)
-                continue
-        except Exception as exc:
-            logger.warning("[CheckpointHandpickerSuite] failed to patch %s: %s", name, exc)
-    return patched
+def _send_event(name: str, payload: dict, client_id=None):
+    server = PromptServer.instance
+    client_id = client_id or getattr(server, "client_id", None)
+    if client_id:
+        server.send_sync(name, payload, client_id)
+    else:
+        server.send_sync(name, payload)
 
 
 def _pil_from_array(arr: np.ndarray) -> Image.Image:
@@ -980,6 +753,8 @@ def _tensor_batch_to_pil(image_tensor) -> list[Image.Image]:
     if image_tensor.ndim == 3:
         image_tensor = image_tensor.unsqueeze(0)
     batch = image_tensor.detach().cpu().numpy()
+    # EphemeralPreview is a faithful branch-end preview. Do not silently drop
+    # batch items here; the contact sheet builder will shrink only when needed.
     return [_pil_from_array(arr) for arr in batch]
 
 
@@ -989,51 +764,6 @@ def _clamp_image_dir_max_images(value) -> int:
     except Exception:
         value = IMAGE_DIR_DEFAULT_MAX_IMAGES
     return max(1, min(IMAGE_DIR_MAX_IMAGES, value))
-
-
-def _reference_image_size(images: list[Image.Image]) -> tuple[int, int]:
-    if not images:
-        return 512, 512
-    w, h = images[0].size
-    if w <= 0 or h <= 0:
-        return 512, 512
-    ratio = w / h
-    if ratio < 0.25 or ratio > 4.0:
-        return 512, 512
-    return int(w), int(h)
-
-
-def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool = False) -> SheetLayout:
-    count = max(1, int(count))
-    ref_w = max(1, int(ref_w))
-    ref_h = max(1, int(ref_h))
-    best = None
-    landscape = ref_w >= ref_h
-    for cols in range(1, count + 1):
-        rows = math.ceil(count / cols)
-        empty = cols * rows - count
-        scale = min(MAX_CONTENT_EDGE / max(1, cols * ref_w), MAX_CONTENT_EDGE / max(1, rows * ref_h))
-        if not allow_upscale:
-            scale = min(1.0, scale)
-        if scale <= 0:
-            continue
-        tile_w = max(1, int(ref_w * scale))
-        tile_h = max(1, int(ref_h * scale))
-        content_w = cols * tile_w
-        content_h = rows * tile_h
-        if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
-            continue
-        canvas_w = content_w + GAP * max(0, cols - 1)
-        canvas_h = content_h + GAP * max(0, rows - 1)
-        aspect_score = max(content_w, content_h) / max(1, min(content_w, content_h))
-        orientation_bonus = 1 if ((cols >= rows) if landscape else (rows >= cols)) else 0
-        tie_score = (round(scale, 8), -empty, orientation_bonus, cols if landscape else rows)
-        layout = SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, count)
-        if best is None or aspect_score < best[0] - 1e-12 or (abs(aspect_score - best[0]) <= 1e-12 and tie_score > best[1]):
-            best = (aspect_score, tie_score, layout)
-    if best:
-        return best[2]
-    return SheetLayout(1, count, ref_w, ref_h, ref_w, count * ref_h + GAP * max(0, count - 1), count)
 
 
 def _fit_image_to_tile(img: Image.Image, tile_w: int, tile_h: int, allow_upscale: bool = False) -> Image.Image:
@@ -1049,7 +779,128 @@ def _fit_image_to_tile(img: Image.Image, tile_w: int, tile_h: int, allow_upscale
     return img.resize((new_w, new_h), resampling)
 
 
-def _build_contact_sheet(images: list[Image.Image], progress_callback=None, max_images: int | None = None, allow_upscale: bool = False) -> tuple[Image.Image | None, dict]:
+def _reference_image_size(images: list[Image.Image]) -> tuple[int, int]:
+    if not images:
+        return 512, 512
+    ref = images[0]
+    w, h = ref.size
+    if w <= 0 or h <= 0:
+        return 512, 512
+    ratio = w / h
+    if ratio < 0.25 or ratio > 4.0:
+        return 512, 512
+    return int(w), int(h)
+
+
+def _layout_for_grid(count: int, ref_w: int, ref_h: int, cols: int, rows: int, allow_upscale: bool = False) -> SheetLayout | None:
+    scale = min(MAX_CONTENT_EDGE / max(1, cols * ref_w), MAX_CONTENT_EDGE / max(1, rows * ref_h))
+    if not allow_upscale:
+        scale = min(1.0, scale)
+    if scale <= 0:
+        return None
+    tile_w = max(1, int(ref_w * scale))
+    tile_h = max(1, int(ref_h * scale))
+    content_w = cols * tile_w
+    content_h = rows * tile_h
+    if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
+        return None
+    return SheetLayout(
+        cols,
+        rows,
+        tile_w,
+        tile_h,
+        content_w + GAP * max(0, cols - 1),
+        content_h + GAP * max(0, rows - 1),
+        count,
+    )
+
+
+def _choose_layout_fit(count: int, ref_w: int, ref_h: int, allow_upscale: bool = False) -> SheetLayout:
+    """Choose a contact-sheet layout using MAX_CONTENT_EDGE as the image-content limit.
+
+    GAP is intentionally ignored for the fit calculation and added only to the
+    final canvas size. This keeps overview sheets readable, with the small gap
+    overflow accepted by design.
+
+    The grid is chosen by scoring every possible column count and selecting the
+    layout whose final content area is closest to square. This avoids hard-coded
+    per-count tables while naturally choosing layouts such as:
+
+    - 5 portrait images  -> 3x2
+    - 10 portrait images -> 4x3
+    - 12 portrait images -> 4x3
+    - 80 landscape images -> 8x10
+
+    Tie-breakers prefer larger tile scale, fewer empty cells, and then a layout
+    that follows the source image orientation.
+    """
+    count = max(1, int(count))
+    ref_w = max(1, int(ref_w))
+    ref_h = max(1, int(ref_h))
+
+    eps = 1e-12
+    landscape = ref_w >= ref_h
+    best = None
+
+    for cols in range(1, count + 1):
+        rows = math.ceil(count / cols)
+        cells = cols * rows
+        empty = cells - count
+
+        raw_w = cols * ref_w
+        raw_h = rows * ref_h
+        scale = min(MAX_CONTENT_EDGE / max(1, raw_w), MAX_CONTENT_EDGE / max(1, raw_h))
+        if not allow_upscale:
+            scale = min(1.0, scale)
+        if scale <= 0:
+            continue
+
+        tile_w = max(1, int(ref_w * scale))
+        tile_h = max(1, int(ref_h * scale))
+        content_w = cols * tile_w
+        content_h = rows * tile_h
+        if content_w <= 0 or content_h <= 0:
+            continue
+        if content_w > MAX_CONTENT_EDGE or content_h > MAX_CONTENT_EDGE:
+            continue
+
+        canvas_w = content_w + GAP * max(0, cols - 1)
+        canvas_h = content_h + GAP * max(0, rows - 1)
+
+        # Gemini-style grid choice: make the whole sheet as close to square as
+        # possible. Use EPS so near-identical float results do not flap between
+        # layouts.
+        aspect_score = max(content_w, content_h) / max(1, min(content_w, content_h))
+        orientation_bonus = 1 if ((cols >= rows) if landscape else (rows >= cols)) else 0
+        tie_score = (
+            round(scale, 8),
+            -empty,
+            orientation_bonus,
+            cols if landscape else rows,
+        )
+
+        layout = SheetLayout(cols, rows, tile_w, tile_h, canvas_w, canvas_h, count)
+        if best is None:
+            best = (aspect_score, tie_score, layout)
+            continue
+
+        best_aspect, best_tie, _ = best
+        if aspect_score < best_aspect - eps:
+            best = (aspect_score, tie_score, layout)
+        elif abs(aspect_score - best_aspect) <= eps and tie_score > best_tie:
+            best = (aspect_score, tie_score, layout)
+
+    if best is not None:
+        return best[2]
+    return SheetLayout(1, count, ref_w, ref_h, ref_w, count * ref_h + GAP * max(0, count - 1), count)
+
+
+def _build_contact_sheet(
+    images: list[Image.Image],
+    progress_callback=None,
+    max_images: int | None = None,
+    allow_upscale: bool = False,
+) -> tuple[Image.Image | None, dict]:
     if not images:
         return None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
     if max_images is None:
@@ -1078,7 +929,7 @@ def _build_contact_sheet(images: list[Image.Image], progress_callback=None, max_
         if img.mode == "RGBA":
             canvas.paste(img, (px, py), img)
         else:
-            canvas.paste(img.convert("RGB"), (px, py))
+            canvas.paste(img, (px, py))
     return canvas, {
         "count": layout.count,
         "columns": layout.cols,
@@ -1091,305 +942,583 @@ def _build_contact_sheet(images: list[Image.Image], progress_callback=None, max_
         "max_images": max_images if max_images is not None else len(images),
     }
 
-
-def _encode_preview_payload(image: Image.Image) -> dict:
+def _encode_jpeg(image: Image.Image) -> str:
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=JPEG_OPTIMIZE)
-    return {
-        "image": base64.b64encode(buf.getvalue()).decode("ascii"),
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _send_preview(node_id, title: str, image: Image.Image | None, extra: dict | None = None, tab_id: str | None = None):
+    payload = {
+        "node": int(node_id) if node_id is not None and str(node_id).isdigit() else None,
+        "title": title,
         "format": "jpeg",
-        "width": image.width,
-        "height": image.height,
+        "image": None,
+        "width": 0,
+        "height": 0,
     }
-
-
-def _send_image_dir_progress(node_id, relpath, tab_id, message, value=0, total=0, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES):
-    status = _get_status(relpath) if relpath else "none"
-    _send_preview(node_id, _image_dir_title(relpath), None, {
-        "node_class": "ImageDirPreview",
-        "ckpt_name_str": relpath,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath) if relpath else "",
-        "status": "loading",
-        "status_icon": STATUS_ICON[status],
-        "message": message,
-        "progress": True,
-        "progress_message": message,
-        "progress_value": value,
-        "progress_total": total,
-        "max_preview_images": max_preview_images,
-    }, tab_id=tab_id)
+    if tab_id is not None:
+        payload["tab_id"] = _clean_tab_id(tab_id)
+    if image is not None:
+        payload["image"] = _encode_jpeg(image)
+        payload["width"] = image.width
+        payload["height"] = image.height
+    if extra:
+        payload.update(extra)
+    _send_event(PREVIEW_EVENT, payload)
 
 
 def _image_dir_title(relpath: str) -> str:
-    status = _get_status(relpath) if relpath else "none"
-    if relpath and status != "none":
-        return f"ImageDir : {STATUS_ICON[status]} {relpath}"
-    if relpath:
-        return f"ImageDir : {relpath}"
-    return "ImageDir Preview"
+    status = _get_status(relpath)
+    return f"ImageDir : {STATUS_ICON[status]} {relpath}" if status != "none" else f"ImageDir : {relpath}"
 
 
-def _safe_search_root(value) -> Path | None:
-    raw = str(value or "").strip()
-    if not raw:
+def _send_image_dir_progress(node_id, relpath: str, message: str, value: int = 0, total: int = 0, tab_id: str | None = None, root: str = ""):
+    # Keep both the old CheckpointCleanupReview field names and the newer
+    # ImageDirPreview caption field. Some frontend builds draw one or the other.
+    _send_preview(
+        node_id,
+        _image_dir_title(relpath),
+        None,
+        {
+            "node_class": "ImageDirPreview",
+            "ckpt_name_str": relpath,
+            "search_directory": root,
+            "status": "loading",
+            "message": message,
+            "progress_message": message,
+            "progress_value": value,
+            "progress_total": total,
+            "progress": True,
+        },
+        tab_id=tab_id,
+    )
+
+
+def _resolve_search_root(search_directory: str | None) -> tuple[Path, str]:
+    if search_directory is None:
+        return Path(folder_paths.get_output_directory()).resolve(), "default_output"
+    value = str(search_directory).strip()
+    if not value:
+        return Path(folder_paths.get_output_directory()).resolve(), "default_output"
+    try:
+        candidate = Path(value).expanduser().resolve()
+        if candidate.exists() and candidate.is_dir():
+            return candidate, "custom"
+        return Path(folder_paths.get_output_directory()).resolve(), "invalid_fallback_output"
+    except Exception:
+        return Path(folder_paths.get_output_directory()).resolve(), "invalid_fallback_output"
+
+
+def _iter_dirs_newest_first(root: Path):
+    root = root.resolve()
+    queue = [root]
+    while queue:
+        current = queue.pop(0)
+        yield current
         try:
-            return Path(folder_paths.get_output_directory()).resolve()
+            children = [p for p in current.iterdir() if p.is_dir()]
+            children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            queue[0:0] = children
         except Exception:
-            return None
-    try:
-        path = Path(raw).expanduser().resolve()
-        return path if path.exists() and path.is_dir() else None
-    except Exception:
-        return None
+            continue
 
 
-def _image_matches_checkpoint(path: Path, relpath: str) -> bool:
-    safe = _ckpt_name_safe_from_relpath(relpath).lower()
-    stem = Path(relpath).stem.lower()
-    hay = "/".join(part.lower() for part in path.parts)
-    return safe in hay or stem in hay
+def _find_preview_images(ckpt_name_str: str, search_directory: str | None = None, max_images: int = IMAGE_DIR_DEFAULT_MAX_IMAGES, progress_callback=None) -> tuple[list[Path], str, str]:
+    relpath = _normalize_relpath(ckpt_name_str)
+    safe = _ckpt_name_safe_from_relpath(relpath)
+    root, mode = _resolve_search_root(search_directory)
+    found: list[Path] = []
+    if not root.exists() or not root.is_dir():
+        return found, str(root), "missing_search_root"
 
-
-def _find_image_dir_candidates(relpath: str, search_directory=None, limit: int = IMAGE_DIR_SCAN_LIMIT) -> list[Path]:
-    root = _safe_search_root(search_directory)
-    if root is None:
-        return []
-    found = []
-    try:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for filename in filenames:
-                p = Path(dirpath) / filename
-                if p.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
-                    continue
-                if not _image_matches_checkpoint(p, relpath):
-                    continue
+    safe_lower = safe.lower()
+    for directory in _iter_dirs_newest_first(root):
+        try:
+            files = [
+                p for p in directory.iterdir()
+                if p.is_file()
+                and p.suffix.lower() in ALLOWED_IMAGE_SUFFIXES
+                and safe_lower in p.stem.lower()
+            ]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for file in files:
+                resolved = file.resolve()
+                # A symlink should not escape the selected preview root.
                 try:
-                    mtime = p.stat().st_mtime
+                    if resolved != root and root not in resolved.parents:
+                        continue
                 except Exception:
-                    mtime = 0.0
-                found.append((mtime, p))
-                if len(found) >= limit:
-                    # Keep scanning bounded. Sort latest first below.
-                    pass
-    except Exception:
-        logger.exception("ImageDirPreview scan failed: %s", root)
-    found.sort(key=lambda item: item[0], reverse=True)
-    return [p for _mtime, p in found[:limit]]
+                    continue
+                found.append(resolved)
+                if progress_callback:
+                    progress_callback(len(found), max_images, f"Found preview images {len(found)}/{max_images}")
+                if len(found) >= max_images:
+                    return found, str(root), mode
+        except Exception:
+            continue
+    return found, str(root), mode
 
 
-def _load_image_file(path: Path) -> Image.Image | None:
-    try:
-        with Image.open(path) as img:
-            img = ImageOps.exif_transpose(img)
-            if img.mode not in ("RGB", "RGBA", "L"):
-                img = img.convert("RGB")
-            return img.copy()
-    except Exception:
-        logger.warning("[CheckpointHandpickerSuite] failed to read preview image: %s", path, exc_info=True)
-        return None
+def _load_pil_images(paths: list[Path], max_images: int | None = None, progress_callback=None) -> list[Image.Image]:
+    images: list[Image.Image] = []
+    limit = len(paths) if max_images is None else max(1, min(int(max_images), len(paths)))
+    total = limit
+    for index, path in enumerate(paths[:limit], start=1):
+        if progress_callback:
+            progress_callback(index - 1, total, f"Loading preview images {index}/{total}")
+        try:
+            with Image.open(path) as img:
+                images.append(img.convert("RGB"))
+        except Exception:
+            logger.exception("Failed to open preview image: %s", path)
+        if progress_callback:
+            progress_callback(index, total, f"Loading preview images {index}/{total}")
+    return images
 
 
-def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", send_progress=True, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES):
+def _load_image_dir_preview(
+    node_id,
+    ckpt_name_str: str,
+    search_directory: str | None = None,
+    tab_id: str | None = None,
+    send_progress: bool = True,
+    max_preview_images: int = IMAGE_DIR_DEFAULT_MAX_IMAGES,
+) -> tuple[Image.Image | None, dict]:
+    relpath = _normalize_relpath(ckpt_name_str)
     max_preview_images = _clamp_image_dir_max_images(max_preview_images)
 
-    def progress(value: int, total: int, message: str):
+    def progress(value: int, total: int, message: str, root: str = ""):
         if send_progress:
-            _send_image_dir_progress(node_id, relpath, tab_id, message, value, total, max_preview_images)
+            _send_image_dir_progress(node_id, relpath, message, value=value, total=total, tab_id=tab_id, root=root)
 
     progress(0, max_preview_images, "Searching preview images...")
-    paths = _find_image_dir_candidates(relpath, search_directory)
-    selected_paths = paths[:max_preview_images]
-    progress(len(selected_paths), max_preview_images, f"Found preview images {len(selected_paths)}/{max_preview_images}")
+    paths, root, mode = _find_preview_images(
+        relpath,
+        search_directory,
+        max_images=max_preview_images,
+        progress_callback=lambda v, t, m: progress(v, t, m, root=""),
+    )
+    progress(len(paths), max_preview_images, f"Found preview images {len(paths)}/{max_preview_images}", root=root)
 
-    images = []
-    total = len(selected_paths)
-    for idx, path in enumerate(selected_paths, start=1):
-        progress(idx - 1, max(1, total), f"Loading preview image {idx}/{total}")
-        img = _load_image_file(path)
-        if img is not None:
-            images.append(img)
-        progress(idx, max(1, total), f"Loading preview image {idx}/{total}")
+    pil_images = _load_pil_images(
+        paths,
+        max_images=max_preview_images,
+        progress_callback=lambda v, t, m: progress(v, t, m, root=root),
+    ) if paths else []
+    if pil_images:
+        sheet, meta = _build_contact_sheet(
+            pil_images,
+            progress_callback=lambda v, t, m: progress(v, t, m, root=root),
+            max_images=max_preview_images,
+            allow_upscale=False,
+        )
+        progress(max_preview_images, max_preview_images, "Encoding preview image...", root=root)
+    else:
+        sheet, meta = None, {"count": 0, "columns": 0, "rows": 0, "tile_width": 0, "tile_height": 0}
 
-    def cb(value, total, message):
-        progress(value, total, message)
-
-    sheet, extra = _build_contact_sheet(images, progress_callback=cb, max_images=max_preview_images)
-    if sheet is not None:
-        progress(max_preview_images, max_preview_images, "Encoding preview image...")
-    status = _get_status(relpath)
-    extra.update({
+    extra = {
         "node_class": "ImageDirPreview",
         "ckpt_name_str": relpath,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-        "status": status,
-        "status_icon": STATUS_ICON[status],
-        "message": f"{len(images)} image(s) found" if images else "no preview images found",
-        "progress_message": "Preview ready." if sheet is not None else "no preview images found",
+        "search_directory": root,
+        "search_mode": mode,
+        "preview_found": bool(paths),
+        "preview_count": len(paths),
+        "max_preview_images": max_preview_images,
+        "status": "ready" if sheet is not None else "no_preview",
+        "message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
+        "progress_message": "Preview ready." if sheet is not None else f"No preview images found: {relpath}",
         "progress_value": max_preview_images,
         "progress_total": max_preview_images,
-        "search_directory": str(_safe_search_root(search_directory) or ""),
-        "max_preview_images": max_preview_images,
-        "source_paths": [str(p) for p in selected_paths],
-    })
+    }
+    extra.update(meta)
     return sheet, extra
 
+def _send_cycler_update(
+    node_id: str | None,
+    title: str,
+    status_text: str,
+    tab_id: str | None = None,
+    ckpt_name_str: str | None = None,
+    source: str | None = None,
+    mode: str | None = None,
+    hold_index: int | None = None,
+    change_every: int | None = None,
+):
+    payload = {
+        "node": int(node_id) if node_id is not None and str(node_id).isdigit() else None,
+        "title": title,
+        "status_text": status_text,
+    }
+    if tab_id is not None:
+        payload["tab_id"] = _clean_tab_id(tab_id)
+    if ckpt_name_str:
+        relpath = _normalize_relpath(ckpt_name_str)
+        status = _get_status(relpath)
+        payload.update({
+            "ckpt_name_str": relpath,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+            "status": status,
+            "status_icon": STATUS_ICON[status],
+        })
+    if source is not None:
+        payload["source"] = source
+    if mode is not None:
+        payload["mode"] = mode
+    if hold_index is not None:
+        payload["hold_index"] = hold_index
+    if change_every is not None:
+        payload["change_every"] = change_every
+    _send_event(CYCLER_EVENT, payload)
 
-def _valid_local_list(local_list: list[str] | None) -> list[str]:
-    """Return valid Local List entries while preserving order and duplicates.
 
-    Local List is a manual per-Cycler queue, not a set. The same checkpoint may
-    intentionally be pushed multiple times, and each entry must be consumed
-    independently.
+def _get_cycler_state(node_key: str) -> dict:
+    with _STATE_LOCK:
+        state = _CYCLER_STATES.get(node_key)
+        if state is None:
+            state = {
+                "use_local_list": True,
+                "local_list": [],
+                "active_filter": [],  # empty means All
+                # Monotonic frontend settings revision for persisted Cycler
+                # settings. Queued prompts may contain older hidden widget values;
+                # compare revisions so stale queue snapshots cannot rewind filters.
+                "settings_revision": -1,
+                "repeat_count": 0,
+                "current_index": 0,
+                "cycle_count": 0,
+                "last_checkpoint_hash": "",
+                "last_ckpt_name": "",
+                "last_normal_ckpt_name": "",
+                "last_title": "",
+                "last_hold_index": 0,
+                "last_change_every": 1,
+                "last_mode": "increment",
+                "last_source": "",
+                "last_all_checkpoint_hash": "",
+                "shuffle_deck": [],
+                # compatibility with older draft state/routes
+                "accept_queue": True,
+                "override_queue": [],
+                "accept_filter": True,
+            }
+            _CYCLER_STATES[node_key] = state
+        # migrate older draft keys in-memory
+        if "use_local_list" not in state:
+            state["use_local_list"] = bool(state.get("accept_queue", True))
+        if "local_list" not in state:
+            state["local_list"] = list(state.get("override_queue", []))
+        if "active_filter" not in state:
+            state["active_filter"] = []
+        if "settings_revision" not in state:
+            state["settings_revision"] = -1
+        if "shuffle_deck" not in state:
+            state["shuffle_deck"] = []
+        if "last_mode" not in state:
+            state["last_mode"] = "increment"
+        if "last_source" not in state:
+            state["last_source"] = ""
+        if "last_all_checkpoint_hash" not in state:
+            state["last_all_checkpoint_hash"] = ""
+        if "last_normal_ckpt_name" not in state:
+            state["last_normal_ckpt_name"] = state.get("last_ckpt_name", "")
+        return state
+
+def _checkpoint_hash(names: Iterable[str]) -> str:
+    return "\n".join(names)
+
+
+def _filter_checkpoints(checkpoints: list[str], statuses: list[str]) -> tuple[list[str], bool]:
+    if not statuses:
+        return checkpoints, False
+    active = [s for s in statuses if s in STATUS_VALUES]
+    if not active:
+        return checkpoints, False
+    filtered = [ckpt for ckpt in checkpoints if _get_status(ckpt) in active]
+    if not filtered:
+        return checkpoints, True
+    return filtered, False
+
+
+def _active_filter_values(statuses: list[str] | None) -> list[str]:
+    return [s for s in (statuses or []) if s in STATUS_VALUES]
+
+
+def _parse_saved_filter_statuses(value) -> list[str] | None:
+    """Parse persisted Cycler filter settings.
+
+    None means "no persisted value was supplied" and keeps the current
+    in-memory state. An empty list means an explicit All filter.
     """
-    all_set = set(_get_checkpoint_list())
-    local = []
-    for item in local_list or []:
-        rel = _normalize_relpath(item)
-        if rel in all_set:
-            local.append(rel)
-    return local
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = [part.strip() for part in text.split(",")]
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    selected = []
+    for item in parsed:
+        status = str(item).strip()
+        if status in STATUS_VALUES and status not in selected:
+            selected.append(status)
+    return selected
 
 
-def _filter_match_count(active_filter: list[str]) -> int:
-    all_checkpoints = _get_checkpoint_list()
-    if not active_filter:
-        return len(all_checkpoints)
-    return sum(1 for ckpt in all_checkpoints if _get_status(ckpt) in active_filter)
+def _parse_saved_bool(value) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "":
+        return None
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
 
 
-def _checkpoint_total_count() -> int:
-    return len(_get_checkpoint_list())
+def _parse_saved_int(value) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return int(text)
+    except Exception:
+        return None
 
 
-def _build_local_list_lines(local_items: list[str], max_items: int = 20) -> list[str]:
-    shown = []
-    for item in list(local_items[:max_items]):
-        status = _get_status(item)
-        icon = STATUS_ICON[status] if status != "none" else " "
-        shown.append(f"{icon} {item}")
-    if len(local_items) > max_items:
-        shown.append(f"... and {len(local_items) - max_items} more")
-    return shown
+def _filter_match_count(checkpoints: list[str], statuses: list[str] | None) -> int:
+    active = _active_filter_values(statuses)
+    if not active:
+        return len(checkpoints)
+    return sum(1 for ckpt in checkpoints if _get_status(ckpt) in active)
 
 
-def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filter, fallback_all, local_count) -> str:
-    status = _get_status(ckpt_name) if ckpt_name else "none"
+def _matches_filter(ckpt_name: str, statuses: list[str] | None, fallback_all: bool = False) -> bool:
+    active = _active_filter_values(statuses)
+    if fallback_all or not active:
+        return True
+    return _get_status(ckpt_name) in active
+
+
+def _find_start_index(checkpoints: list[str], start_checkpoint: str) -> int:
+    rel = _normalize_relpath(start_checkpoint)
+    for i, ckpt in enumerate(checkpoints):
+        if _normalize_relpath(ckpt) == rel:
+            return i
+    return 0
+
+
+def _build_cycler_title(
+    source: str,
+    ckpt_name: str,
+    hold_index: int,
+    change_every: int,
+    active_filter: list[str],
+    fallback_all: bool,
+    local_list_remaining_count: int = 0,
+) -> str:
+    status = _get_status(ckpt_name)
     icon = STATUS_ICON[status] if status != "none" else ""
-    prefix = "Cycler"
-    # Filter state is shown by the filter buttons and the status panel. Do not
-    # duplicate it in the title.
+    display = f"{icon} {ckpt_name}".strip() if ckpt_name else "(not executed yet)"
+    local_label = f" [local:{local_list_remaining_count}]" if local_list_remaining_count > 0 else ""
     if fallback_all:
-        prefix += " [fallback all]"
-    if source == "local_list" and local_count > 0:
-        prefix += f" [local:{local_count}]"
-    body = f"{icon} {ckpt_name}".strip() if ckpt_name else "(none)"
-    if source == "local_list":
-        return f"{prefix} : {body}"
-    return f"{prefix} : {body} ({hold_index}/{change_every})"
+        return f"Cycler{local_label} : ⚠ {ckpt_name} ({hold_index}/{change_every} Filter:0→All)"
+    return f"Cycler{local_label} : {display}"
 
 
-def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True) -> str:
-    status = _get_status(ckpt_name) if ckpt_name else "none"
-    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (none)")
-    display_mode = "local list" if source == "local_list" else mode
-    lines = [
-        current,
-        f"Mode: {display_mode}" if source == "local_list" else f"Mode: {mode}  Hold: {hold_index}/{change_every}",
-        f"Filter: {_filter_display(active_filter)}  Matches: {match_count} / {_checkpoint_total_count()}",
-    ]
-    if fallback_all:
-        lines.append("Filter fallback: all checkpoints")
-    if use_local_list:
-        items = list(local_items or [])
-        lines.append(f"Local List: {local_count} item(s)")
-        lines.extend(_build_local_list_lines(items))
-    if queue:
-        lines.append(f"Queue: {len(queue)} item(s)")
-    return "\n".join(lines)
-
-
-def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -> str:
-    """Build a status panel for UI-only operations such as Push/Clear Local List.
-
-    This is a synthesized display: last_execution_snapshot provides the current
-    job, runtime_controls provide the live filter/mode settings, and Local List
-    comes from runtime_state.
-    """
-    controls = _runtime_controls_from_state(state)
-    snap = _last_execution_snapshot(state)
-    ckpt_name = snap.get("ckpt_name", "") or ""
-    status = _get_status(ckpt_name) if ckpt_name else "none"
-    active_filter = list(controls.get("active_filter", []))
-    local_items = _valid_local_list(state.get("local_list", []))
-    local_count = len(local_items)
-    mode = controls.get("mode", "increment")
-    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (not executed yet)")
-    use_local = bool(controls.get("use_local_list", True))
-    local_job_active = snap.get("source") == "local_list"
-    if local_job_active:
-        mode_line = "Mode: local list"
-    else:
-        hold_index = max(0, _parse_saved_int(snap.get("hold_index"), 0))
-        change_every = _valid_change_every(snap.get("change_every_used", controls.get("change_every", 1)))
-        mode_line = f"Mode: {snap.get('mode_used', mode)}  Hold: {hold_index}/{change_every}" if ckpt_name else f"Mode: {mode}"
-    lines = [
-        current,
-        mode_line,
-        f"Filter: {_filter_display(active_filter)}  Matches: {_filter_match_count(active_filter)} / {_checkpoint_total_count()}",
-    ]
-    if use_local:
-        lines.append(f"Local List: {local_count} item(s)")
-        lines.extend(_build_local_list_lines(local_items))
-    if controls.get("mode") == "shuffle_once" or snap.get("base_mode") == "shuffle_once" or snap.get("mode_used") == "shuffle_once":
-        lines.append(f"Shuffle Deck Remaining: {len(state.get('shuffle_deck', []))}")
-    return "\n".join(lines)
-
-
-def _candidate_checkpoints(active_filter: list[str]) -> tuple[list[str], bool, int]:
-    """Return global candidates, fallback flag, and global filter match count.
-
-    Local List is intentionally handled outside this function. Filter metadata is
-    always about the entire checkpoint set, not about the Local List.
-    """
-    all_checkpoints = _get_checkpoint_list()
+def _filter_label(active_filter: list[str]) -> str:
     if not active_filter:
-        return list(all_checkpoints), False, len(all_checkpoints)
-    filtered = [ckpt for ckpt in all_checkpoints if _get_status(ckpt) in active_filter]
-    if filtered:
-        return filtered, False, len(filtered)
-    return list(all_checkpoints), bool(all_checkpoints), 0
+        return "All"
+    icons = _status_icons_for_filter(active_filter)
+    return icons or "All"
 
 
-class CheckpointListSelector:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"checkpoint": ("STRING", {"default": ""})},
-            "hidden": {"unique_id": "UNIQUE_ID"},
-        }
+def _source_label(source: str, active_filter: list[str], mode: str) -> str:
+    if source == "local_list":
+        return "Local List"
+    if mode == "fixed":
+        return "Fixed"
+    return "Filtered Checkpoints" if active_filter else "Normal Cycle"
 
-    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
-    RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
-    FUNCTION = "select"
-    CATEGORY = "checkpoint/handpicker"
 
-    def select(self, checkpoint="", unique_id=None):
-        rel = _normalize_relpath(checkpoint)
-        if rel not in _get_checkpoint_list():
-            items = _get_checkpoint_list()
-            rel = items[0] if items else ""
-        return (rel, rel, _ckpt_name_safe_from_relpath(rel) if rel else "checkpoint")
+def _append_local_list_lines(lines: list[str], local_list_remaining: list[str]):
+    if not local_list_remaining:
+        return
+    lines.append(f"Local List Remaining: {len(local_list_remaining)} item(s)")
+    for item in local_list_remaining[:8]:
+        s = _get_status(item)
+        prefix = STATUS_ICON[s] if s != "none" else "-"
+        lines.append(f"{prefix} {item}")
+    if len(local_list_remaining) > 8:
+        lines.append(f"+{len(local_list_remaining) - 8} more")
+
+
+def _build_cycler_status_text(
+    source: str,
+    ckpt_name: str,
+    active_filter: list[str],
+    fallback_all: bool,
+    local_list_remaining: list[str],
+    hold_index: int,
+    change_every: int,
+    total_matches: int,
+    total_checkpoints: int | None = None,
+    mode: str = "",
+    shuffle_deck_remaining: int | None = None,
+) -> str:
+    lines = []
+    mode = mode or "increment"
+    if ckpt_name:
+        status = _get_status(ckpt_name)
+        lines.append(f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" else f"Current: {ckpt_name}")
+    else:
+        lines.append("Current: (not executed yet)")
+
+    lines.append(f"Mode: {mode}")
+    lines.append(f"Source: {_source_label(source, active_filter, mode)}")
+
+    total = total_checkpoints if total_checkpoints is not None else len(_get_checkpoint_list())
+    if mode == "fixed":
+        if active_filter:
+            lines.append(f"Filter: {_filter_label(active_filter)}  Matches: {total_matches} / {total}")
+            lines.append("Note: Filter is ignored in fixed mode.")
+    else:
+        lines.append(f"Filter: {_filter_label(active_filter)}  Matches: {total_matches} / {total}")
+        if fallback_all:
+            lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
+
+    if source != "local_list":
+        lines.append(f"Hold: {hold_index} / {change_every}")
+        if mode == "shuffle_once" and shuffle_deck_remaining is not None:
+            lines.append(f"Shuffle Deck Remaining: {shuffle_deck_remaining}")
+
+    _append_local_list_lines(lines, local_list_remaining)
+    return "\n".join(lines)
+
+
+def _build_cycler_pending_title(state: dict) -> str:
+    ckpt_name = state.get("last_ckpt_name", "")
+    if not ckpt_name:
+        return ""
+    source = state.get("last_source", "") or "cycle"
+    hold = int(state.get("last_hold_index") or 1)
+    change_every = int(state.get("last_change_every") or 1)
+    active_filter = _active_filter_values(state.get("active_filter", []) or [])
+    all_checkpoints = _get_checkpoint_list()
+    match_count = _filter_match_count(all_checkpoints, active_filter)
+    mode = state.get("last_mode", "increment")
+    fallback_all = bool(active_filter) and match_count == 0 and mode != "fixed"
+    local_list = list(state.get("local_list", [])) if state.get("use_local_list", True) else []
+    return _build_cycler_title(source, ckpt_name, hold, change_every, active_filter, fallback_all, len(local_list))
+
+
+def _build_cycler_pending_status_text(state: dict) -> str:
+    all_checkpoints = _get_checkpoint_list()
+    active_filter = _active_filter_values(state.get("active_filter", []) or [])
+    match_count = _filter_match_count(all_checkpoints, active_filter)
+    fallback_all = bool(active_filter) and match_count == 0
+    local_list = list(state.get("local_list", [])) if state.get("use_local_list", True) else []
+    last_ckpt = state.get("last_ckpt_name", "")
+    hold = int(state.get("last_hold_index") or 0)
+    change_every = int(state.get("last_change_every") or 1)
+    mode = state.get("last_mode", "increment")
+    source = state.get("last_source", "")
+    if not source:
+        source = "local_list" if local_list and not last_ckpt else "cycle"
+    shuffle_remaining = len(state.get("shuffle_deck", [])) if mode == "shuffle_once" and source != "local_list" else None
+
+    if not last_ckpt:
+        lines = ["Current: (not executed yet)", f"Mode: {mode}"]
+        lines.append(f"Source: {_source_label(source, active_filter, mode)}")
+        if mode == "fixed":
+            if active_filter:
+                lines.append(f"Filter: {_filter_label(active_filter)}  Matches: {match_count} / {len(all_checkpoints)}")
+                lines.append("Note: Filter is ignored in fixed mode.")
+        else:
+            lines.append(f"Filter: {_filter_label(active_filter)}  Matches: {match_count} / {len(all_checkpoints)}")
+            if fallback_all:
+                lines.append("⚠ Filter matched 0 checkpoints. Using all checkpoints.")
+            lines.append("Note: Filter will apply on next Cycler execution.")
+        _append_local_list_lines(lines, local_list)
+        return "\n".join(lines)
+
+    return _build_cycler_status_text(
+        source,
+        last_ckpt,
+        active_filter,
+        fallback_all and mode != "fixed",
+        local_list,
+        hold if hold else 1,
+        change_every,
+        match_count,
+        len(all_checkpoints),
+        mode,
+        shuffle_remaining,
+    )
+
+
+def _send_cycler_state_update(node_id: str, state: dict, tab_id: str | None = None):
+    _send_cycler_update(
+        node_id,
+        _build_cycler_pending_title(state),
+        _build_cycler_pending_status_text(state),
+        tab_id=tab_id,
+        ckpt_name_str=state.get("last_ckpt_name") or None,
+        source=state.get("last_source") or None,
+        mode=state.get("last_mode") or None,
+        hold_index=int(state.get("last_hold_index") or 0) or None,
+        change_every=int(state.get("last_change_every") or 0) or None,
+    )
+
+
+def _split_cycler_state_key(node_key: str) -> tuple[str, str]:
+    tab_id, sep, node_id = str(node_key).partition(":")
+    return (tab_id, node_id) if sep else ("", tab_id)
+
+
+def _refresh_cycler_states_for_status_change(relpath: str):
+    relpath = _normalize_relpath(relpath)
+    updates: list[tuple[str, str, dict]] = []
+    with _STATE_LOCK:
+        for node_key, state in list(_CYCLER_STATES.items()):
+            active_filter = _active_filter_values(state.get("active_filter", []) or [])
+            local_list = list(state.get("local_list", []))
+            last_ckpt = _normalize_relpath(state.get("last_ckpt_name", ""))
+            local_set = {_normalize_relpath(item) for item in local_list}
+            should_refresh = (
+                last_ckpt == relpath
+                or relpath in local_set
+                or bool(active_filter)
+            )
+            if not should_refresh:
+                continue
+            tab_id, node_id = _split_cycler_state_key(node_key)
+            if not node_id or node_id == "__none__":
+                continue
+            updates.append((tab_id, node_id, dict(state)))
+    for tab_id, node_id, state in updates:
+        _send_cycler_state_update(node_id, state, tab_id=tab_id)
 
 
 class CheckpointNameCycler:
     @classmethod
     def INPUT_TYPES(cls):
-        values = _get_checkpoint_list() or [""]
+        checkpoints = _get_checkpoint_list()
         return {
             "required": {
-                "start_checkpoint": (values,),
+                "start_checkpoint": (checkpoints if checkpoints else [""],),
                 "mode": (["fixed", "increment", "randomize", "shuffle_once"], {"default": "increment"}),
                 "change_every": ("INT", {"default": 1, "min": 1, "max": 999999}),
             },
@@ -1399,296 +1528,227 @@ class CheckpointNameCycler:
                 "hps_use_local_list": ("STRING", {"default": "", "hidden": True}),
                 "hps_settings_revision": ("STRING", {"default": "0", "hidden": True}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
-    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
+    RETURN_TYPES = (_get_checkpoint_list() if _get_checkpoint_list() else [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "cycle"
     CATEGORY = "checkpoint/handpicker"
 
     @classmethod
-    def IS_CHANGED(cls, start_checkpoint, mode="increment", change_every=1, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
-        return float("nan")
+    def IS_CHANGED(cls, **kwargs):
+        return time.time_ns()
 
-    def cycle(self, start_checkpoint, mode="increment", change_every=1, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
+    def cycle(self, start_checkpoint, mode, change_every, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
+        node_id = str(unique_id) if unique_id is not None else "__default__"
         tab_id = _clean_tab_id(hps_tab_id)
-        node_id = str(unique_id or "")
-        key = _state_key(tab_id, node_id)
-        state = _get_cycler_state(key)
+        node_key = _state_key(tab_id, node_id)
+        state = _get_cycler_state(node_key)
 
-        prompt_mode = _valid_mode(mode)
-        prompt_change_every = _valid_change_every(change_every)
-        prompt_filter = _normalize_status_list(hps_filter_statuses)
-        prompt_use_local_list = _parse_saved_bool(hps_use_local_list, bool(_runtime_controls_from_state(state).get("use_local_list", True)))
-        prompt_start_checkpoint = _normalize_relpath(start_checkpoint)
-        prompt_revision = _parse_saved_int(hps_settings_revision, _runtime_controls_from_state(state).get("settings_revision", 0))
-
-        controls = _runtime_controls_from_state(state)
-        current_revision = _parse_saved_int(controls.get("settings_revision"), 0)
-        # First execution can seed runtime_controls from prompt arguments. After
-        # that, prompt JSON is treated as a stale fallback unless its revision is
-        # newer than the backend runtime state.
-        if not state.get("runtime_controls_initialized") or prompt_revision > current_revision:
-            controls = _set_runtime_controls(
-                state,
-                mode=prompt_mode,
-                change_every=prompt_change_every,
-                start_checkpoint=prompt_start_checkpoint,
-                active_filter=prompt_filter,
-                use_local_list=prompt_use_local_list,
-                settings_revision=max(prompt_revision, current_revision),
-                mark_initialized=True,
-            )
-        else:
-            controls = _runtime_controls_from_state(state)
-
-        mode = _valid_mode(controls.get("mode", prompt_mode))
-        change_every = _valid_change_every(controls.get("change_every", prompt_change_every))
-        active_filter = _normalize_status_list(controls.get("active_filter", prompt_filter))
-        use_local_list = bool(controls.get("use_local_list", prompt_use_local_list))
-        start_checkpoint_used = _normalize_relpath(controls.get("start_checkpoint") or prompt_start_checkpoint)
+        hidden_revision = _parse_saved_int(hps_settings_revision)
+        state_revision = int(state.get("settings_revision", -1) or -1)
+        # Hidden widget values are persisted workflow settings. They are useful
+        # when loading a workflow, and as a fallback if a prompt executes before
+        # the frontend API call reaches the backend. But older queued prompts can
+        # contain stale hidden values. Only apply hidden settings when their
+        # revision is at least as new as the backend live state.
+        if hidden_revision is not None and hidden_revision >= state_revision:
+            saved_filter = _parse_saved_filter_statuses(hps_filter_statuses)
+            if saved_filter is not None:
+                state["active_filter"] = saved_filter
+            saved_use_local_list = _parse_saved_bool(hps_use_local_list)
+            if saved_use_local_list is not None:
+                state["use_local_list"] = saved_use_local_list
+                state["accept_queue"] = saved_use_local_list
+            state["settings_revision"] = hidden_revision
 
         all_checkpoints = _get_checkpoint_list()
         if not all_checkpoints:
-            title = "Cycler : no checkpoints"
-            status_text = "Current: (no checkpoints)"
-            state["last_title"] = title
-            state["last_status_text"] = status_text
-            _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
             return ("", "", "checkpoint")
 
-        if start_checkpoint_used not in all_checkpoints:
-            # Backend fallback only. The frontend must still keep the visible
-            # combo value valid so ComfyUI's queue-time validation does not fail.
-            start_checkpoint_used = all_checkpoints[0]
-            controls = _set_runtime_controls(state, start_checkpoint=start_checkpoint_used, mark_initialized=bool(state.get("runtime_controls_initialized", False)))
+        mode = mode if mode in ("fixed", "increment", "randomize", "shuffle_once") else "increment"
+        change_every = max(1, int(change_every or 1))
+        active_filter = _active_filter_values(state.get("active_filter", []) or [])
+        match_count = _filter_match_count(all_checkpoints, active_filter)
+        fallback_all = bool(active_filter) and match_count == 0
+        all_set = set(all_checkpoints)
 
-        global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter)
-        local_items = _valid_local_list(state.get("local_list", []))
-        use_local_source = use_local_list and bool(local_items)
-        candidates = local_items if use_local_source else global_candidates
-        if not candidates:
-            candidates = all_checkpoints
-            fallback_all = True
-        candidate_set = set(candidates)
+        all_hash = _checkpoint_hash(all_checkpoints)
+        if state.get("last_all_checkpoint_hash") != all_hash:
+            state["last_all_checkpoint_hash"] = all_hash
+            state["current_index"] = max(0, min(int(state.get("current_index", 0)), len(all_checkpoints) - 1))
+            state["shuffle_deck"] = [ckpt for ckpt in state.get("shuffle_deck", []) if ckpt in all_set]
+            if state.get("last_normal_ckpt_name") not in all_set:
+                state["last_normal_ckpt_name"] = ""
+                state["repeat_count"] = 0
 
-        def start_index() -> int:
-            requested = _normalize_relpath(start_checkpoint_used)
-            if requested in all_checkpoints:
-                return all_checkpoints.index(requested)
-            return 0
-
-        source = "local_list" if use_local_source else "cycle"
-        hold_index = 1
-        selected_index = 0
-
-        if use_local_source:
-            # Manual Local List queue. It is a runtime_state ledger, not part of
-            # last_execution_snapshot. Consume exactly one item per execution.
-            ckpt_name = local_items[0]
-            remaining_local_items = local_items[1:]
-            state["local_list"] = remaining_local_items
-            state["override_queue"] = remaining_local_items
-            state["local_index"] = 0
-            selected_index = all_checkpoints.index(ckpt_name)
-            title = _build_cycler_title("local_list", ckpt_name, 1, change_every, active_filter, False, len(remaining_local_items))
+        # Local List is an isolated manual lane:
+        # one entry per execution, no filter, no change_every, no normal index/deck progress.
+        local_list = list(state.get("local_list", [])) if state.get("use_local_list", True) else []
+        selected_from_local = None
+        skipped_local = 0
+        while local_list:
+            candidate = _normalize_relpath(local_list.pop(0))
+            if candidate in all_set:
+                selected_from_local = candidate
+                break
+            skipped_local += 1
+        if selected_from_local:
+            state["local_list"] = local_list
+            state["override_queue"] = local_list
+            ckpt_name = selected_from_local
+            hold_index = 1
+            local_total = len(local_list) + 1
+            title = _build_cycler_title("local_list", ckpt_name, hold_index, 1, active_filter, False, len(local_list))
             status_text = _build_cycler_status_text(
                 "local_list",
                 ckpt_name,
                 active_filter,
                 False,
-                [],
-                1,
-                change_every,
-                global_match_count,
-                len(remaining_local_items),
-                "local list",
-                local_items=remaining_local_items,
-                use_local_list=True,
-            )
-            local_items = remaining_local_items
-        else:
-            repeat_count = max(0, int(state.get("repeat_count", 0)))
-            last_ckpt = _normalize_relpath(state.get("last_normal_ckpt_name") or state.get("last_ckpt_name", ""))
-            can_hold_last = last_ckpt in candidate_set and repeat_count > 0 and repeat_count < change_every
-
-            def find_next_increment(current_index: int):
-                if not candidates:
-                    return all_checkpoints[0], 0
-                n = len(all_checkpoints)
-                start = max(0, min(n - 1, current_index))
-                for offset in range(n):
-                    idx = (start + offset) % n
-                    ckpt = all_checkpoints[idx]
-                    if ckpt in candidate_set:
-                        return ckpt, idx
-                ckpt = candidates[0]
-                return ckpt, all_checkpoints.index(ckpt)
-
-            def draw_from_shuffle_deck():
-                # v8g: shuffle_once is a global shuffled increment.
-                # The deck is built from all checkpoints, while the active filter
-                # is applied when scanning the deck. Non-matching checkpoints are
-                # skipped AND consumed, matching increment's "cursor moved on"
-                # semantics without exposing an extra cursor UI.
-                all_set = set(all_checkpoints)
-                deck = [x for x in state.get("shuffle_deck", []) if x in all_set]
-
-                def refill_deck():
-                    fresh = list(all_checkpoints)
-                    random.shuffle(fresh)
-                    return fresh
-
-                if not deck:
-                    deck = refill_deck()
-
-                for _pass in range(2):
-                    while deck:
-                        ckpt = deck.pop(0)
-                        if ckpt in candidate_set:
-                            state["shuffle_deck"] = deck
-                            return ckpt
-                    # The remaining global deck had no item for the current
-                    # filter. Start a new global deck and scan once more.
-                    deck = refill_deck()
-
-                # Defensive fallback. This should be unreachable when candidates
-                # is non-empty, but keeps the node alive if checkpoint state
-                # changes under us.
-                state["shuffle_deck"] = deck
-                return candidates[0]
-
-            if can_hold_last:
-                ckpt_name = last_ckpt
-                selected_index = all_checkpoints.index(ckpt_name)
-            else:
-                if mode == "fixed":
-                    requested = _normalize_relpath(start_checkpoint_used)
-                    ckpt_name = requested if requested in candidate_set else candidates[0]
-                    selected_index = all_checkpoints.index(ckpt_name)
-                elif mode == "randomize":
-                    ckpt_name = random.choice(candidates)
-                    selected_index = all_checkpoints.index(ckpt_name)
-                elif mode == "shuffle_once":
-                    ckpt_name = draw_from_shuffle_deck()
-                    selected_index = all_checkpoints.index(ckpt_name)
-                else:
-                    ckpt_name, selected_index = find_next_increment(int(state.get("current_index", start_index())))
-
-            hold_index = repeat_count + 1 if can_hold_last else 1
-            if hold_index >= change_every:
-                state["repeat_count"] = 0
-                if mode == "increment":
-                    next_index = selected_index + 1
-                    if next_index >= len(all_checkpoints):
-                        next_index = 0
-                        state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
-                    state["current_index"] = next_index
-                else:
-                    state["current_index"] = selected_index
-            else:
-                state["repeat_count"] = hold_index
-                state["current_index"] = selected_index
-
-            state["last_normal_ckpt_name"] = ckpt_name
-            title = _build_cycler_title("cycle", ckpt_name, hold_index, change_every, active_filter, fallback_all and mode != "fixed", len(local_items) if use_local_list else 0)
-            status_text = _build_cycler_status_text(
-                "cycle",
-                ckpt_name,
-                active_filter,
-                fallback_all and mode != "fixed",
-                [],
+                local_list,
                 hold_index,
-                change_every,
-                global_match_count,
-                len(local_items),
+                1,
+                match_count,
+                len(all_checkpoints),
                 mode,
-                local_items=local_items,
-                use_local_list=use_local_list,
+                None,
             )
-            if mode == "shuffle_once":
-                status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
+            if skipped_local:
+                status_text += f"\nSkipped missing Local List item(s): {skipped_local}"
+            state["last_ckpt_name"] = ckpt_name
+            state["last_title"] = title
+            state["last_hold_index"] = hold_index
+            state["last_change_every"] = change_every
+            state["last_mode"] = mode
+            state["last_source"] = "local_list"
+            _send_cycler_update(
+                node_id,
+                title,
+                status_text,
+                tab_id=tab_id,
+                ckpt_name_str=ckpt_name,
+                source="local_list",
+                mode=mode,
+                hold_index=hold_index,
+                change_every=1,
+            )
+            return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
+        elif skipped_local:
+            state["local_list"] = []
+            state["override_queue"] = []
 
-        status = _get_status(ckpt_name)
-        snapshot = {
-            "ckpt_name": ckpt_name,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
-            "source": source,
-            "mode_used": "local_list" if use_local_source else mode,
-            "base_mode": mode,
-            "change_every_used": change_every,
-            "filter_used": list(active_filter),
-            "use_local_list_used": use_local_list,
-            "fallback_all": False if use_local_source else (fallback_all and mode != "fixed"),
-            "matches_at_resolve": global_match_count,
-            "local_list_count_after": len(local_items),
-            "hold_index": hold_index,
-            "hold_total": change_every,
-            "status": status,
-            "status_icon": STATUS_ICON[status],
-            "title": title,
-            "status_text": status_text,
-        }
-        state["last_execution_snapshot"] = snapshot
+        def is_match(ckpt: str) -> bool:
+            return _matches_filter(ckpt, active_filter, fallback_all)
+
+        def find_next_increment(start_idx: int) -> tuple[str, int]:
+            start_idx = max(0, min(int(start_idx), len(all_checkpoints) - 1))
+            for offset in range(len(all_checkpoints)):
+                idx = (start_idx + offset) % len(all_checkpoints)
+                ckpt = all_checkpoints[idx]
+                if is_match(ckpt):
+                    return ckpt, idx
+            return all_checkpoints[start_idx], start_idx
+
+        def filtered_candidates() -> list[str]:
+            if fallback_all or not active_filter:
+                return all_checkpoints
+            return [ckpt for ckpt in all_checkpoints if _get_status(ckpt) in active_filter]
+
+        def draw_from_shuffle_deck() -> str:
+            deck = [ckpt for ckpt in state.get("shuffle_deck", []) if ckpt in all_set]
+            while True:
+                if not deck:
+                    deck = list(all_checkpoints)
+                    random.shuffle(deck)
+                candidate = deck.pop(0)
+                # In shuffle_once, skipped non-matching cards are consumed too.
+                if is_match(candidate):
+                    state["shuffle_deck"] = deck
+                    return candidate
+
+        last_ckpt = state.get("last_normal_ckpt_name", "")
+        repeat_count = int(state.get("repeat_count", 0))
+        can_hold_last = (
+            repeat_count > 0
+            and repeat_count < change_every
+            and last_ckpt in all_set
+            and (mode == "fixed" or is_match(last_ckpt))
+        )
+
+        new_selection = False
+        if can_hold_last:
+            ckpt_name = last_ckpt
+            try:
+                selected_index = all_checkpoints.index(ckpt_name)
+            except ValueError:
+                selected_index = 0
+        else:
+            new_selection = True
+            if mode == "fixed":
+                requested = _normalize_relpath(start_checkpoint)
+                ckpt_name = requested if requested in all_set else all_checkpoints[0]
+                selected_index = all_checkpoints.index(ckpt_name)
+            elif mode == "randomize":
+                candidates = filtered_candidates()
+                ckpt_name = random.choice(candidates if candidates else all_checkpoints)
+                selected_index = all_checkpoints.index(ckpt_name)
+            elif mode == "shuffle_once":
+                ckpt_name = draw_from_shuffle_deck()
+                selected_index = all_checkpoints.index(ckpt_name)
+            else:  # increment
+                ckpt_name, selected_index = find_next_increment(int(state.get("current_index", 0)))
+
+        hold_index = repeat_count + 1 if can_hold_last else 1
+        if hold_index >= change_every:
+            state["repeat_count"] = 0
+            if mode == "increment":
+                next_index = selected_index + 1
+                if next_index >= len(all_checkpoints):
+                    next_index = 0
+                    state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
+                state["current_index"] = next_index
+            else:
+                state["current_index"] = selected_index
+        else:
+            state["repeat_count"] = hold_index
+            state["current_index"] = selected_index
+
+        source = "cycle"
+        local_list_remaining = list(state.get("local_list", [])) if state.get("use_local_list", True) else []
+        title = _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filter, fallback_all and mode != "fixed", len(local_list_remaining))
+        status_text = _build_cycler_status_text(
+            source,
+            ckpt_name,
+            active_filter,
+            fallback_all and mode != "fixed",
+            local_list_remaining,
+            hold_index,
+            change_every,
+            match_count,
+            len(all_checkpoints),
+            mode,
+            len(state.get("shuffle_deck", [])) if mode == "shuffle_once" else None,
+        )
         state["last_ckpt_name"] = ckpt_name
-        state["last_source"] = source
+        state["last_normal_ckpt_name"] = ckpt_name
         state["last_title"] = title
-        state["last_status_text"] = status_text
         state["last_hold_index"] = hold_index
-        # Mirrors of runtime controls, not queue-prompt arguments.
         state["last_change_every"] = change_every
         state["last_mode"] = mode
-        state["last_start_checkpoint"] = start_checkpoint_used
-
-        exec_state = _store_tab_execution_state(tab_id, {
-            "node": int(unique_id) if unique_id is not None else None,
-            "node_class": "CheckpointNameCycler",
-            "ckpt_name_str": ckpt_name,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
-            "status": status,
-            "status_icon": STATUS_ICON[status],
-            "source": source,
-            "mode": "local_list" if use_local_source else mode,
-            "mode_used": "local_list" if use_local_source else mode,
-            "base_mode": mode,
-            "change_every": change_every,
-            "change_every_used": change_every,
-            "filter_used": list(active_filter),
-            "fallback_all": False if use_local_source else (fallback_all and mode != "fixed"),
-            "matches_at_resolve": global_match_count,
-            "local_list_count": len(local_items),
-            "hold_index": hold_index,
-            "title": title,
-            "status_text": status_text,
-            "last_execution_snapshot": snapshot,
-        })
-        state["execution_revision"] = exec_state.get("execution_revision", 0)
-        snapshot["execution_revision"] = state["execution_revision"]
-        state["last_execution_snapshot"] = snapshot
+        state["last_source"] = source
         _send_cycler_update(
             node_id,
             title,
             status_text,
             tab_id=tab_id,
             ckpt_name_str=ckpt_name,
-            ckpt_name_safe=_ckpt_name_safe_from_relpath(ckpt_name),
-            status=status,
-            status_icon=STATUS_ICON[status],
             source=source,
-            mode="local_list" if use_local_source else mode,
-            base_mode=mode,
+            mode=mode,
             hold_index=hold_index,
             change_every=change_every,
-            local_list_count=len(local_items),
-            local_list_items=list(local_items),
-            filter_matches=global_match_count,
-            filter_total=_checkpoint_total_count(),
-            active_filter=list(active_filter),
-            use_local_list=use_local_list,
-            runtime_controls=controls,
-            last_execution_snapshot=snapshot,
-            execution_revision=state["execution_revision"],
         )
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
@@ -1697,9 +1757,15 @@ class CheckpointStatusTagger:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"ckpt_name_str": ("STRING", {"forceInput": True})},
-            "optional": {"hps_tab_id": ("STRING", {"default": "", "hidden": True})},
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "required": {
+                "ckpt_name_str": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ()
@@ -1715,15 +1781,12 @@ class CheckpointStatusTagger:
         relpath = _normalize_relpath(ckpt_name_str)
         status = _get_status(relpath)
         title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
-        _store_tagger_state(hps_tab_id, unique_id, relpath, status)
         _send_event(TAGGER_EVENT, {
             "node": int(unique_id) if unique_id is not None else None,
             "tab_id": _clean_tab_id(hps_tab_id),
             "node_class": "CheckpointStatusTagger",
             "ckpt_name_str": relpath,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
             "status": status,
-            "status_icon": STATUS_ICON[status],
             "title": title,
         })
         return ()
@@ -1752,22 +1815,7 @@ class EphemeralPreview:
             pil_images = _tensor_batch_to_pil(image)
             sheet, meta = _build_contact_sheet(pil_images)
             meta["node_class"] = "EphemeralPreview"
-            exec_state = _get_tab_execution_state(hps_tab_id)
-            ckpt_name = exec_state.get("ckpt_name_str", "")
-            status = exec_state.get("status", _get_status(ckpt_name) if ckpt_name else "none")
-            if ckpt_name:
-                meta.update({
-                    "ckpt_name_str": ckpt_name,
-                    "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
-                    "status": status,
-                    "status_icon": STATUS_ICON.get(status, "—"),
-                    "execution_revision": exec_state.get("execution_revision", 0),
-                })
-                title = f"Preview : {STATUS_ICON[status]} {ckpt_name}" if status != "none" else f"Preview : {ckpt_name}"
-                _store_preview_state(hps_tab_id, unique_id, ckpt_name, status, execution_revision=exec_state.get("execution_revision", 0))
-            else:
-                title = "Ephemeral Preview"
-            _send_preview(unique_id, title, sheet, meta, tab_id=hps_tab_id)
+            _send_preview(unique_id, "Ephemeral Preview", sheet, meta, tab_id=hps_tab_id)
         except Exception:
             logger.exception("EphemeralPreview failed")
         return ()
@@ -1777,13 +1825,17 @@ class ImageDirPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"ckpt_name_str": ("STRING", {"forceInput": True})},
+            "required": {
+                "ckpt_name_str": ("STRING", {"forceInput": True}),
+            },
             "optional": {
                 "search_directory": ("STRING", {"forceInput": True}),
                 "max_preview_images": ("INT", {"default": IMAGE_DIR_DEFAULT_MAX_IMAGES, "min": 1, "max": IMAGE_DIR_MAX_IMAGES}),
                 "hps_tab_id": ("STRING", {"default": "", "hidden": True}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ()
@@ -1798,45 +1850,11 @@ class ImageDirPreview:
     def preview(self, ckpt_name_str, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
         relpath = _normalize_relpath(ckpt_name_str)
         sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True, max_preview_images=max_preview_images)
-        status = _get_status(relpath)
-        _store_preview_state(hps_tab_id, unique_id, relpath, status, node_class="ImageDirPreview")
         _send_preview(unique_id, _image_dir_title(relpath), sheet, extra, tab_id=hps_tab_id)
         return ()
 
 
 routes = PromptServer.instance.routes
-
-
-@routes.get(f"/{EXTENSION_PREFIX}/node_state")
-async def node_state(request):
-    node_id = str(request.query.get("node_id", ""))
-    tab_id = _clean_tab_id(request.query.get("tab_id", ""))
-    node_class = str(request.query.get("node_class", ""))
-    key = _state_key(tab_id, node_id)
-    if node_class == "CheckpointNameCycler":
-        state = _get_cycler_state(key)
-        payload = _cycler_state_payload(state)
-        payload.update({"ok": True, "node_id": node_id, "node_class": node_class})
-        return web.json_response(payload)
-    if node_class == "CheckpointStatusTagger":
-        state = dict(_TAGGER_STATES.get(key, {}))
-        state.update({"ok": True, "node_id": node_id, "node_class": node_class})
-        return web.json_response(state)
-    if node_class == "EphemeralPreview":
-        state = dict(_PREVIEW_STATES.get(key, {}))
-        if not state:
-            exec_state = _get_tab_execution_state(tab_id)
-            if exec_state.get("ckpt_name_str"):
-                state = {
-                    "ckpt_name_str": exec_state.get("ckpt_name_str", ""),
-                    "ckpt_name_safe": exec_state.get("ckpt_name_safe", ""),
-                    "status": exec_state.get("status", "none"),
-                    "status_icon": exec_state.get("status_icon", "—"),
-                    "execution_revision": exec_state.get("execution_revision", 0),
-                }
-        state.update({"ok": True, "node_id": node_id, "node_class": node_class})
-        return web.json_response(state)
-    return web.json_response({"ok": False, "error": "Unsupported node_class."}, status=400)
 
 
 @routes.get(f"/{EXTENSION_PREFIX}/list_checkpoints")
@@ -1859,7 +1877,10 @@ async def refresh_all(_request):
     summary = _delete_status_summary()
     updated = len(checkpoint_values)
     logger.info("[CheckpointHandpickerSuite] Refresh All completed.")
-    logger.info("[CheckpointHandpickerSuite] Checkpoints: %s total (favorite=%s, nice=%s, keep=%s, delete=%s, none=%s)", summary["total"], summary["favorite"], summary["nice"], summary["keep"], summary["delete"], summary["none"])
+    logger.info(
+        "[CheckpointHandpickerSuite] Checkpoints: %s total (favorite=%s, nice=%s, keep=%s, delete=%s, none=%s)",
+        summary["total"], summary["favorite"], summary["nice"], summary["keep"], summary["delete"], summary["none"],
+    )
     logger.info("[CheckpointHandpickerSuite] Backend checkpoint classes patched: %s", patched_classes)
     if pruned_delete_records:
         logger.info("[CheckpointHandpickerSuite] Pruned missing delete reservation(s): %s", pruned_delete_records)
@@ -1871,6 +1892,7 @@ async def refresh_all(_request):
         "status_text": _status_summary_text("Refresh All"),
         "checkpoint_values": checkpoint_values,
         "patched_classes": patched_classes,
+        "patched_class_count": len(patched_classes),
         "pruned_delete_records": pruned_delete_records,
     })
 
@@ -1880,21 +1902,21 @@ async def tagger_set_status(request):
     data = await request.json()
     relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
     requested = str(data.get("status", "none"))
-    tab_id = _clean_tab_id(data.get("tab_id", ""))
-    node_id = data.get("node_id") or data.get("node")
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
     if requested not in STATUS_VALUES:
         return web.json_response({"ok": False, "error": "Invalid status."}, status=400)
+
     current = _get_status(relpath)
     if requested == "none":
         status = "none"
     elif requested == current:
-        status = "none"
+        status = "none"  # toggle off
     elif requested == "delete" and current not in ("none", "delete"):
         return web.json_response({"ok": False, "error": "Delete is available only from none."}, status=400)
     else:
         status = requested
+
     _set_status(relpath, status)
     if status == "delete":
         resolved = _resolve_checkpoint_unique(relpath)
@@ -1902,61 +1924,100 @@ async def tagger_set_status(request):
             _append_delete_record({
                 "version": 1,
                 "type": "reserve",
-                "id": f"{int(time.time())}_{uuid.uuid4().hex}",
+                "id": f"{int(time.time())}_{uuid.uuid4().hex[:12]}",
                 "ckpt_name_str": relpath,
+                "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
                 "resolved_path": resolved["path"],
-                "json_path": resolved["json_path"],
                 "reserved_at": _now_iso(),
             })
             _write_delete_script()
-    else:
-        # Cancel active delete reservation for this checkpoint if it existed.
+    elif current == "delete" and status != "delete":
         active = _active_delete_records().get(relpath)
-        if active and active.get("id"):
+        if active:
             _append_delete_record({
                 "version": 1,
                 "type": "cancel",
                 "id": active.get("id"),
                 "ckpt_name_str": relpath,
                 "cancelled_at": _now_iso(),
-                "reason": f"status_changed_to_{status}",
             })
             _write_delete_script()
-    _store_tagger_state(tab_id, node_id, relpath, status)
-    _send_status_changed(relpath, tab_id=tab_id, node_id=node_id)
+    payload = {
+        "scope": "global",
+        "ok": True,
+        "ckpt_name_str": relpath,
+        "status": _get_status(relpath),
+        "status_icon": STATUS_ICON[_get_status(relpath)],
+        "summary": _delete_status_summary(),
+    }
+    _send_event(STATUS_CHANGED_EVENT, payload)
+    _refresh_cycler_states_for_status_change(relpath)
+    return web.json_response(payload)
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/review/sync_checkpoint")
+async def review_sync_checkpoint(request):
+    data = await request.json()
+    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
+    if not _is_valid_checkpoint_relpath(relpath):
+        return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    tagger_ids = [str(x) for x in data.get("tagger_node_ids", []) if str(x).isdigit()]
+    preview_targets = []
+    raw_preview_targets = data.get("preview_targets")
+    if isinstance(raw_preview_targets, list):
+        for item in raw_preview_targets:
+            if isinstance(item, dict):
+                node_id = str(item.get("node_id", ""))
+                if node_id.isdigit():
+                    preview_targets.append({
+                        "node_id": node_id,
+                        "search_directory": str(item.get("search_directory") or ""),
+                        "max_preview_images": _clamp_image_dir_max_images(item.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES)),
+                    })
+    if not preview_targets:
+        preview_targets = [
+            {"node_id": str(x), "search_directory": "", "max_preview_images": IMAGE_DIR_DEFAULT_MAX_IMAGES}
+            for x in data.get("preview_node_ids", [])
+            if str(x).isdigit()
+        ]
+    status = _get_status(relpath)
+    title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
+    for node_id in tagger_ids:
+        _send_event(TAGGER_EVENT, {
+            "node": int(node_id),
+            "tab_id": tab_id,
+            "node_class": "CheckpointStatusTagger",
+            "ckpt_name_str": relpath,
+            "status": status,
+            "title": title,
+        })
+
+    preview_count = 0
+    for target in preview_targets:
+        node_id = target["node_id"]
+        search_directory = target.get("search_directory") or None
+        max_preview_images = _clamp_image_dir_max_images(target.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES))
+        sheet, extra = await asyncio.to_thread(
+            _load_image_dir_preview,
+            node_id,
+            relpath,
+            search_directory,
+            tab_id,
+            True,
+            max_preview_images,
+        )
+        _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
+        preview_count += 1
+
     return web.json_response({
         "ok": True,
         "ckpt_name_str": relpath,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+        "taggers": len(tagger_ids),
+        "previews": preview_count,
         "status": status,
-        "status_icon": STATUS_ICON[status],
-        "summary": _delete_status_summary(),
     })
-
-
-@routes.post(f"/{EXTENSION_PREFIX}/cycler/set_runtime_controls")
-async def cycler_set_runtime_controls(request):
-    data = await request.json()
-    node_id = str(data.get("node_id", ""))
-    tab_id = _clean_tab_id(data.get("tab_id", ""))
-    state = _get_cycler_state(_state_key(tab_id, node_id))
-    revision = _parse_saved_int(data.get("settings_revision"), _runtime_controls_from_state(state).get("settings_revision", 0))
-    accepted, revision = _should_accept_settings_update(state, revision)
-    if accepted:
-        _set_runtime_controls(
-            state,
-            mode=data.get("mode") if "mode" in data else None,
-            change_every=data.get("change_every") if "change_every" in data else None,
-            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
-            active_filter=data.get("active_filter") if "active_filter" in data else None,
-            use_local_list=bool(data.get("use_local_list")) if "use_local_list" in data else None,
-            settings_revision=revision,
-            mark_initialized=True,
-        )
-    _send_cycler_state_update(node_id, state, tab_id=tab_id)
-    payload = _cycler_state_payload(state)
-    payload.update({"ok": True, "accepted": accepted, "node_id": node_id})
-    return web.json_response(payload)
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/set_flags")
@@ -1965,22 +2026,15 @@ async def cycler_set_flags(request):
     node_id = str(data.get("node_id", ""))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     state = _get_cycler_state(_state_key(tab_id, node_id))
-    revision = _parse_saved_int(data.get("settings_revision"), _parse_saved_int(state.get("settings_revision"), 0))
-    accepted, revision = _should_accept_settings_update(state, revision)
-    if accepted:
-        _set_runtime_controls(
-            state,
-            mode=data.get("mode") if "mode" in data else None,
-            change_every=data.get("change_every") if "change_every" in data else None,
-            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
-            use_local_list=bool(data.get("use_local_list")) if "use_local_list" in data else None,
-            settings_revision=revision,
-            mark_initialized=True,
-        )
+    revision = _parse_saved_int(data.get("settings_revision"))
+    if revision is None:
+        revision = int(state.get("settings_revision", -1) or -1) + 1
+    if "use_local_list" in data:
+        state["use_local_list"] = bool(data.get("use_local_list"))
+        state["accept_queue"] = state["use_local_list"]
+        state["settings_revision"] = revision
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
-    payload = _cycler_state_payload(state)
-    payload.update({"ok": True, "accepted": accepted, "use_local_list": state["use_local_list"]})
-    return web.json_response(payload)
+    return web.json_response({"ok": True, "use_local_list": state["use_local_list"]})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/set_filter")
@@ -1988,25 +2042,16 @@ async def cycler_set_filter(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
-    statuses = _normalize_status_list(data.get("statuses", []))
+    statuses = [s for s in data.get("statuses", []) if s in STATUS_VALUES]
     state = _get_cycler_state(_state_key(tab_id, node_id))
-    revision = _parse_saved_int(data.get("settings_revision"), _parse_saved_int(state.get("settings_revision"), 0))
-    accepted, revision = _should_accept_settings_update(state, revision)
-    if accepted:
-        _set_runtime_controls(
-            state,
-            mode=data.get("mode") if "mode" in data else None,
-            change_every=data.get("change_every") if "change_every" in data else None,
-            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
-            active_filter=statuses.copy(),
-            settings_revision=revision,
-            mark_initialized=True,
-        )
+    revision = _parse_saved_int(data.get("settings_revision"))
+    if revision is None:
+        revision = int(state.get("settings_revision", -1) or -1) + 1
+    state["active_filter"] = statuses.copy()
+    state["settings_revision"] = revision
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
-    logger.info("[CheckpointHandpickerSuite] Updated cycler filter for tab %s node %s: %s accepted=%s", tab_id, node_id, statuses or ["All"], accepted)
-    payload = _cycler_state_payload(state)
-    payload.update({"ok": True, "accepted": accepted, "node_id": node_id, "statuses": _runtime_controls_from_state(state).get("active_filter", [])})
-    return web.json_response(payload)
+    logger.info("[CheckpointHandpickerSuite] Updated cycler filter for tab %s node %s: %s", tab_id, node_id, statuses or ["All"])
+    return web.json_response({"ok": True, "node_id": node_id, "statuses": statuses})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/local_list_append")
@@ -2018,21 +2063,15 @@ async def cycler_local_list_append(request):
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     target_node_ids = [str(x) for x in data.get("target_node_ids", []) if str(x).isdigit()]
     updated = 0
-    states = []
     for node_id in target_node_ids:
         state = _get_cycler_state(_state_key(tab_id, node_id))
         if state.get("use_local_list", True):
-            local_list = state.setdefault("local_list", [])
-            local_list.append(relpath)
-            state["override_queue"] = local_list
-            state["last_status_text"] = _build_cycler_idle_status_text("", state)
+            state.setdefault("local_list", []).append(relpath)
+            state["override_queue"] = state["local_list"]
             updated += 1
             _send_cycler_state_update(node_id, state, tab_id=tab_id)
-            payload = _cycler_state_payload(state)
-            payload.update({"node_id": node_id})
-            states.append(payload)
     logger.info("[CheckpointHandpickerSuite] Pushed checkpoint to %s Local List(s) in tab %s: %s", updated, tab_id, relpath)
-    return web.json_response({"ok": True, "updated": updated, "states": states})
+    return web.json_response({"ok": True, "updated": updated})
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/clear_local_list")
@@ -2044,75 +2083,9 @@ async def cycler_clear_local_list(request):
     cleared = len(state.get("local_list", []))
     state["local_list"] = []
     state["override_queue"] = []
-    state["last_status_text"] = _build_cycler_idle_status_text("", state)
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
     logger.info("[CheckpointHandpickerSuite] Cleared Local List for tab %s node %s: %s item(s)", tab_id, node_id, cleared)
-    payload = _cycler_state_payload(state)
-    payload.update({"node_id": node_id})
-    return web.json_response({"ok": True, "cleared": cleared, "state": payload})
-
-
-@routes.post(f"/{EXTENSION_PREFIX}/review/sync_checkpoint")
-async def review_sync_checkpoint(request):
-    data = await request.json()
-    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
-    tab_id = _clean_tab_id(data.get("tab_id", ""))
-    if not _is_valid_checkpoint_relpath(relpath):
-        return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
-    status = _get_status(relpath)
-    title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
-    tagger_node_ids = [str(x) for x in data.get("tagger_node_ids", []) if str(x).isdigit()]
-    for node_id in tagger_node_ids:
-        _store_tagger_state(tab_id, node_id, relpath, status)
-        _send_event(TAGGER_EVENT, {
-            "node": int(node_id),
-            "tab_id": tab_id,
-            "node_class": "CheckpointStatusTagger",
-            "ckpt_name_str": relpath,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-            "status": status,
-            "status_icon": STATUS_ICON[status],
-            "title": title,
-        })
-
-    preview_targets = data.get("preview_targets")
-    if not isinstance(preview_targets, list):
-        preview_targets = []
-        for node_id in data.get("preview_node_ids", []) or []:
-            preview_targets.append({"node_id": node_id})
-
-    preview_count = 0
-    for target in preview_targets:
-        try:
-            node_id = str(target.get("node_id", ""))
-            if not node_id.isdigit():
-                continue
-            search_directory = target.get("search_directory")
-            max_preview_images = _clamp_image_dir_max_images(target.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES))
-            sheet, extra = await asyncio.to_thread(
-                _load_image_dir_preview,
-                node_id,
-                relpath,
-                search_directory,
-                tab_id,
-                True,
-                max_preview_images,
-            )
-            _store_preview_state(tab_id, node_id, relpath, status, node_class="ImageDirPreview")
-            _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
-            preview_count += 1
-        except Exception:
-            logger.exception("[CheckpointHandpickerSuite] failed to sync ImageDirPreview")
-
-    return web.json_response({
-        "ok": True,
-        "ckpt_name_str": relpath,
-        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-        "status": status,
-        "status_icon": STATUS_ICON[status],
-        "taggers": len(tagger_node_ids),
-        "previews": preview_count,
-    })
+    return web.json_response({"ok": True, "cleared": cleared})
 
 
 NODE_CLASS_MAPPINGS = {
