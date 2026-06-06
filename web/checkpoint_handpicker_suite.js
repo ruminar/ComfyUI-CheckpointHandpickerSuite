@@ -158,9 +158,6 @@ function patchCheckpointSlotTypes(node, checkpoints) {
   for (const output of node?.outputs ?? []) {
     if (!isCheckpointSlotName(output?.name)) continue;
 
-    // For combo-like checkpoint outputs, the type itself is the allowed value
-    // list. This is the part that prevents type mismatch with downstream
-    // CheckpointNameSelector-style nodes after deletion + Refresh All.
     output.type = [...values];
 
     const links = Array.isArray(output.links) ? output.links : [];
@@ -181,7 +178,6 @@ function patchCheckpointSlotTypes(node, checkpoints) {
     }
   }
 }
-
 
 function updateCheckpointComboWidget(node, widget, checkpoints) {
   if (!widget || !Array.isArray(checkpoints) || checkpoints.length === 0) {
@@ -335,7 +331,6 @@ function installCheckpointRefreshFuturePatch(nodeType, nodeData) {
   };
 }
 
-
 function isNodeClass(node, className) {
   return node && (node.type === className || node.comfyClass === className);
 }
@@ -368,9 +363,6 @@ function ensureHiddenWidgetValue(node, name, value) {
   if (!w) return false;
   if (value !== undefined) w.value = value;
 
-  // Different ComfyUI/LiteGraph builds hide widgets through different flags.
-  // Set all harmless hints, and do it repeatedly from lifecycle hooks so the
-  // value is still serialized but the row does not occupy visible node space.
   w.type = "hidden";
   w.hidden = true;
   w.disabled = true;
@@ -380,6 +372,8 @@ function ensureHiddenWidgetValue(node, name, value) {
   w.draw = () => {};
   return true;
 }
+
+const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
 
 function normalizeCyclerFilterStatuses(value) {
   let raw = value;
@@ -412,6 +406,41 @@ function parseSavedBool(value, fallback) {
   return fallback;
 }
 
+function parseSavedInt(value, fallback = 0) {
+  const n = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function bumpCyclerSettingsRevision(node) {
+  node.__hpsSettingsRevision = Math.max(0, parseSavedInt(node.__hpsSettingsRevision, 0)) + 1;
+  return node.__hpsSettingsRevision;
+}
+
+function validCyclerMode(value) {
+  return ["fixed", "increment", "randomize", "shuffle_once"].includes(String(value || "")) ? String(value) : "increment";
+}
+
+function validChangeEvery(value) {
+  const n = Number.parseInt(String(value ?? "1"), 10);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+function getCyclerRuntimeControls(node) {
+  return {
+    mode: validCyclerMode(getWidget(node, "mode")?.value),
+    change_every: validChangeEvery(getWidget(node, "change_every")?.value),
+    start_checkpoint: String(getWidget(node, "start_checkpoint")?.value ?? ""),
+  };
+}
+
+function setWidgetValueIfDifferent(node, name, value) {
+  const widget = getWidget(node, name);
+  if (!widget) return false;
+  if (String(widget.value ?? "") === String(value ?? "")) return false;
+  widget.value = value;
+  return true;
+}
+
 function ensureHiddenTabIdWidget(node) {
   return ensureHiddenWidgetValue(node, "hps_tab_id", HPS_TAB_ID);
 }
@@ -428,13 +457,18 @@ function restoreCyclerSettingsFromWidgets(node) {
   const useLocalWidget = getWidget(node, "hps_use_local_list");
   node.__hpsUseLocalList = parseSavedBool(useLocalWidget?.value, node.__hpsUseLocalList ?? true);
 
+  const revisionWidget = getWidget(node, "hps_settings_revision");
+  node.__hpsSettingsRevision = parseSavedInt(revisionWidget?.value, node.__hpsSettingsRevision ?? 0);
+
   ensureHiddenWidgetValue(node, "hps_filter_statuses", serializeCyclerFilterStatuses(node.__hpsFilterStatuses));
   ensureHiddenWidgetValue(node, "hps_use_local_list", node.__hpsUseLocalList ? "true" : "false");
+  ensureHiddenWidgetValue(node, "hps_settings_revision", String(node.__hpsSettingsRevision ?? 0));
 }
 
 function syncCyclerSettingsWidgets(node) {
   ensureHiddenWidgetValue(node, "hps_filter_statuses", serializeCyclerFilterStatuses(node.__hpsFilterStatuses || []));
   ensureHiddenWidgetValue(node, "hps_use_local_list", node.__hpsUseLocalList ? "true" : "false");
+  ensureHiddenWidgetValue(node, "hps_settings_revision", String(node.__hpsSettingsRevision ?? 0));
 }
 
 function scheduleHideTabIdWidget(node) {
@@ -535,9 +569,6 @@ function localPos(node, pos) {
 
 function candidatePositions(node, pos) {
   if (!pos) return [];
-  // LiteGraph/ComfyUI versions differ here: some callbacks pass node-local
-  // coordinates, others pass graph/canvas coordinates. Test both so custom
-  // drawn controls keep working across frontend versions.
   const graphToLocal = localPos(node, pos);
   return [pos, graphToLocal];
 }
@@ -587,6 +618,47 @@ function installCursorCapture() {
   canvasEl.addEventListener("mouseleave", () => setCanvasCursor(""));
 }
 
+// ---------- Backend state restore ----------
+async function restoreNodeStateFromBackend(node, nodeClass) {
+  if (!node || !nodeClass) return;
+  try {
+    const query = new URLSearchParams({ node_id: String(node.id), node_class: nodeClass, tab_id: HPS_TAB_ID });
+    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/node_state?${query.toString()}`, { cache: "no-store" });
+    if (!response.ok) return;
+    const result = await response.json();
+    if (!result?.ok) return;
+
+    if (nodeClass === "EphemeralPreview") {
+      if (result.ckpt_name_str) {
+        node.__hpsPreviewCkptName = result.ckpt_name_str;
+        node.__hpsPreviewStatus = result.status || "none";
+        setPreviewTitleFromCheckpoint(node, result.ckpt_name_str, result.status || "none");
+      }
+    } else if (nodeClass === TAGGER_CLASS) {
+      if (result.ckpt_name_str) {
+        node.__hpsTaggerPath = result.ckpt_name_str;
+        node.__hpsTaggerStatus = result.status || "none";
+        node.__hpsTaggerMessage = node.__hpsTaggerStatus === "none"
+          ? "Current: — none"
+          : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_LABEL[node.__hpsTaggerStatus]}`;
+        node.title = node.__hpsTaggerStatus === "none"
+          ? `Tagger : ${result.ckpt_name_str}`
+          : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${result.ckpt_name_str}`;
+      }
+    } else if (nodeClass === CYCLER_CLASS) {
+      if (result.ckpt_name_str) {
+        node.__hpsCyclerCkptName = result.ckpt_name_str;
+        node.__hpsCyclerStatusValue = result.status || "none";
+      }
+      if (result.status_text) node.__hpsCyclerStatus = result.status_text;
+      if (result.title) node.title = result.title;
+    }
+    app.graph?.setDirtyCanvas?.(true, true);
+  } catch (error) {
+    // Older Python side versions did not expose node_state. Ignore quietly.
+  }
+}
+
 // ---------- Preview ----------
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
@@ -596,6 +668,13 @@ function setupPreviewNode(nodeType) {
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 340, 300);
+    if (isNodeClass(this, "EphemeralPreview")) setTimeout(() => restoreNodeStateFromBackend(this, "EphemeralPreview"), 0);
+    return r;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    if (isNodeClass(this, "EphemeralPreview")) setTimeout(() => restoreNodeStateFromBackend(this, "EphemeralPreview"), 0);
     return r;
   };
 
@@ -662,11 +741,13 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const isEphemeral = isNodeClass(node, "EphemeralPreview");
   if (isEphemeral && detail.image) {
     const execution = getExecutionState();
-    if (execution?.ckpt_name_str) {
-      node.__hpsPreviewCkptName = execution.ckpt_name_str;
-      node.__hpsPreviewStatus = execution.status || "none";
-      node.__hpsPreviewStatusIcon = execution.status_icon || STATUS_ICON[node.__hpsPreviewStatus] || "";
-      setPreviewTitleFromCheckpoint(node, node.__hpsPreviewCkptName, node.__hpsPreviewStatus);
+    const ckptName = detail.ckpt_name_str || execution?.ckpt_name_str || "";
+    if (ckptName) {
+      node.__hpsPreviewCkptName = ckptName;
+      node.__hpsPreviewStatus = detail.status || execution?.status || "none";
+      node.__hpsPreviewStatusIcon = detail.status_icon || execution?.status_icon || STATUS_ICON[node.__hpsPreviewStatus] || "";
+      if (detail.title) node.title = detail.title;
+      else setPreviewTitleFromCheckpoint(node, node.__hpsPreviewCkptName, node.__hpsPreviewStatus);
     } else {
       node.title = "Ephemeral Preview";
     }
@@ -678,7 +759,6 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const caption = detail.progress_message || detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   node.__hpsPreviewCaption = caption;
   if (!detail.image) {
-    // Progress messages should not blank a previously loaded sheet.
     if (!detail.progress) node.__hpsPreview = null;
     app.graph.setDirtyCanvas(true, true);
     return;
@@ -793,7 +873,6 @@ function firstWidgetValue(node, preferredSlot = null, seen = new Set()) {
     if (s) return s;
   }
 
-  // Reroute-like nodes usually forward their first input. Follow one hop chain.
   const type = String(node.type || node.comfyClass || "").toLowerCase();
   if (type.includes("reroute") || type.includes("relay")) {
     return linkedInputValue(node, node.inputs?.[0]?.name || "", seen);
@@ -943,29 +1022,15 @@ async function syncSelectedCheckpoint(node) {
       ckpt_name_str: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
-      preview_targets: targets.previews.map((n) => {
-        const searchDirectory = imageDirSearchDirectory(n);
-        console.debug("[CheckpointHandpickerSuite] ImageDirPreview search_directory", n.id, searchDirectory);
-        return {
-          node_id: n.id,
-          search_directory: searchDirectory,
-          max_preview_images: imageDirMaxPreviewImages(n),
-        };
-      }),
+      search_directories: Object.fromEntries(targets.previews.map((n) => [String(n.id), imageDirSearchDirectory(n)])),
+      max_preview_images: Object.fromEntries(targets.previews.map((n) => [String(n.id), imageDirMaxPreviewImages(n)])),
     })),
   });
   const result = await response.json();
-  if (result.ok) {
-    node.__hpsStatus = `synced : ${selected}`;
-  } else {
-    node.__hpsStatus = result.error || "Sync failed";
-  }
+  node.__hpsStatus = result.ok
+    ? `synced : ${selected} (${targets.taggers.length} tagger, ${targets.previews.length} preview)`
+    : (result.error || "Sync failed");
   app.graph.setDirtyCanvas(true, true);
-}
-
-function runSelectorAction(node) {
-  if (selectorActionMode(node) === "sync") return syncSelectedCheckpoint(node);
-  return pushSelectedToLocalList(node);
 }
 
 function maxSelectorScroll(node) {
@@ -981,238 +1046,151 @@ function selectorScrollbar(node) {
   const items = selectorItems(node);
   if (items.length <= SELECTOR_VISIBLE_ROWS) return null;
   const r = selectorRects(node).list;
-  const scroll = Math.max(0, Math.min(node.__hpsScroll || 0, maxSelectorScroll(node)));
-  const thumbH = Math.max(24, r.h * (SELECTOR_VISIBLE_ROWS / items.length));
-  const range = Math.max(1, maxSelectorScroll(node));
-  const y = r.y + (r.h - thumbH) * (scroll / range);
-  return {
-    track: { x: r.x + r.w - 16, y: r.y, w: 16, h: r.h },
-    thumb: { x: r.x + r.w - 12, y, w: 8, h: thumbH },
-  };
-}
-
-function setSelectorScrollFromScrollbarY(node, localY, thumbH, dragOffset = thumbH / 2) {
-  const r = selectorRects(node).list;
+  const scroll = node.__hpsScroll || 0;
+  const ratio = SELECTOR_VISIBLE_ROWS / items.length;
+  const h = Math.max(20, r.h * ratio);
   const maxScroll = maxSelectorScroll(node);
-  const usable = Math.max(1, r.h - thumbH);
-  const y = Math.max(r.y, Math.min(r.y + usable, localY - dragOffset));
-  node.__hpsScroll = Math.round(((y - r.y) / usable) * maxScroll);
-  app.graph.setDirtyCanvas(true, true);
-}
-
-function selectorLocalFromEventOrPos(node, event, pos) {
-  const fromEvent = event ? graphEventToLocal(node, event) : null;
-  if (fromEvent) return fromEvent;
-  return candidatePositions(node, pos)?.[0] || null;
-}
-
-let selectorWheelCaptureInstalled = false;
-function installSelectorWheelCapture() {
-  if (selectorWheelCaptureInstalled) return;
-  selectorWheelCaptureInstalled = true;
-  const canvasEl = app.canvas?.canvas;
-  if (!canvasEl) return;
-  canvasEl.addEventListener("wheel", (event) => {
-    const canvas = app.canvas;
-    const graph = app.graph;
-    if (!canvas || !graph) return;
-    let graphPos = null;
-    try {
-      graphPos = canvas.convertEventToCanvasOffset?.(event);
-    } catch {
-      graphPos = null;
-    }
-    if (!graphPos) return;
-    const nodes = [...(graph._nodes || [])].reverse();
-    for (const node of nodes) {
-      if (!(node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS)) continue;
-      if (node.flags?.collapsed) continue;
-      const local = [graphPos[0] - (node.pos?.[0] || 0), graphPos[1] - (node.pos?.[1] || 0)];
-      if (!hit(local, selectorRects(node).list)) continue;
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-      scrollSelector(node, event.deltaY > 0 ? 3 : -3);
-      return;
-    }
-  }, { passive: false, capture: true });
+  const y = r.y + (maxScroll ? ((r.h - h) * scroll / maxScroll) : 0);
+  return { x: r.x + r.w - 8, y, w: 6, h };
 }
 
 function selectorCursorAt(node, local) {
   if (!local) return "";
   const r = selectorRects(node);
-  if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList)) return node.__hpsLoading ? "wait" : "pointer";
-  if ((selectorItems(node).length > SELECTOR_VISIBLE_ROWS) && (hit(local, r.up) || hit(local, r.down))) return "pointer";
-  const sb = selectorScrollbar(node);
-  if (node.__hpsScrollbarDragging) return "grabbing";
-  if (sb && hit(local, sb.thumb)) return "grab";
-  if (sb && hit(local, sb.track)) return "pointer";
-  if (hit(local, r.list)) {
-    const row = Math.floor((local[1] - r.list.y) / ROW_H);
-    const idx = (node.__hpsScroll || 0) + row;
-    return selectorItems(node)[idx] ? "pointer" : "";
+  if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
+  const list = selectorItems(node);
+  const base = node.__hpsScroll || 0;
+  for (let i = 0; i < Math.min(SELECTOR_VISIBLE_ROWS, list.length - base); i++) {
+    const row = { x: r.list.x, y: r.list.y + i * ROW_H, w: r.list.w, h: ROW_H };
+    if (hit(local, row)) return "pointer";
   }
   return "";
 }
 
+function drawSelectorRows(ctx, node) {
+  const r = selectorRects(node);
+  const items = selectorItems(node);
+  const selected = selectorSelected(node);
+  const base = node.__hpsScroll || 0;
+  ctx.save();
+  ctx.font = "12px sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.strokeStyle = "rgba(255,255,255,0.18)";
+  ctx.strokeRect(r.list.x, r.list.y, r.list.w, r.list.h);
+  for (let i = 0; i < SELECTOR_VISIBLE_ROWS; i++) {
+    const item = items[base + i];
+    const y = r.list.y + i * ROW_H;
+    if (!item) continue;
+    const ckpt = item.ckpt_name_str || "";
+    const status = item.status || "none";
+    const active = ckpt === selected;
+    ctx.fillStyle = active ? "rgba(75,125,190,0.58)" : (i % 2 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.06)");
+    ctx.fillRect(r.list.x + 1, y + 1, r.list.w - 2, ROW_H - 2);
+    ctx.fillStyle = active ? "#fff" : "#ddd";
+    ctx.fillText(`${STATUS_ICON[status] || "—"} ${ckpt}`, r.list.x + 6, y + ROW_H / 2, r.list.w - 20);
+  }
+  const sb = selectorScrollbar(node);
+  if (sb) {
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fillRect(sb.x, sb.y, sb.w, sb.h);
+  }
+  ctx.restore();
+}
+
 function setupSelectorNode(nodeType) {
-  installMinSize(nodeType, 560, 520);
+  installMinSize(nodeType, 520, 540);
+  installTabIdSupport(nodeType);
   installCursorCapture();
+
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 560, 520);
-    installSelectorWheelCapture();
+    ensureSize(this, 520, 540);
     hideSelectorWidget(this);
-    this.__hpsItems = [];
-    this.__hpsScroll = 0;
     setTimeout(() => refreshSelector(this, false), 0);
+    return r;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    hideSelectorWidget(this);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
+    ensureHiddenTabIdWidget(this);
     hideSelectorWidget(this);
-    if (hpsNodeCollapsed(this)) {
-      this.__hpsScrollbarDragging = false;
-      this.__hpsScrollbarDragOffset = 0;
-      return;
-    }
+    if (hpsNodeCollapsed(this)) return;
     const r = selectorRects(this);
-    drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
+    drawButton(ctx, r.refreshAll, "Refresh All", !this.__hpsLoading);
+    drawButton(ctx, r.listOnly, "List", !this.__hpsLoading);
     drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
-    drawButton(ctx, r.up, "▲", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
-    drawButton(ctx, r.down, "▼", selectorItems(this).length > SELECTOR_VISIBLE_ROWS);
-    ctx.fillStyle = "#ddd";
+    drawButton(ctx, r.up, "▲", true);
+    drawButton(ctx, r.down, "▼", true);
+
+    ctx.save();
+    ctx.fillStyle = "#ccc";
     ctx.font = "12px sans-serif";
-    const statusLines = String(this.__hpsStatus || "").split("\n").slice(0, 4);
-    statusLines.forEach((line, i) => ctx.fillText(line, 8, 50 + i * 14, this.size[0] - 16));
-    ctx.fillStyle = "rgba(0,0,0,0.22)";
-    ctx.fillRect(r.list.x, r.list.y, r.list.w, r.list.h);
-    ctx.strokeStyle = "rgba(180,220,255,0.35)";
-    ctx.strokeRect(r.list.x, r.list.y, r.list.w, r.list.h);
-    const items = selectorItems(this);
-    const scroll = Math.max(0, Math.min(this.__hpsScroll || 0, Math.max(0, items.length - SELECTOR_VISIBLE_ROWS)));
-    this.__hpsScroll = scroll;
-    const selected = selectorSelected(this);
-    for (let row = 0; row < SELECTOR_VISIBLE_ROWS; row++) {
-      const idx = scroll + row;
-      const item = items[idx];
-      if (!item) continue;
-      const y = r.list.y + row * ROW_H;
-      if (item.ckpt_name_str === selected) {
-        ctx.fillStyle = "rgba(80,120,180,0.65)";
-        ctx.fillRect(r.list.x + 1, y + 1, r.list.w - 2, ROW_H - 2);
-      }
-      ctx.fillStyle = "#e6e6e6";
-      ctx.font = "12px monospace";
-      ctx.fillText(item.label || item.ckpt_name_str, r.list.x + 8, y + 14, r.list.w - 24);
-    }
-    const sb = selectorScrollbar(this);
-    if (sb) {
-      ctx.fillStyle = "rgba(220,220,220,0.18)";
-      ctx.fillRect(sb.track.x + 6, sb.track.y, 4, sb.track.h);
-      ctx.fillStyle = "rgba(230,230,230,0.55)";
-      ctx.fillRect(sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h);
-    }
+    const status = this.__hpsStatus || "not loaded";
+    status.split("\n").slice(0, 3).forEach((line, i) => ctx.fillText(line, 8, 50 + i * 14));
+    ctx.restore();
+
+    drawSelectorRows(ctx, this);
   };
+
   const origMouseDown = nodeType.prototype.onMouseDown;
   nodeType.prototype.onMouseDown = function (e, pos) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     const r = selectorRects(this);
     if (hitAny(this, pos, r.refreshAll)) { refreshSelector(this, true); return true; }
     if (hitAny(this, pos, r.listOnly)) { refreshSelector(this, false); return true; }
-    if (hitAny(this, pos, r.pushLocalList)) { runSelectorAction(this); return true; }
-    if (hitAny(this, pos, r.up)) { scrollSelector(this, -SELECTOR_VISIBLE_ROWS); return true; }
-    if (hitAny(this, pos, r.down)) { scrollSelector(this, SELECTOR_VISIBLE_ROWS); return true; }
-    const sb = selectorScrollbar(this);
-    const sbHitPos = sb ? candidatePositions(this, pos).find((p) => hit(p, sb.track)) : null;
-    if (sb && sbHitPos) {
-      if (hit(sbHitPos, sb.thumb)) {
-        this.__hpsScrollbarDragging = true;
-        this.__hpsScrollbarDragOffset = sbHitPos[1] - sb.thumb.y;
-      } else {
-        setSelectorScrollFromScrollbarY(this, sbHitPos[1], sb.thumb.h);
-      }
+    if (hitAny(this, pos, r.pushLocalList)) {
+      if (selectorActionMode(this) === "sync") syncSelectedCheckpoint(this);
+      else pushSelectedToLocalList(this);
       return true;
     }
-    const listHitPos = candidatePositions(this, pos).find((p) => hit(p, r.list));
-    if (listHitPos) {
-      const row = Math.floor((listHitPos[1] - r.list.y) / ROW_H);
-      const idx = (this.__hpsScroll || 0) + row;
-      const item = selectorItems(this)[idx];
+    if (hitAny(this, pos, r.up)) { scrollSelector(this, -1); return true; }
+    if (hitAny(this, pos, r.down)) { scrollSelector(this, 1); return true; }
+
+    const positions = candidatePositions(this, pos);
+    for (const p of positions) {
+      if (!hit(p, r.list)) continue;
+      const row = Math.floor((p[1] - r.list.y) / ROW_H);
+      const item = selectorItems(this)[(this.__hpsScroll || 0) + row];
       if (item) {
         setSelectorSelected(this, item.ckpt_name_str);
         app.graph.setDirtyCanvas(true, true);
+        return true;
       }
-      return true;
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
-  const origMouseMove = nodeType.prototype.onMouseMove;
-  nodeType.prototype.onMouseMove = function (e, pos) {
-    if (hpsNodeCollapsed(this)) {
-      this.__hpsScrollbarDragging = false;
-      this.__hpsScrollbarDragOffset = 0;
-      return origMouseMove ? origMouseMove.apply(this, arguments) : false;
-    }
-    if (this.__hpsScrollbarDragging) {
-      const sb = selectorScrollbar(this);
-      const local = selectorLocalFromEventOrPos(this, e, pos);
-      if (sb && local) setSelectorScrollFromScrollbarY(this, local[1], sb.thumb.h, this.__hpsScrollbarDragOffset || sb.thumb.h / 2);
-      return true;
-    }
-    return origMouseMove ? origMouseMove.apply(this, arguments) : false;
-  };
-  const origMouseUp = nodeType.prototype.onMouseUp;
-  nodeType.prototype.onMouseUp = function () {
-    if (this.__hpsScrollbarDragging) {
-      this.__hpsScrollbarDragging = false;
-      this.__hpsScrollbarDragOffset = 0;
-      app.graph.setDirtyCanvas(true, true);
-      return true;
-    }
-    return origMouseUp ? origMouseUp.apply(this, arguments) : false;
-  };
-  const origConnectionsChange = nodeType.prototype.onConnectionsChange;
-  nodeType.prototype.onConnectionsChange = function () {
-    app.graph.setDirtyCanvas(true, true);
-    return origConnectionsChange ? origConnectionsChange.apply(this, arguments) : undefined;
-  };
-  const origWheel = nodeType.prototype.onMouseWheel;
+
+  const origMouseWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (e, pos) {
-    if (hpsNodeCollapsed(this)) return origWheel ? origWheel.apply(this, arguments) : false;
-    const r = selectorRects(this).list;
-    if (hitAny(this, pos, r)) {
-      e?.preventDefault?.(); e?.stopPropagation?.();
+    const r = selectorRects(this);
+    if (candidatePositions(this, pos).some((p) => hit(p, r.list))) {
       scrollSelector(this, e.deltaY > 0 ? 3 : -3);
       return true;
     }
-    return origWheel ? origWheel.apply(this, arguments) : false;
+    return origMouseWheel ? origMouseWheel.apply(this, arguments) : false;
   };
 }
 
 // ---------- Tagger ----------
-const TAGGER_STATUSES = ["favorite", "nice", "keep", "delete"];
 function currentTaggerPath(node) {
-  return node.__hpsTaggerPath || getWidget(node, "ckpt_name_str")?.value || "";
+  return node.__hpsTaggerPath || linkedInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
-  const buttonW = 72;
-  const gap = 6;
-  const rightMargin = 12;
-  const totalW = TAGGER_STATUSES.length * buttonW + (TAGGER_STATUSES.length - 1) * gap;
-  const startX = Math.max(120, (node.size?.[0] || 450) - rightMargin - totalW);
-  return TAGGER_STATUSES.map((status, i) => ({
+  return STATUS_ORDER.map((status, i) => ({
     status,
-    x: startX + i * (buttonW + gap),
-    y: 5,
-    w: buttonW,
-    h: 24,
+    x: 8 + i * 84,
+    y: 8,
+    w: 78,
+    h: 26,
   }));
 }
-
 function taggerDeleteEnabled(node) {
   const current = node.__hpsTaggerStatus || "none";
   return current === "none" || current === "delete";
@@ -1254,6 +1232,13 @@ function setupTaggerNode(nodeType) {
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 450, 100);
+    setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
+    return r;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
@@ -1311,6 +1296,7 @@ api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   if (detail.title) node.title = detail.title;
   app.graph.setDirtyCanvas(true, true);
 });
+
 let selectorGlobalRefreshTimer = null;
 function scheduleSelectorGlobalRefresh() {
   clearTimeout(selectorGlobalRefreshTimer);
@@ -1322,42 +1308,31 @@ function scheduleSelectorGlobalRefresh() {
 }
 
 api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
-  if (detail?.scope !== "global") return;
-  scheduleSelectorGlobalRefresh();
-
-  const execution = getExecutionState();
-  if (execution?.ckpt_name_str === detail.ckpt_name_str) {
-    execution.status = detail.status || "none";
-    execution.status_icon = detail.status_icon || STATUS_ICON[execution.status] || "";
-    execution.updated_at = Date.now();
-  }
-
+  if (!isForThisTab(detail)) return;
   for (const node of app.graph?._nodes || []) {
-    if (isNodeClass(node, TAGGER_CLASS) && node.__hpsTaggerPath === detail.ckpt_name_str) {
-      node.__hpsTaggerStatus = detail.status;
-      node.__hpsTaggerMessage = detail.status === "none" ? "Current: — none" : `Current: ${STATUS_ICON[detail.status]} ${STATUS_LABEL[detail.status]}`;
-      node.title = detail.status === "none" ? `Tagger : ${detail.ckpt_name_str}` : `Tagger : ${STATUS_ICON[detail.status]} ${detail.ckpt_name_str}`;
-      app.graph.setDirtyCanvas(true, true);
+    if (isNodeClass(node, SELECTOR_CLASS)) {
+      for (const item of selectorItems(node)) {
+        if (item.ckpt_name_str === detail.ckpt_name_str) item.status = detail.status || "none";
+      }
     }
-    if (isNodeClass(node, "EphemeralPreview") && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
+    if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
       node.__hpsPreviewStatus = detail.status || "none";
-      node.__hpsPreviewStatusIcon = detail.status_icon || STATUS_ICON[node.__hpsPreviewStatus] || "";
-      setPreviewTitleFromCheckpoint(node, detail.ckpt_name_str, node.__hpsPreviewStatus);
-      app.graph.setDirtyCanvas(true, true);
+      setPreviewTitleFromCheckpoint(node, detail.ckpt_name_str, detail.status || "none");
     }
-    if (isNodeClass(node, "ImageDirPreview") && node.__hpsPreviewState?.ckpt_name_str === detail.ckpt_name_str) {
-      patchCheckpointTitle(node, "ImageDir", detail.ckpt_name_str, detail.status || "none");
-      app.graph.setDirtyCanvas(true, true);
+    if (isNodeClass(node, TAGGER_CLASS) && currentTaggerPath(node) === detail.ckpt_name_str) {
+      node.__hpsTaggerStatus = detail.status || "none";
+      node.__hpsTaggerMessage = node.__hpsTaggerStatus === "none" ? "Current: — none" : `Current: ${STATUS_ICON[node.__hpsTaggerStatus]} ${STATUS_LABEL[node.__hpsTaggerStatus]}`;
+      patchCheckpointTitle(node, "Tagger", detail.ckpt_name_str, node.__hpsTaggerStatus);
     }
     if (isNodeClass(node, CYCLER_CLASS) && node.__hpsCyclerCkptName === detail.ckpt_name_str) {
       patchCheckpointTitle(node, "Cycler", detail.ckpt_name_str, detail.status || "none");
-      app.graph.setDirtyCanvas(true, true);
     }
   }
+  scheduleSelectorGlobalRefresh();
+  app.graph.setDirtyCanvas(true, true);
 });
 
 // ---------- Cycler ----------
-const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
 function cyclerRects(node) {
   const filterY = 35;
   const filter = [{ status: "all", x: 8, y: filterY, w: 54, h: 24 }];
@@ -1377,7 +1352,12 @@ async function pushCyclerFlags(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_flags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(tabPayload({ node_id: node.id, use_local_list: !!node.__hpsUseLocalList })),
+    body: JSON.stringify(tabPayload({
+      node_id: node.id,
+      use_local_list: !!node.__hpsUseLocalList,
+      settings_revision: node.__hpsSettingsRevision ?? 0,
+      ...getCyclerRuntimeControls(node),
+    })),
   });
 }
 async function pushCyclerFilter(node) {
@@ -1385,7 +1365,12 @@ async function pushCyclerFilter(node) {
   await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_filter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(tabPayload({ node_id: node.id, statuses: cyclerActiveFilter(node) })),
+    body: JSON.stringify(tabPayload({
+      node_id: node.id,
+      statuses: cyclerActiveFilter(node),
+      settings_revision: node.__hpsSettingsRevision ?? 0,
+      ...getCyclerRuntimeControls(node),
+    })),
   });
 }
 async function clearLocalList(node) {
@@ -1413,36 +1398,44 @@ function setupCyclerNode(nodeType) {
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 560, 260);
-    this.__hpsUseLocalList = true;
-    this.__hpsFilterStatuses = [];
     restoreCyclerSettingsFromWidgets(this);
-    setTimeout(() => { restoreCyclerSettingsFromWidgets(this); pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
+    setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     restoreCyclerSettingsFromWidgets(this);
-    setTimeout(() => { restoreCyclerSettingsFromWidgets(this); pushCyclerFlags(this); pushCyclerFilter(this); }, 0);
+    setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
   nodeType.prototype.onDrawBackground = function (ctx) {
     if (origDraw) origDraw.apply(this, arguments);
     ensureHiddenTabIdWidget(this);
-    syncCyclerSettingsWidgets(this);
+    restoreCyclerSettingsFromWidgets(this);
     if (hpsNodeCollapsed(this)) return;
     const r = cyclerRects(this);
-    drawButton(ctx, r.localListToggle, this.__hpsUseLocalList ? "☑ Use Local List" : "☐ Use Local List", true, this.__hpsUseLocalList);
-    drawButton(ctx, r.clearLocalList, "Clear Local List", true, false);
     const active = cyclerActiveFilter(this);
-    for (const b of r.filter) {
-      if (b.status === "all") drawButton(ctx, b, "All", true, active.length === 0);
-      else drawButton(ctx, b, STATUS_ICON[b.status], true, active.includes(b.status));
-    }
     ctx.save();
+
+    drawButton(ctx, r.localListToggle, this.__hpsUseLocalList === false ? "Local List OFF" : "Local List ON", true, this.__hpsUseLocalList !== false);
+    drawButton(ctx, r.clearLocalList, "Clear Local List", true, false, "rgba(105,90,90,0.65)");
+    for (const b of r.filter) {
+      const isAll = b.status === "all";
+      const on = isAll ? active.length === 0 : active.includes(b.status);
+      drawButton(ctx, b, isAll ? "all" : STATUS_ICON[b.status], true, on);
+    }
+
+    ctx.fillStyle = "#aaa";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`filter: ${active.length ? active.join(", ") : "all"}`, 8, 78);
+    ctx.fillText(`settings revision: ${this.__hpsSettingsRevision ?? 0}`, 8, 96);
+
     ctx.fillStyle = "rgba(0,0,0,0.18)";
     ctx.fillRect(r.statusBox.x, r.statusBox.y, r.statusBox.w, r.statusBox.h);
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.strokeRect(r.statusBox.x, r.statusBox.y, r.statusBox.w, r.statusBox.h);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px monospace";
     const lines = (this.__hpsCyclerStatus || "Current: (not executed yet)").split("\n");
@@ -1455,6 +1448,7 @@ function setupCyclerNode(nodeType) {
     const r = cyclerRects(this);
     if (hitAny(this, pos, r.localListToggle)) {
       this.__hpsUseLocalList = !this.__hpsUseLocalList;
+      bumpCyclerSettingsRevision(this);
       syncCyclerSettingsWidgets(this);
       pushCyclerFlags(this);
       app.graph.setDirtyCanvas(true, true);
@@ -1473,6 +1467,7 @@ function setupCyclerNode(nodeType) {
         if (set.has(b.status)) set.delete(b.status); else set.add(b.status);
         this.__hpsFilterStatuses = CYCLER_FILTER_STATUSES.filter((x) => set.has(x));
       }
+      bumpCyclerSettingsRevision(this);
       syncCyclerSettingsWidgets(this);
       pushCyclerFilter(this);
       app.graph.setDirtyCanvas(true, true);
