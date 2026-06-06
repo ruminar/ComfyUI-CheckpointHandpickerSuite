@@ -58,6 +58,7 @@ function patchCheckpointTitle(node, prefix, ckptName, status = "none") {
 }
 
 const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
+const TAGGER_STATUS_ORDER = ["favorite", "nice", "keep", "delete"];
 const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
 const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
 
@@ -404,6 +405,10 @@ function statusIconDisplay(statuses) {
   return normalized.length ? normalized.map((status) => STATUS_ICON[status] || status).join("") : "all";
 }
 
+function selectorStatusIcon(status) {
+  return status && status !== "none" ? (STATUS_ICON[status] || "") : " ";
+}
+
 function applyCyclerStatePayload(node, detail) {
   if (!node || !detail) return;
   if (detail.active_filter !== undefined) {
@@ -419,6 +424,15 @@ function applyCyclerStatePayload(node, detail) {
     node.__hpsCyclerCkptName = detail.ckpt_name_str;
     node.__hpsCyclerStatusValue = detail.status || "none";
     setExecutionState(detail);
+  }
+  if (detail.filter_matches !== undefined) {
+    node.__hpsFilterMatches = Number(detail.filter_matches) || 0;
+  }
+  if (Array.isArray(detail.local_list_items)) {
+    node.__hpsLocalListItems = [...detail.local_list_items];
+  }
+  if (detail.local_list_count !== undefined) {
+    node.__hpsLocalListCount = Number(detail.local_list_count) || 0;
   }
   if (detail.status_text !== undefined) {
     node.__hpsCyclerStatus = detail.status_text;
@@ -1019,7 +1033,7 @@ async function pushSelectedToLocalList(node) {
     body: JSON.stringify(tabPayload({
       ckpt_name_str: selected,
       target_node_ids: (app.graph?._nodes || [])
-        .filter((n) => isNodeClass(n, CYCLER_CLASS))
+        .filter((n) => isNodeClass(n, CYCLER_CLASS) && n.__hpsUseLocalList !== false)
         .map((n) => n.id),
     })),
   });
@@ -1187,7 +1201,7 @@ function drawSelectorRows(ctx, node) {
     ctx.fillStyle = active ? "rgba(75,125,190,0.58)" : (i % 2 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.06)");
     ctx.fillRect(r.list.x + 1, y + 1, r.list.w - 2, ROW_H - 2);
     ctx.fillStyle = active ? "#fff" : "#ddd";
-    ctx.fillText(`${STATUS_ICON[status] || "—"} ${ckpt}`, r.list.x + 6, y + ROW_H / 2, r.list.w - 20);
+    ctx.fillText(`${selectorStatusIcon(status)} ${ckpt}`, r.list.x + 6, y + ROW_H / 2, r.list.w - 20);
   }
   const sb = selectorScrollbar(node);
   if (sb) {
@@ -1385,12 +1399,12 @@ function currentTaggerPath(node) {
   return node.__hpsTaggerPath || linkedInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
-  // Keep the controls below LiteGraph input pins/labels.
-  return STATUS_ORDER.map((status, i) => ({
+  // Keep the controls away from LiteGraph input pins/labels.
+  return TAGGER_STATUS_ORDER.map((status, i) => ({
     status,
-    x: 128 + i * 84,
-    y: 8,
-    w: 78,
+    x: 120 + i * 82,
+    y: 3,
+    w: 76,
     h: 26,
   }));
 }
@@ -1428,13 +1442,13 @@ function taggerCursorAt(node, local) {
 }
 
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 450, 130);
+  installMinSize(nodeType, 450, 90);
   installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 450, 130);
+    ensureSize(this, 450, 90);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -1467,10 +1481,10 @@ function setupTaggerNode(nodeType) {
     const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 78);
+    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 50);
     const msg = this.__hpsTaggerMessage || (current === "none" ? "Current: — none" : `Current: ${STATUS_ICON[current]} ${STATUS_LABEL[current]}`);
     ctx.fillStyle = current === "none" ? "#888" : "#ddd";
-    ctx.fillText(msg, 8, 96);
+    ctx.fillText(msg, 8, 70);
     if (this.size[1] >= 124 && current !== "none" && current !== "delete") {
       ctx.fillStyle = "#aaa";
       ctx.fillText("Delete is available only from none.", 8, 114);
