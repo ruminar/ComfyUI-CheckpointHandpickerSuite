@@ -798,7 +798,7 @@ function setupPreviewNode(nodeType) {
       const total = Math.max(1, Number(st.progress_total || st.max_preview_images || 1));
       const value = Math.max(0, Math.min(total, Number(st.progress_value || 0)));
       const barX = margin;
-      const barY = 52;
+      const barY = 0;
       const barW = Math.max(1, this.size[0] - margin * 2);
       const barH = 6;
       ctx.fillStyle = "rgba(255,255,255,0.14)";
@@ -894,13 +894,14 @@ function selectorRects(node) {
   const buttonY = 8;
   const buttonH = 24;
   const arrowW = 32;
-  const downX = Math.max(430, (node.size?.[0] || 520) - margin - arrowW);
-  const upX = downX - gap - arrowW;
   const refreshW = 102;
   const listOnlyW = 92;
+  const pushW = selectorActionMode(node) === "sync" ? 150 : 132;
   const pushX = margin + refreshW + gap + listOnlyW + gap;
-  const availablePushW = Math.max(140, upX - gap - pushX);
-  const pushW = Math.min(190, availablePushW);
+  // Keep scroll buttons close to the toolbar action buttons instead of anchoring
+  // them to the right edge. The right edge belongs to ComfyUI output pins.
+  const upX = pushX + pushW + gap;
+  const downX = upX + arrowW + gap;
   return {
     refreshAll: { x: margin, y: buttonY, w: refreshW, h: buttonH },
     listOnly: { x: margin + refreshW + gap, y: buttonY, w: listOnlyW, h: buttonH },
@@ -1062,7 +1063,7 @@ function selectorActionMode(node) {
 }
 
 function selectorActionLabel(node) {
-  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push to Local List";
+  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push Local";
 }
 
 async function loadSelector(node, mode = "list") {

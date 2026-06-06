@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -2088,7 +2089,15 @@ async def review_sync_checkpoint(request):
                 continue
             search_directory = target.get("search_directory")
             max_preview_images = _clamp_image_dir_max_images(target.get("max_preview_images", IMAGE_DIR_DEFAULT_MAX_IMAGES))
-            sheet, extra = _load_image_dir_preview(node_id, relpath, search_directory, tab_id=tab_id, send_progress=True, max_preview_images=max_preview_images)
+            sheet, extra = await asyncio.to_thread(
+                _load_image_dir_preview,
+                node_id,
+                relpath,
+                search_directory,
+                tab_id,
+                True,
+                max_preview_images,
+            )
             _store_preview_state(tab_id, node_id, relpath, status, node_class="ImageDirPreview")
             _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
             preview_count += 1
