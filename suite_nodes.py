@@ -21,7 +21,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
-# v8f: live Cycler runtime controls and execution snapshots.
+# v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -521,6 +521,8 @@ def _cycler_state_payload(state: dict) -> dict:
             local_items=valid_local_items,
             use_local_list=use_local,
         )
+        if snap.get("base_mode", mode_used) == "shuffle_once" or mode_used == "shuffle_once":
+            status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
     else:
         title = "Checkpoint Name Cycler"
         status_text = _build_cycler_idle_status_text("", state)
@@ -549,6 +551,8 @@ def _cycler_state_payload(state: dict) -> dict:
             "use_local_list": bool(controls.get("use_local_list", True)),
             "settings_revision": _parse_saved_int(controls.get("settings_revision"), 0),
         },
+        "runtime_controls_initialized": bool(state.get("runtime_controls_initialized", False)),
+        "shuffle_deck_remaining": len(state.get("shuffle_deck", [])),
         "mode": controls.get("mode", "increment"),
         "change_every": controls.get("change_every", 1),
         "start_checkpoint": controls.get("start_checkpoint", ""),
@@ -1188,21 +1192,31 @@ def _load_image_file(path: Path) -> Image.Image | None:
 
 def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", send_progress=True, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES):
     max_preview_images = _clamp_image_dir_max_images(max_preview_images)
-    if send_progress:
-        _send_image_dir_progress(node_id, relpath, tab_id, "Searching preview images...", 0, max_preview_images, max_preview_images)
+
+    def progress(value: int, total: int, message: str):
+        if send_progress:
+            _send_image_dir_progress(node_id, relpath, tab_id, message, value, total, max_preview_images)
+
+    progress(0, max_preview_images, "Searching preview images...")
     paths = _find_image_dir_candidates(relpath, search_directory)
     selected_paths = paths[:max_preview_images]
+    progress(len(selected_paths), max_preview_images, f"Found preview images {len(selected_paths)}/{max_preview_images}")
+
     images = []
+    total = len(selected_paths)
     for idx, path in enumerate(selected_paths, start=1):
-        if send_progress:
-            _send_image_dir_progress(node_id, relpath, tab_id, f"Loading preview image {idx}/{len(selected_paths)}", idx - 1, len(selected_paths), max_preview_images)
+        progress(idx - 1, max(1, total), f"Loading preview image {idx}/{total}")
         img = _load_image_file(path)
         if img is not None:
             images.append(img)
+        progress(idx, max(1, total), f"Loading preview image {idx}/{total}")
+
     def cb(value, total, message):
-        if send_progress:
-            _send_image_dir_progress(node_id, relpath, tab_id, message, value, total, max_preview_images)
+        progress(value, total, message)
+
     sheet, extra = _build_contact_sheet(images, progress_callback=cb, max_images=max_preview_images)
+    if sheet is not None:
+        progress(max_preview_images, max_preview_images, "Encoding preview image...")
     status = _get_status(relpath)
     extra.update({
         "node_class": "ImageDirPreview",
@@ -1211,6 +1225,9 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
         "status": status,
         "status_icon": STATUS_ICON[status],
         "message": f"{len(images)} image(s) found" if images else "no preview images found",
+        "progress_message": "Preview ready." if sheet is not None else "no preview images found",
+        "progress_value": max_preview_images,
+        "progress_total": max_preview_images,
         "search_directory": str(_safe_search_root(search_directory) or ""),
         "max_preview_images": max_preview_images,
         "source_paths": [str(p) for p in selected_paths],
@@ -1324,6 +1341,8 @@ def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -
     if use_local:
         lines.append(f"Local List: {local_count} item(s)")
         lines.extend(_build_local_list_lines(local_items))
+    if controls.get("mode") == "shuffle_once" or snap.get("base_mode") == "shuffle_once" or snap.get("mode_used") == "shuffle_once":
+        lines.append(f"Shuffle Deck Remaining: {len(state.get('shuffle_deck', []))}")
     return "\n".join(lines)
 
 
@@ -1438,6 +1457,12 @@ class CheckpointNameCycler:
             _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
             return ("", "", "checkpoint")
 
+        if start_checkpoint_used not in all_checkpoints:
+            # Backend fallback only. The frontend must still keep the visible
+            # combo value valid so ComfyUI's queue-time validation does not fail.
+            start_checkpoint_used = all_checkpoints[0]
+            controls = _set_runtime_controls(state, start_checkpoint=start_checkpoint_used, mark_initialized=bool(state.get("runtime_controls_initialized", False)))
+
         global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter)
         local_items = _valid_local_list(state.get("local_list", []))
         use_local_source = use_local_list and bool(local_items)
@@ -1501,13 +1526,37 @@ class CheckpointNameCycler:
                 return ckpt, all_checkpoints.index(ckpt)
 
             def draw_from_shuffle_deck():
-                deck = [x for x in state.get("shuffle_deck", []) if x in candidate_set]
+                # v8g: shuffle_once is a global shuffled increment.
+                # The deck is built from all checkpoints, while the active filter
+                # is applied when scanning the deck. Non-matching checkpoints are
+                # skipped AND consumed, matching increment's "cursor moved on"
+                # semantics without exposing an extra cursor UI.
+                all_set = set(all_checkpoints)
+                deck = [x for x in state.get("shuffle_deck", []) if x in all_set]
+
+                def refill_deck():
+                    fresh = list(all_checkpoints)
+                    random.shuffle(fresh)
+                    return fresh
+
                 if not deck:
-                    deck = candidates.copy()
-                    random.shuffle(deck)
-                ckpt = deck.pop(0)
+                    deck = refill_deck()
+
+                for _pass in range(2):
+                    while deck:
+                        ckpt = deck.pop(0)
+                        if ckpt in candidate_set:
+                            state["shuffle_deck"] = deck
+                            return ckpt
+                    # The remaining global deck had no item for the current
+                    # filter. Start a new global deck and scan once more.
+                    deck = refill_deck()
+
+                # Defensive fallback. This should be unreachable when candidates
+                # is non-empty, but keeps the node alive if checkpoint state
+                # changes under us.
                 state["shuffle_deck"] = deck
-                return ckpt
+                return candidates[0]
 
             if can_hold_last:
                 ckpt_name = last_ckpt
