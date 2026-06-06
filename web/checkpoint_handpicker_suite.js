@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// v8e: Local List queue consumption, UI restoration, and regression guardrails.
+// v8f: live Cycler runtime controls and execution snapshots.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
@@ -412,14 +412,28 @@ function selectorStatusIcon(status) {
 
 function applyCyclerStatePayload(node, detail) {
   if (!node || !detail) return;
-  if (detail.active_filter !== undefined) {
-    node.__hpsFilterStatuses = normalizeCyclerFilterStatuses(detail.active_filter);
+  const controls = detail.runtime_controls || {};
+  if (detail.active_filter !== undefined || controls.active_filter !== undefined) {
+    node.__hpsFilterStatuses = normalizeCyclerFilterStatuses(detail.active_filter ?? controls.active_filter);
   }
-  if (detail.use_local_list !== undefined) {
-    node.__hpsUseLocalList = !!detail.use_local_list;
+  if (detail.use_local_list !== undefined || controls.use_local_list !== undefined) {
+    node.__hpsUseLocalList = !!(detail.use_local_list ?? controls.use_local_list);
   }
-  if (detail.settings_revision !== undefined) {
-    node.__hpsSettingsRevision = parseSavedInt(detail.settings_revision, node.__hpsSettingsRevision ?? 0);
+  if (detail.settings_revision !== undefined || controls.settings_revision !== undefined) {
+    node.__hpsSettingsRevision = parseSavedInt(detail.settings_revision ?? controls.settings_revision, node.__hpsSettingsRevision ?? 0);
+  }
+  // Only apply visible runtime widgets when the backend explicitly returns them
+  // as runtime_controls. This keeps restore coherent while avoiding prompt-time
+  // stale values becoming authoritative.
+  if (detail.runtime_controls) {
+    node.__hpsApplyingRuntimePayload = true;
+    try {
+      if (controls.mode !== undefined) setWidgetValueIfDifferent(node, "mode", controls.mode);
+      if (controls.change_every !== undefined) setWidgetValueIfDifferent(node, "change_every", controls.change_every);
+      if (controls.start_checkpoint !== undefined && controls.start_checkpoint !== "") setWidgetValueIfDifferent(node, "start_checkpoint", controls.start_checkpoint);
+    } finally {
+      node.__hpsApplyingRuntimePayload = false;
+    }
   }
   if (detail.ckpt_name_str) {
     node.__hpsCyclerCkptName = detail.ckpt_name_str;
@@ -829,21 +843,42 @@ function hideSelectorWidget(node) {
 }
 function selectorRects(node) {
   const margin = 8;
+  const gap = 6;
+  const buttonY = 8;
+  const buttonH = 24;
+  const arrowW = 34;
+  const downX = Math.max(430, (node.size?.[0] || 520) - margin - arrowW);
+  const upX = downX - gap - arrowW;
+  const refreshW = 108;
+  const listOnlyW = 96;
+  const pushX = margin + refreshW + gap + listOnlyW + gap;
+  const pushW = Math.max(118, upX - gap - pushX);
   return {
-    refreshAll: { x: margin, y: 8, w: 110, h: 24 },
-    listOnly: { x: 124, y: 8, w: 104, h: 24 },
-    pushLocalList: { x: 236, y: 8, w: 154, h: 24 },
-    up: { x: 360, y: 8, w: 34, h: 24 },
-    down: { x: 400, y: 8, w: 34, h: 24 },
+    refreshAll: { x: margin, y: buttonY, w: refreshW, h: buttonH },
+    listOnly: { x: margin + refreshW + gap, y: buttonY, w: listOnlyW, h: buttonH },
+    pushLocalList: { x: pushX, y: buttonY, w: pushW, h: buttonH },
+    up: { x: upX, y: buttonY, w: arrowW, h: buttonH },
+    down: { x: downX, y: buttonY, w: arrowW, h: buttonH },
     list: { x: margin, y: 104, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
 function selectorItems(node) { return node.__hpsItems || []; }
 function selectorSelected(node) { return selectorWidget(node)?.value || node.__hpsSelected || ""; }
+function selectorStatusFor(node, ckptName) {
+  const item = selectorItems(node).find((entry) => entry.ckpt_name_str === ckptName);
+  return item?.status || "none";
+}
+
+function selectorTitleText(node, ckptName) {
+  if (!ckptName) return "Checkpoint List Selector";
+  const status = selectorStatusFor(node, ckptName);
+  return `Selector : ${titleDisplayForCheckpoint(ckptName, status)}`;
+}
+
 function setSelectorSelected(node, value) {
   const w = selectorWidget(node); if (w) w.value = value;
   node.__hpsSelected = value;
-  node.title = value ? `Selector : ${value}` : "Checkpoint List Selector";
+  node.title = selectorTitleText(node, value);
 }
 function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
@@ -1006,6 +1041,8 @@ async function refreshSelector(node, all = false) {
     const selected = selectorSelected(node);
     if (selected && !node.__hpsItems.find((x) => x.ckpt_name_str === selected) && node.__hpsItems.length) {
       setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
+    } else if (selectorSelected(node)) {
+      node.title = selectorTitleText(node, selectorSelected(node));
     }
 
     if (all) {
@@ -1542,6 +1579,9 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
       for (const item of selectorItems(node)) {
         if (item.ckpt_name_str === detail.ckpt_name_str) item.status = detail.status || "none";
       }
+      if (selectorSelected(node) === detail.ckpt_name_str) {
+        node.title = selectorTitleText(node, detail.ckpt_name_str);
+      }
     }
     if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
       node.__hpsPreviewStatus = detail.status || "none";
@@ -1553,7 +1593,12 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
       patchCheckpointTitle(node, "Tagger", detail.ckpt_name_str, node.__hpsTaggerStatus);
     }
     if (isNodeClass(node, CYCLER_CLASS) && node.__hpsCyclerCkptName === detail.ckpt_name_str) {
-      patchCheckpointTitle(node, "Cycler", detail.ckpt_name_str, detail.status || "none");
+      node.__hpsCyclerStatusValue = detail.status || "none";
+      const oldTitle = String(node.title || "");
+      const idx = oldTitle.indexOf(detail.ckpt_name_str);
+      if (idx >= 0) {
+        node.title = oldTitle.slice(0, idx) + titleDisplayForCheckpoint(detail.ckpt_name_str, detail.status || "none") + oldTitle.slice(idx + detail.ckpt_name_str.length);
+      }
     }
   }
   scheduleSelectorGlobalRefresh();
@@ -1605,6 +1650,49 @@ async function pushCyclerFilter(node) {
   const result = await response.json();
   if (result?.ok) applyCyclerStatePayload(node, result);
 }
+function schedulePushCyclerRuntimeControls(node) {
+  if (!node || node.__hpsApplyingRuntimePayload) return;
+  clearTimeout(node.__hpsRuntimePushTimer);
+  node.__hpsRuntimePushTimer = setTimeout(() => pushCyclerRuntimeControls(node), 120);
+}
+
+async function pushCyclerRuntimeControls(node) {
+  if (!node || node.__hpsApplyingRuntimePayload) return;
+  syncCyclerSettingsWidgets(node);
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/set_runtime_controls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(tabPayload({
+      node_id: node.id,
+      settings_revision: node.__hpsSettingsRevision ?? 0,
+      ...getCyclerRuntimeControls(node),
+    })),
+  });
+  const result = await response.json();
+  if (result?.ok) applyCyclerStatePayload(node, result);
+}
+
+function installCyclerRuntimeControlHooks(node) {
+  if (!node) return;
+  let installedAny = false;
+  for (const name of ["start_checkpoint", "mode", "change_every"]) {
+    const widget = getWidget(node, name);
+    if (!widget || widget.__hpsRuntimeHookInstalled) continue;
+    widget.__hpsRuntimeHookInstalled = true;
+    installedAny = true;
+    const originalCallback = widget.callback;
+    widget.callback = function (...args) {
+      const r = originalCallback ? originalCallback.apply(this, args) : undefined;
+      if (!node.__hpsApplyingRuntimePayload) {
+        bumpCyclerSettingsRevision(node);
+        schedulePushCyclerRuntimeControls(node);
+      }
+      return r;
+    };
+  }
+  if (installedAny) node.__hpsRuntimeHooksInstalled = true;
+}
+
 async function clearLocalList(node) {
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/cycler/clear_local_list`, {
     method: "POST",
@@ -1635,6 +1723,7 @@ function setupCyclerNode(nodeType) {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 560, 260);
     restoreCyclerSettingsFromWidgets(this);
+    installCyclerRuntimeControlHooks(this);
     setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
@@ -1642,6 +1731,7 @@ function setupCyclerNode(nodeType) {
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     restoreCyclerSettingsFromWidgets(this);
+    installCyclerRuntimeControlHooks(this);
     setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
@@ -1650,6 +1740,13 @@ function setupCyclerNode(nodeType) {
     if (origDraw) origDraw.apply(this, arguments);
     ensureHiddenTabIdWidget(this);
     restoreCyclerSettingsFromWidgets(this);
+    installCyclerRuntimeControlHooks(this);
+    const runtimeKey = JSON.stringify(getCyclerRuntimeControls(this));
+    if (!this.__hpsApplyingRuntimePayload && this.__hpsLastRuntimeControlsKey && this.__hpsLastRuntimeControlsKey !== runtimeKey) {
+      bumpCyclerSettingsRevision(this);
+      schedulePushCyclerRuntimeControls(this);
+    }
+    this.__hpsLastRuntimeControlsKey = runtimeKey;
     if (hpsNodeCollapsed(this)) return;
     const r = cyclerRects(this);
     const active = cyclerActiveFilter(this);

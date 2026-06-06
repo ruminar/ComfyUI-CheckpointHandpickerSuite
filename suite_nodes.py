@@ -21,7 +21,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
-# v8e: Local List queue consumption, UI restoration, and regression guardrails.
+# v8f: live Cycler runtime controls and execution snapshots.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -364,17 +364,35 @@ def _valid_change_every(value) -> int:
 
 def _get_default_cycler_state() -> dict:
     return {
-        "use_local_list": True,
-        "accept_queue": True,
+        # runtime_controls are the live controls used by the next execution.
+        # Python function arguments are only a fallback when the frontend state
+        # has not been initialized yet.
+        "runtime_controls": {
+            "mode": "increment",
+            "change_every": 1,
+            "start_checkpoint": "",
+            "active_filter": [],
+            "use_local_list": True,
+            "settings_revision": 0,
+        },
+        "runtime_controls_initialized": False,
+        # runtime_state: mutable execution inventory/decks/counters.
         "local_list": [],
         "local_index": 0,
         "override_queue": [],
-        "active_filter": [],
-        "settings_revision": 0,
         "current_index": 0,
         "repeat_count": 0,
         "cycle_count": 0,
         "shuffle_deck": [],
+        # last_execution_snapshot is the original record of the last checkpoint
+        # that was actually returned downstream. Local List contents are NOT
+        # stored here; they are a separate runtime_state ledger.
+        "last_execution_snapshot": None,
+        # legacy mirrors kept for old JS/payload compatibility.
+        "use_local_list": True,
+        "accept_queue": True,
+        "active_filter": [],
+        "settings_revision": 0,
         "last_ckpt_name": "",
         "last_normal_ckpt_name": "",
         "last_source": "cycle",
@@ -397,6 +415,72 @@ def _get_cycler_state(key: str) -> dict:
         return state
 
 
+def _runtime_controls_from_state(state: dict) -> dict:
+    raw = state.get("runtime_controls")
+    if not isinstance(raw, dict):
+        raw = {}
+    controls = {
+        "mode": _valid_mode(raw.get("mode", state.get("last_mode", "increment"))),
+        "change_every": _valid_change_every(raw.get("change_every", state.get("last_change_every", 1))),
+        "start_checkpoint": _normalize_relpath(raw.get("start_checkpoint", state.get("last_start_checkpoint", ""))),
+        "active_filter": _normalize_status_list(raw.get("active_filter", state.get("active_filter", []))),
+        "use_local_list": bool(raw.get("use_local_list", state.get("use_local_list", True))),
+        "settings_revision": _parse_saved_int(raw.get("settings_revision", state.get("settings_revision", 0)), 0),
+    }
+    state["runtime_controls"] = controls
+    # Keep legacy mirrors in sync. These mirrors are runtime controls, not last
+    # execution facts.
+    state["last_mode"] = controls["mode"]
+    state["last_change_every"] = controls["change_every"]
+    state["last_start_checkpoint"] = controls["start_checkpoint"]
+    state["active_filter"] = list(controls["active_filter"])
+    state["use_local_list"] = controls["use_local_list"]
+    state["accept_queue"] = controls["use_local_list"]
+    state["settings_revision"] = controls["settings_revision"]
+    return controls
+
+
+def _set_runtime_controls(state: dict, *, mode=None, change_every=None, start_checkpoint=None, active_filter=None, use_local_list=None, settings_revision=None, mark_initialized=True) -> dict:
+    controls = _runtime_controls_from_state(state)
+    if mode is not None:
+        controls["mode"] = _valid_mode(mode)
+    if change_every is not None:
+        controls["change_every"] = _valid_change_every(change_every)
+    if start_checkpoint is not None:
+        controls["start_checkpoint"] = _normalize_relpath(start_checkpoint)
+    if active_filter is not None:
+        controls["active_filter"] = _normalize_status_list(active_filter)
+    if use_local_list is not None:
+        controls["use_local_list"] = bool(use_local_list)
+    if settings_revision is not None:
+        controls["settings_revision"] = max(0, _parse_saved_int(settings_revision, controls.get("settings_revision", 0)))
+    state["runtime_controls"] = controls
+    if mark_initialized:
+        state["runtime_controls_initialized"] = True
+    return _runtime_controls_from_state(state)
+
+
+def _last_execution_snapshot(state: dict) -> dict:
+    snap = state.get("last_execution_snapshot")
+    if isinstance(snap, dict) and snap.get("ckpt_name"):
+        return snap
+    # Migrate old last_* fields if present.
+    ckpt = state.get("last_ckpt_name", "") or ""
+    if not ckpt:
+        return {}
+    return {
+        "ckpt_name": ckpt,
+        "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt),
+        "source": state.get("last_source", "cycle"),
+        "mode_used": state.get("last_mode", "increment"),
+        "base_mode": state.get("last_mode", "increment"),
+        "change_every_used": _valid_change_every(state.get("last_change_every", 1)),
+        "hold_index": max(0, _parse_saved_int(state.get("last_hold_index"), 0)),
+        "filter_used": list(state.get("active_filter", [])),
+        "fallback_all": False,
+    }
+
+
 def _should_accept_settings_update(state: dict, revision: int) -> tuple[bool, int]:
     revision = max(0, _parse_saved_int(revision, 0))
     current = max(0, _parse_saved_int(state.get("settings_revision"), 0))
@@ -406,23 +490,41 @@ def _should_accept_settings_update(state: dict, revision: int) -> tuple[bool, in
 
 
 def _cycler_state_payload(state: dict) -> dict:
-    ckpt = state.get("last_ckpt_name", "") or ""
+    controls = _runtime_controls_from_state(state)
+    snap = _last_execution_snapshot(state)
+    ckpt = snap.get("ckpt_name", "") or ""
     status = _get_status(ckpt) if ckpt else "none"
-    active_filter = list(state.get("active_filter", []))
+    active_filter = list(controls.get("active_filter", []))
     valid_local_items = _valid_local_list(state.get("local_list", []))
     local_count = len(valid_local_items)
     filter_matches = _filter_match_count(active_filter)
-    use_local = bool(state.get("use_local_list", True))
-    # Current job title/source is a snapshot of the last resolved job. Local List
-    # ON/OFF and Clear must not rewrite it; they only affect future selection and
-    # the pending Local List display.
-    display_source = "local_list" if state.get("last_source") == "local_list" else "cycle"
-    hold_index = max(0, _parse_saved_int(state.get("last_hold_index"), 0))
-    change_every = _valid_change_every(state.get("last_change_every", 1))
-    title = _build_cycler_title(display_source, ckpt, hold_index, change_every, active_filter, False, local_count if use_local else 0) if ckpt else "Checkpoint Name Cycler"
-    # Keep status_text derived from the current UI state so Local List ON/OFF
-    # immediately shows/hides the list without waiting for the next queue run.
-    status_text = _build_cycler_idle_status_text("", state)
+    use_local = bool(controls.get("use_local_list", True))
+
+    if ckpt:
+        display_source = snap.get("source", "cycle")
+        hold_index = max(0, _parse_saved_int(snap.get("hold_index"), 0))
+        change_every = _valid_change_every(snap.get("change_every_used", controls.get("change_every", 1)))
+        mode_used = snap.get("mode_used", controls.get("mode", "increment"))
+        fallback_all = bool(snap.get("fallback_all", False))
+        title = _build_cycler_title(display_source, ckpt, hold_index, change_every, active_filter, fallback_all, local_count if use_local else 0)
+        status_text = _build_cycler_status_text(
+            display_source,
+            ckpt,
+            active_filter,
+            fallback_all,
+            [],
+            hold_index,
+            change_every,
+            filter_matches,
+            local_count,
+            mode_used,
+            local_items=valid_local_items,
+            use_local_list=use_local,
+        )
+    else:
+        title = "Checkpoint Name Cycler"
+        status_text = _build_cycler_idle_status_text("", state)
+
     state["last_title"] = title
     state["last_status_text"] = status_text
     return {
@@ -432,16 +534,25 @@ def _cycler_state_payload(state: dict) -> dict:
         "status_icon": STATUS_ICON[status],
         "title": title,
         "status_text": status_text,
-        "use_local_list": bool(state.get("use_local_list", True)),
+        "use_local_list": bool(controls.get("use_local_list", True)),
         "active_filter": active_filter,
         "filter_matches": filter_matches,
         "filter_total": _checkpoint_total_count(),
-        "settings_revision": _parse_saved_int(state.get("settings_revision"), 0),
+        "settings_revision": _parse_saved_int(controls.get("settings_revision"), 0),
         "local_list_count": len(valid_local_items),
         "local_list_items": valid_local_items,
-        "mode": state.get("last_mode", "increment"),
-        "change_every": state.get("last_change_every", 1),
-        "start_checkpoint": state.get("last_start_checkpoint", ""),
+        "runtime_controls": {
+            "mode": controls.get("mode", "increment"),
+            "change_every": controls.get("change_every", 1),
+            "start_checkpoint": controls.get("start_checkpoint", ""),
+            "active_filter": active_filter,
+            "use_local_list": bool(controls.get("use_local_list", True)),
+            "settings_revision": _parse_saved_int(controls.get("settings_revision"), 0),
+        },
+        "mode": controls.get("mode", "increment"),
+        "change_every": controls.get("change_every", 1),
+        "start_checkpoint": controls.get("start_checkpoint", ""),
+        "last_execution_snapshot": snap,
         "execution_revision": state.get("execution_revision", 0),
     }
 
@@ -1135,7 +1246,11 @@ def _checkpoint_total_count() -> int:
 
 
 def _build_local_list_lines(local_items: list[str], max_items: int = 20) -> list[str]:
-    shown = list(local_items[:max_items])
+    shown = []
+    for item in list(local_items[:max_items]):
+        status = _get_status(item)
+        icon = STATUS_ICON[status] if status != "none" else " "
+        shown.append(f"{icon} {item}")
     if len(local_items) > max_items:
         shown.append(f"... and {len(local_items) - max_items} more")
     return shown
@@ -1145,8 +1260,8 @@ def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filt
     status = _get_status(ckpt_name) if ckpt_name else "none"
     icon = STATUS_ICON[status] if status != "none" else ""
     prefix = "Cycler"
-    if active_filter:
-        prefix += f" [{_status_icons_for_filter(active_filter)}]"
+    # Filter state is shown by the filter buttons and the status panel. Do not
+    # duplicate it in the title.
     if fallback_all:
         prefix += " [fallback all]"
     if source == "local_list" and local_count > 0:
@@ -1159,9 +1274,10 @@ def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filt
 
 def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True) -> str:
     status = _get_status(ckpt_name) if ckpt_name else "none"
+    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (none)")
     display_mode = "local list" if source == "local_list" else mode
     lines = [
-        f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (none)",
+        current,
         f"Mode: {display_mode}" if source == "local_list" else f"Mode: {mode}  Hold: {hold_index}/{change_every}",
         f"Filter: {_filter_display(active_filter)}  Matches: {match_count} / {_checkpoint_total_count()}",
     ]
@@ -1177,19 +1293,29 @@ def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, qu
 
 
 def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -> str:
-    """Build a status panel for UI-only operations such as Push/Clear Local List."""
-    ckpt_name = state.get("last_ckpt_name", "") or ""
+    """Build a status panel for UI-only operations such as Push/Clear Local List.
+
+    This is a synthesized display: last_execution_snapshot provides the current
+    job, runtime_controls provide the live filter/mode settings, and Local List
+    comes from runtime_state.
+    """
+    controls = _runtime_controls_from_state(state)
+    snap = _last_execution_snapshot(state)
+    ckpt_name = snap.get("ckpt_name", "") or ""
     status = _get_status(ckpt_name) if ckpt_name else "none"
-    active_filter = list(state.get("active_filter", []))
+    active_filter = list(controls.get("active_filter", []))
     local_items = _valid_local_list(state.get("local_list", []))
     local_count = len(local_items)
-    mode = state.get("last_mode", "increment")
-    hold_index = max(0, _parse_saved_int(state.get("last_hold_index"), 0))
-    change_every = _valid_change_every(state.get("last_change_every", 1))
-    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if ckpt_name else "Current: (not executed yet)"
-    use_local = bool(state.get("use_local_list", True))
-    local_job_active = state.get("last_source") == "local_list"
-    mode_line = "Mode: local list" if local_job_active else f"Mode: {mode}  Hold: {hold_index}/{change_every}"
+    mode = controls.get("mode", "increment")
+    current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (not executed yet)")
+    use_local = bool(controls.get("use_local_list", True))
+    local_job_active = snap.get("source") == "local_list"
+    if local_job_active:
+        mode_line = "Mode: local list"
+    else:
+        hold_index = max(0, _parse_saved_int(snap.get("hold_index"), 0))
+        change_every = _valid_change_every(snap.get("change_every_used", controls.get("change_every", 1)))
+        mode_line = f"Mode: {snap.get('mode_used', mode)}  Hold: {hold_index}/{change_every}" if ckpt_name else f"Mode: {mode}"
     lines = [
         current,
         mode_line,
@@ -1270,18 +1396,38 @@ class CheckpointNameCycler:
         node_id = str(unique_id or "")
         key = _state_key(tab_id, node_id)
         state = _get_cycler_state(key)
-        mode = _valid_mode(mode)
-        change_every = _valid_change_every(change_every)
-        active_filter = _normalize_status_list(hps_filter_statuses)
-        use_local_list = _parse_saved_bool(hps_use_local_list, bool(state.get("use_local_list", True)))
-        revision = _parse_saved_int(hps_settings_revision, _parse_saved_int(state.get("settings_revision"), 0))
 
-        accepted, revision = _should_accept_settings_update(state, revision)
-        if accepted:
-            state["settings_revision"] = revision
-            state["active_filter"] = active_filter
-            state["use_local_list"] = use_local_list
-            state["accept_queue"] = use_local_list
+        prompt_mode = _valid_mode(mode)
+        prompt_change_every = _valid_change_every(change_every)
+        prompt_filter = _normalize_status_list(hps_filter_statuses)
+        prompt_use_local_list = _parse_saved_bool(hps_use_local_list, bool(_runtime_controls_from_state(state).get("use_local_list", True)))
+        prompt_start_checkpoint = _normalize_relpath(start_checkpoint)
+        prompt_revision = _parse_saved_int(hps_settings_revision, _runtime_controls_from_state(state).get("settings_revision", 0))
+
+        controls = _runtime_controls_from_state(state)
+        current_revision = _parse_saved_int(controls.get("settings_revision"), 0)
+        # First execution can seed runtime_controls from prompt arguments. After
+        # that, prompt JSON is treated as a stale fallback unless its revision is
+        # newer than the backend runtime state.
+        if not state.get("runtime_controls_initialized") or prompt_revision > current_revision:
+            controls = _set_runtime_controls(
+                state,
+                mode=prompt_mode,
+                change_every=prompt_change_every,
+                start_checkpoint=prompt_start_checkpoint,
+                active_filter=prompt_filter,
+                use_local_list=prompt_use_local_list,
+                settings_revision=max(prompt_revision, current_revision),
+                mark_initialized=True,
+            )
+        else:
+            controls = _runtime_controls_from_state(state)
+
+        mode = _valid_mode(controls.get("mode", prompt_mode))
+        change_every = _valid_change_every(controls.get("change_every", prompt_change_every))
+        active_filter = _normalize_status_list(controls.get("active_filter", prompt_filter))
+        use_local_list = bool(controls.get("use_local_list", prompt_use_local_list))
+        start_checkpoint_used = _normalize_relpath(controls.get("start_checkpoint") or prompt_start_checkpoint)
 
         all_checkpoints = _get_checkpoint_list()
         if not all_checkpoints:
@@ -1292,9 +1438,9 @@ class CheckpointNameCycler:
             _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
             return ("", "", "checkpoint")
 
-        global_candidates, fallback_all, global_match_count = _candidate_checkpoints(state.get("active_filter", []))
+        global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter)
         local_items = _valid_local_list(state.get("local_list", []))
-        use_local_source = bool(state.get("use_local_list", True)) and bool(local_items)
+        use_local_source = use_local_list and bool(local_items)
         candidates = local_items if use_local_source else global_candidates
         if not candidates:
             candidates = all_checkpoints
@@ -1302,7 +1448,7 @@ class CheckpointNameCycler:
         candidate_set = set(candidates)
 
         def start_index() -> int:
-            requested = _normalize_relpath(start_checkpoint)
+            requested = _normalize_relpath(start_checkpoint_used)
             if requested in all_checkpoints:
                 return all_checkpoints.index(requested)
             return 0
@@ -1312,28 +1458,26 @@ class CheckpointNameCycler:
         selected_index = 0
 
         if use_local_source:
-            # Local List is a manual per-Cycler queue. It must not advance the
-            # normal change_every/repeat/shuffle state, and it must consume one
-            # queued entry per execution. Duplicates are allowed and consumed
-            # independently.
+            # Manual Local List queue. It is a runtime_state ledger, not part of
+            # last_execution_snapshot. Consume exactly one item per execution.
             ckpt_name = local_items[0]
             remaining_local_items = local_items[1:]
             state["local_list"] = remaining_local_items
             state["override_queue"] = remaining_local_items
             state["local_index"] = 0
             selected_index = all_checkpoints.index(ckpt_name)
-            title = _build_cycler_title("local_list", ckpt_name, 1, change_every, state.get("active_filter", []), False, len(remaining_local_items))
+            title = _build_cycler_title("local_list", ckpt_name, 1, change_every, active_filter, False, len(remaining_local_items))
             status_text = _build_cycler_status_text(
                 "local_list",
                 ckpt_name,
-                state.get("active_filter", []),
+                active_filter,
                 False,
                 [],
                 1,
                 change_every,
                 global_match_count,
                 len(remaining_local_items),
-                mode,
+                "local list",
                 local_items=remaining_local_items,
                 use_local_list=True,
             )
@@ -1370,7 +1514,7 @@ class CheckpointNameCycler:
                 selected_index = all_checkpoints.index(ckpt_name)
             else:
                 if mode == "fixed":
-                    requested = _normalize_relpath(start_checkpoint)
+                    requested = _normalize_relpath(start_checkpoint_used)
                     ckpt_name = requested if requested in candidate_set else candidates[0]
                     selected_index = all_checkpoints.index(ckpt_name)
                 elif mode == "randomize":
@@ -1398,11 +1542,11 @@ class CheckpointNameCycler:
                 state["current_index"] = selected_index
 
             state["last_normal_ckpt_name"] = ckpt_name
-            title = _build_cycler_title("cycle", ckpt_name, hold_index, change_every, state.get("active_filter", []), fallback_all and mode != "fixed", len(local_items) if state.get("use_local_list", True) else 0)
+            title = _build_cycler_title("cycle", ckpt_name, hold_index, change_every, active_filter, fallback_all and mode != "fixed", len(local_items) if use_local_list else 0)
             status_text = _build_cycler_status_text(
                 "cycle",
                 ckpt_name,
-                state.get("active_filter", []),
+                active_filter,
                 fallback_all and mode != "fixed",
                 [],
                 hold_index,
@@ -1411,20 +1555,42 @@ class CheckpointNameCycler:
                 len(local_items),
                 mode,
                 local_items=local_items,
-                use_local_list=bool(state.get("use_local_list", True)),
+                use_local_list=use_local_list,
             )
             if mode == "shuffle_once":
                 status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
 
+        status = _get_status(ckpt_name)
+        snapshot = {
+            "ckpt_name": ckpt_name,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
+            "source": source,
+            "mode_used": "local_list" if use_local_source else mode,
+            "base_mode": mode,
+            "change_every_used": change_every,
+            "filter_used": list(active_filter),
+            "use_local_list_used": use_local_list,
+            "fallback_all": False if use_local_source else (fallback_all and mode != "fixed"),
+            "matches_at_resolve": global_match_count,
+            "local_list_count_after": len(local_items),
+            "hold_index": hold_index,
+            "hold_total": change_every,
+            "status": status,
+            "status_icon": STATUS_ICON[status],
+            "title": title,
+            "status_text": status_text,
+        }
+        state["last_execution_snapshot"] = snapshot
         state["last_ckpt_name"] = ckpt_name
         state["last_source"] = source
         state["last_title"] = title
         state["last_status_text"] = status_text
         state["last_hold_index"] = hold_index
+        # Mirrors of runtime controls, not queue-prompt arguments.
         state["last_change_every"] = change_every
         state["last_mode"] = mode
-        state["last_start_checkpoint"] = _normalize_relpath(start_checkpoint)
-        status = _get_status(ckpt_name)
+        state["last_start_checkpoint"] = start_checkpoint_used
+
         exec_state = _store_tab_execution_state(tab_id, {
             "node": int(unique_id) if unique_id is not None else None,
             "node_class": "CheckpointNameCycler",
@@ -1437,16 +1603,19 @@ class CheckpointNameCycler:
             "mode_used": "local_list" if use_local_source else mode,
             "base_mode": mode,
             "change_every": change_every,
-            "change_every_used": 1 if use_local_source else change_every,
-            "filter_used": list(state.get("active_filter", [])),
+            "change_every_used": change_every,
+            "filter_used": list(active_filter),
             "fallback_all": False if use_local_source else (fallback_all and mode != "fixed"),
             "matches_at_resolve": global_match_count,
             "local_list_count": len(local_items),
             "hold_index": hold_index,
             "title": title,
             "status_text": status_text,
+            "last_execution_snapshot": snapshot,
         })
         state["execution_revision"] = exec_state.get("execution_revision", 0)
+        snapshot["execution_revision"] = state["execution_revision"]
+        state["last_execution_snapshot"] = snapshot
         _send_cycler_update(
             node_id,
             title,
@@ -1465,6 +1634,10 @@ class CheckpointNameCycler:
             local_list_items=list(local_items),
             filter_matches=global_match_count,
             filter_total=_checkpoint_total_count(),
+            active_filter=list(active_filter),
+            use_local_list=use_local_list,
+            runtime_controls=controls,
+            last_execution_snapshot=snapshot,
             execution_revision=state["execution_revision"],
         )
         return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
@@ -1711,6 +1884,31 @@ async def tagger_set_status(request):
     })
 
 
+@routes.post(f"/{EXTENSION_PREFIX}/cycler/set_runtime_controls")
+async def cycler_set_runtime_controls(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state = _get_cycler_state(_state_key(tab_id, node_id))
+    revision = _parse_saved_int(data.get("settings_revision"), _runtime_controls_from_state(state).get("settings_revision", 0))
+    accepted, revision = _should_accept_settings_update(state, revision)
+    if accepted:
+        _set_runtime_controls(
+            state,
+            mode=data.get("mode") if "mode" in data else None,
+            change_every=data.get("change_every") if "change_every" in data else None,
+            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
+            active_filter=data.get("active_filter") if "active_filter" in data else None,
+            use_local_list=bool(data.get("use_local_list")) if "use_local_list" in data else None,
+            settings_revision=revision,
+            mark_initialized=True,
+        )
+    _send_cycler_state_update(node_id, state, tab_id=tab_id)
+    payload = _cycler_state_payload(state)
+    payload.update({"ok": True, "accepted": accepted, "node_id": node_id})
+    return web.json_response(payload)
+
+
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/set_flags")
 async def cycler_set_flags(request):
     data = await request.json()
@@ -1720,16 +1918,15 @@ async def cycler_set_flags(request):
     revision = _parse_saved_int(data.get("settings_revision"), _parse_saved_int(state.get("settings_revision"), 0))
     accepted, revision = _should_accept_settings_update(state, revision)
     if accepted:
-        if "use_local_list" in data:
-            state["use_local_list"] = bool(data.get("use_local_list"))
-            state["accept_queue"] = state["use_local_list"]
-        if "mode" in data:
-            state["last_mode"] = _valid_mode(data.get("mode"))
-        if "change_every" in data:
-            state["last_change_every"] = _valid_change_every(data.get("change_every"))
-        if "start_checkpoint" in data:
-            state["last_start_checkpoint"] = _normalize_relpath(data.get("start_checkpoint", ""))
-        state["settings_revision"] = revision
+        _set_runtime_controls(
+            state,
+            mode=data.get("mode") if "mode" in data else None,
+            change_every=data.get("change_every") if "change_every" in data else None,
+            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
+            use_local_list=bool(data.get("use_local_list")) if "use_local_list" in data else None,
+            settings_revision=revision,
+            mark_initialized=True,
+        )
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
     payload = _cycler_state_payload(state)
     payload.update({"ok": True, "accepted": accepted, "use_local_list": state["use_local_list"]})
@@ -1746,18 +1943,19 @@ async def cycler_set_filter(request):
     revision = _parse_saved_int(data.get("settings_revision"), _parse_saved_int(state.get("settings_revision"), 0))
     accepted, revision = _should_accept_settings_update(state, revision)
     if accepted:
-        state["active_filter"] = statuses.copy()
-        if "mode" in data:
-            state["last_mode"] = _valid_mode(data.get("mode"))
-        if "change_every" in data:
-            state["last_change_every"] = _valid_change_every(data.get("change_every"))
-        if "start_checkpoint" in data:
-            state["last_start_checkpoint"] = _normalize_relpath(data.get("start_checkpoint", ""))
-        state["settings_revision"] = revision
+        _set_runtime_controls(
+            state,
+            mode=data.get("mode") if "mode" in data else None,
+            change_every=data.get("change_every") if "change_every" in data else None,
+            start_checkpoint=data.get("start_checkpoint", "") if "start_checkpoint" in data else None,
+            active_filter=statuses.copy(),
+            settings_revision=revision,
+            mark_initialized=True,
+        )
     _send_cycler_state_update(node_id, state, tab_id=tab_id)
     logger.info("[CheckpointHandpickerSuite] Updated cycler filter for tab %s node %s: %s accepted=%s", tab_id, node_id, statuses or ["All"], accepted)
     payload = _cycler_state_payload(state)
-    payload.update({"ok": True, "accepted": accepted, "node_id": node_id, "statuses": state.get("active_filter", [])})
+    payload.update({"ok": True, "accepted": accepted, "node_id": node_id, "statuses": _runtime_controls_from_state(state).get("active_filter", [])})
     return web.json_response(payload)
 
 
