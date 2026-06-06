@@ -521,9 +521,12 @@ def _cycler_state_payload(state: dict) -> dict:
             mode_used,
             local_items=valid_local_items,
             use_local_list=use_local,
+            shuffle_deck_remaining=(
+                len(state.get("shuffle_deck", []))
+                if display_source != "local_list" and (snap.get("base_mode", mode_used) == "shuffle_once" or mode_used == "shuffle_once")
+                else None
+            ),
         )
-        if display_source != "local_list" and (snap.get("base_mode", mode_used) == "shuffle_once" or mode_used == "shuffle_once"):
-            status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
     else:
         title = "Checkpoint Name Cycler"
         status_text = _build_cycler_idle_status_text("", state)
@@ -1301,7 +1304,7 @@ def _build_local_list_lines(local_items: list[str], max_items: int = 20) -> list
     for index, item in enumerate(list(local_items[:max_items]), start=1):
         status = _get_status(item)
         icon = STATUS_ICON[status] if status != "none" else " "
-        shown.append(f"{index}. {icon} {item}")
+        shown.append(f"{index:>2}. {icon} {item}")
     if len(local_items) > max_items:
         shown.append(f"... and {len(local_items) - max_items} more")
     return shown
@@ -1323,7 +1326,7 @@ def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filt
     return f"{prefix} : {body} ({hold_index}/{change_every})"
 
 
-def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True) -> str:
+def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True, shuffle_deck_remaining=None) -> str:
     status = _get_status(ckpt_name) if ckpt_name else "none"
     current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (none)")
     display_mode = "local list" if source == "local_list" else mode
@@ -1334,6 +1337,8 @@ def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, qu
     ]
     if fallback_all:
         lines.append("Filter fallback: all checkpoints")
+    if shuffle_deck_remaining is not None:
+        lines.append(f"Shuffle Deck Remaining: {shuffle_deck_remaining}")
     if use_local_list and local_count > 0:
         items = list(local_items or [])
         lines.append(f"Local List Remaining: {local_count} item(s)")
@@ -1372,11 +1377,11 @@ def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -
         mode_line,
         f"Filter: {_filter_display(active_filter)}  Matches: {_filter_match_count(active_filter)} / {_checkpoint_total_count()}",
     ]
+    if (not local_job_active) and (controls.get("mode") == "shuffle_once" or snap.get("base_mode") == "shuffle_once" or snap.get("mode_used") == "shuffle_once"):
+        lines.append(f"Shuffle Deck Remaining: {len(state.get('shuffle_deck', []))}")
     if use_local and local_count > 0:
         lines.append(f"Local List Remaining: {local_count} item(s)")
         lines.extend(_build_local_list_lines(local_items))
-    if (not local_job_active) and (controls.get("mode") == "shuffle_once" or snap.get("base_mode") == "shuffle_once" or snap.get("mode_used") == "shuffle_once"):
-        lines.append(f"Shuffle Deck Remaining: {len(state.get('shuffle_deck', []))}")
     return "\n".join(lines)
 
 
@@ -1539,6 +1544,7 @@ class CheckpointNameCycler:
                 "local list",
                 local_items=remaining_local_items,
                 use_local_list=True,
+                shuffle_deck_remaining=None,
             )
             local_items = remaining_local_items
         else:
@@ -1639,9 +1645,8 @@ class CheckpointNameCycler:
                 mode,
                 local_items=local_items,
                 use_local_list=use_local_list,
+                shuffle_deck_remaining=len(state.get("shuffle_deck", [])) if mode == "shuffle_once" else None,
             )
-            if mode == "shuffle_once":
-                status_text += f"\nShuffle Deck Remaining: {len(state.get('shuffle_deck', []))}"
 
         status = _get_status(ckpt_name)
         snapshot = {
