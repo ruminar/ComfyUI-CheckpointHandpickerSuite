@@ -774,10 +774,10 @@ function setupPreviewNode(nodeType) {
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
     const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 122 : 30;
+    const top = isImageDir ? 72 : 30;
     const margin = 8;
-    const messageX = isImageDir ? margin : Math.min(140, Math.max(margin, this.size[0] - 80));
-    const captionY = isImageDir ? 108 : 20;
+    const messageX = Math.min(140, Math.max(margin, this.size[0] - 80));
+    const captionY = isImageDir ? 36 : 20;
     const messageW = Math.max(1, this.size[0] - messageX - margin);
     const w = Math.max(1, this.size[0] - margin * 2);
     const h = Math.max(1, this.size[1] - top - margin);
@@ -786,8 +786,8 @@ function setupPreviewNode(nodeType) {
       const st = this.__hpsPreviewState || {};
       const isWarning = st.status && !["ready", "loading"].includes(st.status);
       if (isImageDir) {
-        ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.28)";
-        ctx.fillRect(messageX - 4, captionY - 14, messageW + 8, 20);
+        ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.18)";
+        ctx.fillRect(messageX - 4, captionY - 13, messageW + 4, 18);
       }
       ctx.fillStyle = isWarning ? "#FFD28A" : "#ddd";
       ctx.font = "12px sans-serif";
