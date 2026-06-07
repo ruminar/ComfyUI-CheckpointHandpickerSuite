@@ -1604,6 +1604,9 @@ function setupTaggerNode(nodeType) {
     if (current !== "none" && current !== "delete") {
       ctx.fillStyle = "#aaa";
       ctx.fillText("Delete is available only from none.", 8, 90);
+    } else if (current === "delete") {
+      ctx.fillStyle = "#aaa";
+      ctx.fillText("Run exported script in temp. (Asks [y/N] before deletion.)", 8, 90);
     }
     ctx.restore();
   };
