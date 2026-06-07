@@ -1,22 +1,21 @@
-# ComfyUI-CheckpointHandpickerSuite v0.1.2
+# ComfyUI-CheckpointHandpickerSuite 0.1.3
 
-## v0.1.2 - Cycler filter persistence and UI collapse fixes
+Stability and UI refinement release for Cycler, Selector, Tagger, and ImageDirPreview.
 
-This is a bugfix release for Cycler workflow persistence and collapsed node UI behavior.
+## Fixed
 
-### Fixed
+- Fixed a regression where Cycler filters could reset when switching tabs after the 0.1.2 filter persistence fix.
+- Fixed Cycler title/status synchronization issues.
+- Fixed stale Local List status icons after Tagger updates.
+- Fixed Cycler title icon accumulation.
+- Fixed ImageDirPreview progress display positioning.
+- Restored the full `Push to Local List` selector button label.
+- Confirmed delete script export and refresh behavior.
 
-- Fixed an issue where `Checkpoint Name Cycler` status filter settings were reset after saving, loading, switching tabs, or frontend redraws.
-- `Use Local List` ON/OFF state is now preserved with the workflow.
-- Runtime-only state such as Local List contents, current index, repeat count, and shuffle deck is intentionally not saved.
-- Fixed custom controls remaining visible when Suite nodes are collapsed.
+## Improved
 
-## Highlights
+- Added numbered Local List entries in Cycler status.
+- Improved Cycler status layout for current checkpoint, mode, source, filter, shuffle deck, and local list information.
+- Improved Tagger `none` display readability.
 
-- Checkpoint Name Cycler for batch checkpoint cycling
-- Checkpoint List Selector for review and Local List workflows
-- Checkpoint Status Tagger for favorite / nice / keep / delete-reserved tagging
-- Ephemeral Preview for zero-disk preview display
-- ImageDir Preview for output-folder review contact sheets
-- Tab-local UI operation with shared checkpoint status
-- Safe cleanup flow using delete reservation and confirmation script
+This release is primarily a regression-fix and UI stabilization update.
