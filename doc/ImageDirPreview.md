@@ -12,7 +12,7 @@
 
 ### 📥 入力（Inputs）
 
-* **`ckpt_name_str` (必須 / STRING):**
+* **`ckpt_name` (必須 / COMBO):**
 逆探知の鍵（ターゲット）となるCheckpointのファイルパス文字列。`Checkpoint List Selector`（頭脳）から無線バインドされることで、選んだモデルの画像を瞬時に引き出すぞ。
 
 * **`search_directory` (任意 / STRING):**

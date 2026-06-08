@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
+// v9a / 0.2.0: checkpoint-name interface cleanup. ckpt_name is canonical; ckpt_name_str is removed.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
@@ -25,10 +25,10 @@ function getExecutionState() {
 }
 
 function setExecutionState(detail) {
-  if (!detail?.ckpt_name_str) return;
+  if (!detail?.ckpt_name) return;
   const status = detail.status || "none";
   hpsExecutionStore()[HPS_TAB_ID] = {
-    ckpt_name_str: detail.ckpt_name_str,
+    ckpt_name: detail.ckpt_name,
     status,
     status_icon: detail.status_icon || STATUS_ICON[status] || "",
     cycler_node_id: detail.node ?? null,
@@ -104,7 +104,7 @@ function outputNames(node) {
 
 function hasSelectorOutputs(node) {
   const names = outputNames(node);
-  return names.includes("ckpt_name") && names.includes("ckpt_name_str");
+  return names.includes("ckpt_name") && names.includes("ckpt_name_safe");
 }
 
 function hasLoaderOutputs(node) {
@@ -302,7 +302,7 @@ async function checkpointValuesFromRefreshPayload(result) {
   }
   const fallback = await checkpointValuesFromObjectInfoFallback();
   if (fallback.length) return fallback;
-  if (Array.isArray(result?.items)) return result.items.map((item) => item.ckpt_name_str).filter(Boolean);
+  if (Array.isArray(result?.items)) return result.items.map((item) => item.ckpt_name).filter(Boolean);
   return [];
 }
 
@@ -462,8 +462,8 @@ function applyCyclerStatePayload(node, detail) {
       }
     }
   }
-  if (detail.ckpt_name_str) {
-    node.__hpsCyclerCkptName = detail.ckpt_name_str;
+  if (detail.ckpt_name) {
+    node.__hpsCyclerCkptName = detail.ckpt_name;
     node.__hpsCyclerStatusValue = detail.status || "none";
     setExecutionState(detail);
   }
@@ -718,19 +718,19 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
     if (!result?.ok) return;
 
     if (nodeClass === "EphemeralPreview") {
-      if (result.ckpt_name_str) {
-        node.__hpsPreviewCkptName = result.ckpt_name_str;
+      if (result.ckpt_name) {
+        node.__hpsPreviewCkptName = result.ckpt_name;
         node.__hpsPreviewStatus = result.status || "none";
-        setPreviewTitleFromCheckpoint(node, result.ckpt_name_str, result.status || "none");
+        setPreviewTitleFromCheckpoint(node, result.ckpt_name, result.status || "none");
       }
     } else if (nodeClass === TAGGER_CLASS) {
-      if (result.ckpt_name_str) {
-        node.__hpsTaggerPath = result.ckpt_name_str;
+      if (result.ckpt_name) {
+        node.__hpsTaggerPath = result.ckpt_name;
         node.__hpsTaggerStatus = result.status || "none";
         node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
         node.title = node.__hpsTaggerStatus === "none"
-          ? `Tagger : ${result.ckpt_name_str}`
-          : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${result.ckpt_name_str}`;
+          ? `Tagger : ${result.ckpt_name}`
+          : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${result.ckpt_name}`;
       }
     } else if (nodeClass === CYCLER_CLASS) {
       if (result.runtime_controls_initialized === false) {
@@ -843,7 +843,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   const isEphemeral = isNodeClass(node, "EphemeralPreview");
   if (isEphemeral && detail.image) {
     const execution = getExecutionState();
-    const ckptName = detail.ckpt_name_str || execution?.ckpt_name_str || "";
+    const ckptName = detail.ckpt_name || execution?.ckpt_name || "";
     if (ckptName) {
       node.__hpsPreviewCkptName = ckptName;
       node.__hpsPreviewStatus = detail.status || execution?.status || "none";
@@ -914,7 +914,7 @@ function selectorRects(node) {
 function selectorItems(node) { return node.__hpsItems || []; }
 function selectorSelected(node) { return selectorWidget(node)?.value || node.__hpsSelected || ""; }
 function selectorStatusFor(node, ckptName) {
-  const item = selectorItems(node).find((entry) => entry.ckpt_name_str === ckptName);
+  const item = selectorItems(node).find((entry) => entry.ckpt_name === ckptName);
   return item?.status || "none";
 }
 
@@ -934,7 +934,7 @@ function selectorStatusText(result, prefix = "") {
   return `${prefix}${s.total ?? 0} total (💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
 }
 function getSelectorReviewTargets(node) {
-  const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name_str") ?? -1;
+  const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name") ?? -1;
   if (outIndex < 0) return { taggers: [], previews: [] };
   const output = node.outputs?.[outIndex];
   const links = output?.links || [];
@@ -946,7 +946,7 @@ function getSelectorReviewTargets(node) {
     const target = app.graph?.getNodeById?.(link.target_id);
     if (!target) continue;
     const input = target.inputs?.[link.target_slot];
-    if (input?.name !== "ckpt_name_str") continue;
+    if (input?.name !== "ckpt_name") continue;
     if (isNodeClass(target, TAGGER_CLASS)) taggers.push(target);
     if (isNodeClass(target, "ImageDirPreview")) previews.push(target);
   }
@@ -1042,7 +1042,7 @@ function markImageDirPreviewLoading(node, ckptName) {
   node.__hpsPreviewState = {
     ...(node.__hpsPreviewState || {}),
     node_class: "ImageDirPreview",
-    ckpt_name_str: ckptName,
+    ckpt_name: ckptName,
     status: "loading",
     message,
     progress_message: message,
@@ -1085,11 +1085,11 @@ async function refreshSelector(node, all = false) {
     node.__hpsStatus = result.status_text || selectorStatusText(result);
 
     if (!selectorSelected(node) && node.__hpsItems.length) {
-      setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
+      setSelectorSelected(node, node.__hpsItems[0].ckpt_name);
     }
     const selected = selectorSelected(node);
-    if (selected && !node.__hpsItems.find((x) => x.ckpt_name_str === selected) && node.__hpsItems.length) {
-      setSelectorSelected(node, node.__hpsItems[0].ckpt_name_str);
+    if (selected && !node.__hpsItems.find((x) => x.ckpt_name === selected) && node.__hpsItems.length) {
+      setSelectorSelected(node, node.__hpsItems[0].ckpt_name);
     } else if (selectorSelected(node)) {
       node.title = selectorTitleText(node, selectorSelected(node));
     }
@@ -1118,7 +1118,7 @@ async function pushSelectedToLocalList(node) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(tabPayload({
-      ckpt_name_str: selected,
+      ckpt_name: selected,
       target_node_ids: (app.graph?._nodes || [])
         .filter((n) => isNodeClass(n, CYCLER_CLASS) && n.__hpsUseLocalList !== false)
         .map((n) => n.id),
@@ -1153,7 +1153,7 @@ async function syncSelectedCheckpoint(node) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(tabPayload({
-      ckpt_name_str: selected,
+      ckpt_name: selected,
       tagger_node_ids: targets.taggers.map((n) => n.id),
       preview_node_ids: targets.previews.map((n) => n.id),
       preview_targets: targets.previews.map((n) => ({
@@ -1282,7 +1282,7 @@ function drawSelectorRows(ctx, node) {
     const item = items[base + i];
     const y = r.list.y + i * ROW_H;
     if (!item) continue;
-    const ckpt = item.ckpt_name_str || "";
+    const ckpt = item.ckpt_name || "";
     const status = item.status || "none";
     const active = ckpt === selected;
     ctx.fillStyle = active ? "rgba(75,125,190,0.58)" : (i % 2 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.06)");
@@ -1422,7 +1422,7 @@ function setupSelectorNode(nodeType) {
       if (item) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
-        setSelectorSelected(this, item.ckpt_name_str);
+        setSelectorSelected(this, item.ckpt_name);
         app.graph.setDirtyCanvas(true, true);
         return true;
       }
@@ -1498,7 +1498,7 @@ function linkedCheckpointInputValue(node, inputName) {
   if (isNodeClass(source, CYCLER_CLASS)) return source.__hpsCyclerCkptName || "";
   if (isNodeClass(source, SELECTOR_CLASS)) return selectorSelected(source) || "";
   const outputName = String(source.outputs?.[link.origin_slot]?.name || "").toLowerCase();
-  if (outputName === "ckpt_name_str" || outputName === "ckpt_name") {
+  if (outputName === "ckpt_name") {
     const ckptWidget = findCheckpointWidget(source) || findStartCheckpointWidget(source);
     const value = String(ckptWidget?.value || "");
     return value.endsWith(".safetensors") ? value : "";
@@ -1507,7 +1507,7 @@ function linkedCheckpointInputValue(node, inputName) {
 }
 
 function currentTaggerPath(node) {
-  return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name_str") || "";
+  return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name") || "";
 }
 function taggerButtons(node) {
   // Keep controls right-aligned and away from LiteGraph input pins/labels.
@@ -1535,7 +1535,7 @@ async function setTaggerStatus(node, status) {
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tagger/set_status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(tabPayload({ ckpt_name_str: ckpt, status })),
+    body: JSON.stringify(tabPayload({ ckpt_name: ckpt, status })),
   });
   const result = await response.json();
   if (result.ok) {
@@ -1626,7 +1626,7 @@ function setupTaggerNode(nodeType) {
 api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, TAGGER_CLASS);
   if (!node) return;
-  node.__hpsTaggerPath = detail.ckpt_name_str;
+  node.__hpsTaggerPath = detail.ckpt_name;
   node.__hpsTaggerStatus = detail.status;
   node.__hpsTaggerMessage = taggerCurrentMessage(detail.status || "none");
   if (detail.title) node.title = detail.title;
@@ -1648,20 +1648,20 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
   for (const node of app.graph?._nodes || []) {
     if (isNodeClass(node, SELECTOR_CLASS)) {
       for (const item of selectorItems(node)) {
-        if (item.ckpt_name_str === detail.ckpt_name_str) item.status = detail.status || "none";
+        if (item.ckpt_name === detail.ckpt_name) item.status = detail.status || "none";
       }
-      if (selectorSelected(node) === detail.ckpt_name_str) {
-        node.title = selectorTitleText(node, detail.ckpt_name_str);
+      if (selectorSelected(node) === detail.ckpt_name) {
+        node.title = selectorTitleText(node, detail.ckpt_name);
       }
     }
-    if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
+    if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name) {
       node.__hpsPreviewStatus = detail.status || "none";
-      setPreviewTitleFromCheckpoint(node, detail.ckpt_name_str, detail.status || "none");
+      setPreviewTitleFromCheckpoint(node, detail.ckpt_name, detail.status || "none");
     }
-    if (isNodeClass(node, TAGGER_CLASS) && currentTaggerPath(node) === detail.ckpt_name_str) {
+    if (isNodeClass(node, TAGGER_CLASS) && currentTaggerPath(node) === detail.ckpt_name) {
       node.__hpsTaggerStatus = detail.status || "none";
       node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
-      patchCheckpointTitle(node, "Tagger", detail.ckpt_name_str, node.__hpsTaggerStatus);
+      patchCheckpointTitle(node, "Tagger", detail.ckpt_name, node.__hpsTaggerStatus);
     }
     // Cycler title/status are rebuilt from backend state via CYCLER_EVENT.
     // Do not patch the existing Cycler title here; stale status icons can accumulate.

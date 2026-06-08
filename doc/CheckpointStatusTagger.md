@@ -12,17 +12,10 @@
 
 ### 📥 入力（Inputs）
 
-* **`ckpt_name_str` (必須 / STRING):**
+* **`ckpt_name` (必須 / COMBO):**
 格付け対象とするCheckpointのファイルパス文字列。
 * `Checkpoint Name Cycler` の同名出力から繋げば「今まさにその画像を吐き出しているモデル」が対象となり、
 * `Checkpoint List Selector` から繋げば「今画面で目視検分しているモデル」が対象となるぞ。
-
-
-
-### 📤 出力（Outputs）
-
-* **`ckpt_name_str` (STRING):**
-入力されたパスをそのまま下流へスルー（パススルー）する出力じゃ。
 
 ---
 

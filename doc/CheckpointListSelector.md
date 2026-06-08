@@ -21,7 +21,7 @@
 
 ### 📤 出力（Outputs）
 
-* **`ckpt_name_str` (STRING):**
+* **`ckpt_name` (COMBO):**
 現在選択されているCheckpointのファイルパス文字列。
 * *※この出力を他のノードに「繋ぐか・繋がないか」によって、ノードのアビリティが動的にトグル（変身）する仕様じゃ！*
 
@@ -31,16 +31,16 @@
 
 ## 🎯 覚醒する2つのモード（Dynamic Mode Switching）
 
-このノードの `ckpt_name_str` 出力の配線状態によって、UI上のメインボタンが自動で切り替わるのじゃ。
+このノードの `ckpt_name` 出力の配線状態によって、UI上のメインボタンが自動で切り替わるのじゃ。
 
 ### 🏹 1. Push to Local List モード (スタンドアロン運用)
 
-* **発動条件：** `ckpt_name_str` が、キャンバス上のレビュー系ノード（TaggerやPreview）に**接続されていない**場合。
+* **発動条件：** `ckpt_name` が、キャンバス上のレビュー系ノード（TaggerやPreview）に**接続されていない**場合。
 * **効果：** ボタンが `🏹 Push to Local List` になる。リストで選んだモデルを、隣のタブで絶賛爆走中の `Checkpoint Name Cycler` の一時的な緊急割り込みレーン（Local List）へダイレクトに送り込むことができるぞ。
 
 ### 🎯 2. Sync Checkpoint モード (ジュークボックス棚卸し運用)
 
-* **発動条件：** `ckpt_name_str` が、`Checkpoint Status Tagger` や `ImageDir Preview` に**接続されている**場合。
+* **発動条件：** `ckpt_name` が、`Checkpoint Status Tagger` や `ImageDir Preview` に**接続されている**場合。
 * **効果：** ボタンが **`🎯 Sync Checkpoint`** という名の「遠隔無線スイッチ」へと覚醒する！このボタンを押した瞬間、後述する【無線通信ハック】が発動するのじゃ。
 
 ---

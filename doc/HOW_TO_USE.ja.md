@@ -75,7 +75,7 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 1. 前述の通り、`Checkpoint Name Cycler` と `Checkpoint List Selector` を配置する。
 2. **`Ephemeral Preview`** を配置し、ワークフローの中間に存在する `VAE Decode` などの画像出力を受け取れるように繋ぐ。
 3. **`Checkpoint Status Tagger`（右手）** を配置する。
-4. Taggerの `ckpt_name_str` 入力を、`Checkpoint Name Cycler` の `ckpt_name_str` 出力へ接続する。
+4. Taggerの `ckpt_name` 入力を、`Checkpoint Name Cycler` の `ckpt_name` 出力へ接続する。
 
 **🏆 執行結果：**
 ジョブの実行中、中間プレビュー画像を確認しながら、**「今まさにこの画像を吐き出しているCheckpoint」に対して、お気に入りや削除予約などのタグをその場でダイレクトに打てるようになる！**
@@ -97,10 +97,10 @@ git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 
 1. メインのタブ（タブA）で500件のジョブを爆走させたまま、**ブラウザで「別タブ（タブB）」を開く！**
 2. その別タブ側のキャンバスに、**`Checkpoint List Selector`（頭脳）** を配置する。
-3. **`Checkpoint Status Tagger`（右手）** を配置し、`ckpt_name_str` を Selector の同名出力へと繋ぐ。
+3. **`Checkpoint Status Tagger`（右手）** を配置し、`ckpt_name` を Selector の同名出力へと繋ぐ。
 * 🔗 *リンクが繋がった瞬間、Selectorのボタンが `🏹 Push to Local List` から **`🎯 Sync Checkpoint`** へと動的に覚醒するぞ！*
 
-4. **`ImageDir Preview`（目）** を配置し、これも Selector の `ckpt_name_str` へと接続する。
+4. **`ImageDir Preview`（目）** を配置し、これも Selector の `ckpt_name` へと接続する。
 * 📁 *デフォルトではComfyUI標準の `output` フォルダを参照するが、もし参照先を変更したい（jpeg出力専用フォルダなどがある）場合は、`search_directory` 入力にフルパスを文字列で与えてやりゃれ。自動でサブディレクトリまで巡回し、新しい画像ファイルから優先的に表示してくれる優れものじゃ！*
 
 **🏆 執行結果：**

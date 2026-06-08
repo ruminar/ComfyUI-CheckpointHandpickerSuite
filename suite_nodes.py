@@ -22,7 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
-# v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
+# v9a / 0.2.0: checkpoint-name interface cleanup. ckpt_name is canonical; ckpt_name_str is removed.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
@@ -147,7 +147,7 @@ def _save_status_db(data: dict):
     for relpath, entry in data.get("statuses", {}).items():
         if entry.get("status") == "favorite":
             favorites[relpath] = {
-                "ckpt_name_str": relpath,
+                "ckpt_name": relpath,
                 "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
                 "favorited_at": entry.get("updated_at", _now_iso()),
                 "last_seen_at": entry.get("updated_at", _now_iso()),
@@ -272,7 +272,6 @@ def _checkpoint_items() -> list[dict]:
         label = f"{icon} {relpath}" if icon.strip() else f"   {relpath}"
         items.append({
             "ckpt_name": relpath,
-            "ckpt_name_str": relpath,
             "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
             "status": status,
             "status_icon": STATUS_ICON[status],
@@ -534,7 +533,7 @@ def _cycler_state_payload(state: dict) -> dict:
     state["last_title"] = title
     state["last_status_text"] = status_text
     return {
-        "ckpt_name_str": ckpt,
+        "ckpt_name": ckpt,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt) if ckpt else "",
         "status": status,
         "status_icon": STATUS_ICON[status],
@@ -565,24 +564,24 @@ def _cycler_state_payload(state: dict) -> dict:
     }
 
 
-def _store_tagger_state(tab_id, node_id, ckpt_name_str, status):
+def _store_tagger_state(tab_id, node_id, ckpt_name, status):
     key = _state_key(tab_id, node_id)
     with _STATE_LOCK:
         _TAGGER_STATES[key] = {
-            "ckpt_name_str": ckpt_name_str,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name_str) if ckpt_name_str else "",
+            "ckpt_name": ckpt_name,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name) if ckpt_name else "",
             "status": status,
             "status_icon": STATUS_ICON.get(status, "—"),
             "updated_at": _now_iso(),
         }
 
 
-def _store_preview_state(tab_id, node_id, ckpt_name_str, status, **extra):
+def _store_preview_state(tab_id, node_id, ckpt_name, status, **extra):
     key = _state_key(tab_id, node_id)
     with _STATE_LOCK:
         _PREVIEW_STATES[key] = {
-            "ckpt_name_str": ckpt_name_str,
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name_str) if ckpt_name_str else "",
+            "ckpt_name": ckpt_name,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name) if ckpt_name else "",
             "status": status,
             "status_icon": STATUS_ICON.get(status, "—"),
             "updated_at": _now_iso(),
@@ -624,7 +623,7 @@ def _send_status_changed(relpath: str, tab_id: str = "", node_id=None):
         "node": int(node_id) if str(node_id or "").isdigit() else None,
         "tab_id": _clean_tab_id(tab_id),
         "node_class": "CheckpointStatusTagger",
-        "ckpt_name_str": relpath,
+        "ckpt_name": relpath,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         "status": status,
         "status_icon": STATUS_ICON[status],
@@ -711,7 +710,7 @@ def _active_delete_records() -> dict[str, dict]:
                 continue
             rec = json.loads(line)
             typ = rec.get("type")
-            relpath = _normalize_relpath(rec.get("ckpt_name_str", ""))
+            relpath = _normalize_relpath(rec.get("ckpt_name", ""))
             rid = rec.get("id")
             if typ == "reserve" and rid and relpath:
                 active[relpath] = rec
@@ -733,8 +732,8 @@ def _append_delete_record(record: dict):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _resolve_checkpoint_unique(ckpt_name_str: str):
-    relpath = _normalize_relpath(ckpt_name_str)
+def _resolve_checkpoint_unique(ckpt_name: str):
+    relpath = _normalize_relpath(ckpt_name)
     if not _is_valid_checkpoint_relpath(relpath):
         return None
     candidates = []
@@ -780,7 +779,7 @@ def _delete_plan_targets() -> list[dict]:
         raw_json_path = rec.get("json_path") or ""
         json_path = Path(raw_json_path).resolve() if raw_json_path else safetensors_path.with_suffix(".json")
         targets.append({
-            "ckpt_name_str": relpath,
+            "ckpt_name": relpath,
             "safetensors_path": str(safetensors_path),
             "json_path": str(json_path),
             "reserved_at": rec.get("reserved_at", ""),
@@ -836,7 +835,7 @@ def _write_delete_script():
         "    active = {}",
         "    for rec in read_records():",
         "        rec_type = rec.get('type')",
-        "        relpath = rec.get('ckpt_name_str') or ''",
+        "        relpath = rec.get('ckpt_name') or ''",
         "        rid = rec.get('id')",
         "        if rec_type == 'reserve' and relpath:",
         "            active[relpath] = rec",
@@ -895,7 +894,7 @@ def _write_delete_script():
     ]
     for idx, item in enumerate(targets, start=1):
         plan_lines.extend([
-            f"[{idx}] {item['ckpt_name_str']}",
+            f"[{idx}] {item['ckpt_name']}",
             f"    safetensors: {item['safetensors_path']}",
             f"    json:        {item['json_path']}",
             f"    reserved_at: {item.get('reserved_at', '')}",
@@ -927,7 +926,7 @@ def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None
             "version": 1,
             "type": "cancel",
             "id": rid,
-            "ckpt_name_str": relpath,
+            "ckpt_name": relpath,
             "reason": "missing_on_refresh",
             "cancelled_at": _now_iso(),
         })
@@ -971,7 +970,8 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
                 def list_selector_input_types(cls, _values=values):
                     return {"required": {"checkpoint": ("STRING", {"default": ""})}, "hidden": {"unique_id": "UNIQUE_ID"}}
                 node_class.INPUT_TYPES = classmethod(list_selector_input_types)
-                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
+                node_class.RETURN_TYPES = (list(values), "STRING")
+                node_class.RETURN_NAMES = ("ckpt_name", "ckpt_name_safe")
                 patched.append(name)
                 continue
             if name == "CheckpointNameCycler":
@@ -991,7 +991,8 @@ def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]
                         "hidden": {"unique_id": "UNIQUE_ID"},
                     }
                 node_class.INPUT_TYPES = classmethod(cycler_input_types)
-                node_class.RETURN_TYPES = (list(values), "STRING", "STRING")
+                node_class.RETURN_TYPES = (list(values), "STRING")
+                node_class.RETURN_NAMES = ("ckpt_name", "ckpt_name_safe")
                 patched.append(name)
                 continue
         except Exception as exc:
@@ -1145,7 +1146,7 @@ def _send_image_dir_progress(node_id, relpath, tab_id, message, value=0, total=0
     status = _get_status(relpath) if relpath else "none"
     _send_preview(node_id, _image_dir_title(relpath), None, {
         "node_class": "ImageDirPreview",
-        "ckpt_name_str": relpath,
+        "ckpt_name": relpath,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath) if relpath else "",
         "status": "loading",
         "status_icon": STATUS_ICON[status],
@@ -1257,7 +1258,7 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
     status = _get_status(relpath)
     extra.update({
         "node_class": "ImageDirPreview",
-        "ckpt_name_str": relpath,
+        "ckpt_name": relpath,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         "status": status,
         "status_icon": STATUS_ICON[status],
@@ -1408,8 +1409,8 @@ class CheckpointListSelector:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
-    RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
+    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING")
+    RETURN_NAMES = ("ckpt_name", "ckpt_name_safe")
     FUNCTION = "select"
     CATEGORY = "checkpoint/handpicker"
 
@@ -1418,7 +1419,7 @@ class CheckpointListSelector:
         if rel not in _get_checkpoint_list():
             items = _get_checkpoint_list()
             rel = items[0] if items else ""
-        return (rel, rel, _ckpt_name_safe_from_relpath(rel) if rel else "checkpoint")
+        return (rel, _ckpt_name_safe_from_relpath(rel) if rel else "checkpoint")
 
 
 class CheckpointNameCycler:
@@ -1440,8 +1441,8 @@ class CheckpointNameCycler:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
-    RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
+    RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING")
+    RETURN_NAMES = ("ckpt_name", "ckpt_name_safe")
     FUNCTION = "cycle"
     CATEGORY = "checkpoint/handpicker"
 
@@ -1682,7 +1683,7 @@ class CheckpointNameCycler:
         exec_state = _store_tab_execution_state(tab_id, {
             "node": int(unique_id) if unique_id is not None else None,
             "node_class": "CheckpointNameCycler",
-            "ckpt_name_str": ckpt_name,
+            "ckpt_name": ckpt_name,
             "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
             "status": status,
             "status_icon": STATUS_ICON[status],
@@ -1709,7 +1710,7 @@ class CheckpointNameCycler:
             title,
             status_text,
             tab_id=tab_id,
-            ckpt_name_str=ckpt_name,
+            ckpt_name=ckpt_name,
             ckpt_name_safe=_ckpt_name_safe_from_relpath(ckpt_name),
             status=status,
             status_icon=STATUS_ICON[status],
@@ -1728,14 +1729,14 @@ class CheckpointNameCycler:
             last_execution_snapshot=snapshot,
             execution_revision=state["execution_revision"],
         )
-        return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
+        return (ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
 
 
 class CheckpointStatusTagger:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"ckpt_name_str": ("STRING", {"forceInput": True})},
+            "required": {"ckpt_name": (_get_checkpoint_list() or [""], {"forceInput": True})},
             "optional": {"hps_tab_id": ("STRING", {"default": "", "hidden": True})},
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -1746,11 +1747,11 @@ class CheckpointStatusTagger:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, ckpt_name_str, hps_tab_id="", unique_id=None):
+    def IS_CHANGED(cls, ckpt_name, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def tag(self, ckpt_name_str, hps_tab_id="", unique_id=None):
-        relpath = _normalize_relpath(ckpt_name_str)
+    def tag(self, ckpt_name, hps_tab_id="", unique_id=None):
+        relpath = _normalize_relpath(ckpt_name)
         status = _get_status(relpath)
         title = f"Tagger : {STATUS_ICON[status]} {relpath}" if status != "none" else f"Tagger : {relpath}"
         _store_tagger_state(hps_tab_id, unique_id, relpath, status)
@@ -1758,7 +1759,7 @@ class CheckpointStatusTagger:
             "node": int(unique_id) if unique_id is not None else None,
             "tab_id": _clean_tab_id(hps_tab_id),
             "node_class": "CheckpointStatusTagger",
-            "ckpt_name_str": relpath,
+            "ckpt_name": relpath,
             "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
             "status": status,
             "status_icon": STATUS_ICON[status],
@@ -1791,11 +1792,11 @@ class EphemeralPreview:
             sheet, meta = _build_contact_sheet(pil_images)
             meta["node_class"] = "EphemeralPreview"
             exec_state = _get_tab_execution_state(hps_tab_id)
-            ckpt_name = exec_state.get("ckpt_name_str", "")
+            ckpt_name = exec_state.get("ckpt_name", "")
             status = exec_state.get("status", _get_status(ckpt_name) if ckpt_name else "none")
             if ckpt_name:
                 meta.update({
-                    "ckpt_name_str": ckpt_name,
+                    "ckpt_name": ckpt_name,
                     "ckpt_name_safe": _ckpt_name_safe_from_relpath(ckpt_name),
                     "status": status,
                     "status_icon": STATUS_ICON.get(status, "—"),
@@ -1815,7 +1816,7 @@ class ImageDirPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"ckpt_name_str": ("STRING", {"forceInput": True})},
+            "required": {"ckpt_name": (_get_checkpoint_list() or [""], {"forceInput": True})},
             "optional": {
                 "search_directory": ("STRING", {"forceInput": True}),
                 "max_preview_images": ("INT", {"default": IMAGE_DIR_DEFAULT_MAX_IMAGES, "min": 1, "max": IMAGE_DIR_MAX_IMAGES}),
@@ -1830,11 +1831,23 @@ class ImageDirPreview:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, ckpt_name_str, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
+    def IS_CHANGED(cls, ckpt_name, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
         return float("nan")
 
-    def preview(self, ckpt_name_str, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
-        relpath = _normalize_relpath(ckpt_name_str)
+    def preview(self, ckpt_name, search_directory=None, max_preview_images=IMAGE_DIR_DEFAULT_MAX_IMAGES, hps_tab_id="", unique_id=None):
+        relpath = _normalize_relpath(ckpt_name)
+        if not _is_valid_checkpoint_relpath(relpath):
+            _store_preview_state(hps_tab_id, unique_id, "", "none", node_class="ImageDirPreview")
+            _send_preview(unique_id, "ImageDir Preview", None, {
+                "node_class": "ImageDirPreview",
+                "ckpt_name": "",
+                "ckpt_name_safe": "",
+                "status": "none",
+                "status_icon": STATUS_ICON["none"],
+                "message": "no preview",
+                "progress": False,
+            }, tab_id=hps_tab_id)
+            return ()
         sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True, max_preview_images=max_preview_images)
         status = _get_status(relpath)
         _store_preview_state(hps_tab_id, unique_id, relpath, status, node_class="ImageDirPreview")
@@ -1864,9 +1877,9 @@ async def node_state(request):
         state = dict(_PREVIEW_STATES.get(key, {}))
         if not state:
             exec_state = _get_tab_execution_state(tab_id)
-            if exec_state.get("ckpt_name_str"):
+            if exec_state.get("ckpt_name"):
                 state = {
-                    "ckpt_name_str": exec_state.get("ckpt_name_str", ""),
+                    "ckpt_name": exec_state.get("ckpt_name", ""),
                     "ckpt_name_safe": exec_state.get("ckpt_name_safe", ""),
                     "status": exec_state.get("status", "none"),
                     "status_icon": exec_state.get("status_icon", "—"),
@@ -1916,7 +1929,7 @@ async def refresh_all(_request):
 @routes.post(f"/{EXTENSION_PREFIX}/tagger/set_status")
 async def tagger_set_status(request):
     data = await request.json()
-    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
+    relpath = _normalize_relpath(data.get("ckpt_name", ""))
     requested = str(data.get("status", "none"))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     node_id = data.get("node_id") or data.get("node")
@@ -1941,7 +1954,7 @@ async def tagger_set_status(request):
                 "version": 1,
                 "type": "reserve",
                 "id": f"{int(time.time())}_{uuid.uuid4().hex}",
-                "ckpt_name_str": relpath,
+                "ckpt_name": relpath,
                 "resolved_path": resolved["path"],
                 "json_path": resolved["json_path"],
                 "reserved_at": _now_iso(),
@@ -1955,7 +1968,7 @@ async def tagger_set_status(request):
                 "version": 1,
                 "type": "cancel",
                 "id": active.get("id"),
-                "ckpt_name_str": relpath,
+                "ckpt_name": relpath,
                 "cancelled_at": _now_iso(),
                 "reason": f"status_changed_to_{status}",
             })
@@ -1965,7 +1978,7 @@ async def tagger_set_status(request):
     _refresh_cycler_states_for_status_change(relpath)
     return web.json_response({
         "ok": True,
-        "ckpt_name_str": relpath,
+        "ckpt_name": relpath,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         "status": status,
         "status_icon": STATUS_ICON[status],
@@ -2051,7 +2064,7 @@ async def cycler_set_filter(request):
 @routes.post(f"/{EXTENSION_PREFIX}/cycler/local_list_append")
 async def cycler_local_list_append(request):
     data = await request.json()
-    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
+    relpath = _normalize_relpath(data.get("ckpt_name", ""))
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
     tab_id = _clean_tab_id(data.get("tab_id", ""))
@@ -2094,7 +2107,7 @@ async def cycler_clear_local_list(request):
 @routes.post(f"/{EXTENSION_PREFIX}/review/sync_checkpoint")
 async def review_sync_checkpoint(request):
     data = await request.json()
-    relpath = _normalize_relpath(data.get("ckpt_name_str", ""))
+    relpath = _normalize_relpath(data.get("ckpt_name", ""))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
     if not _is_valid_checkpoint_relpath(relpath):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
@@ -2107,7 +2120,7 @@ async def review_sync_checkpoint(request):
             "node": int(node_id),
             "tab_id": tab_id,
             "node_class": "CheckpointStatusTagger",
-            "ckpt_name_str": relpath,
+            "ckpt_name": relpath,
             "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
             "status": status,
             "status_icon": STATUS_ICON[status],
@@ -2145,7 +2158,7 @@ async def review_sync_checkpoint(request):
 
     return web.json_response({
         "ok": True,
-        "ckpt_name_str": relpath,
+        "ckpt_name": relpath,
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         "status": status,
         "status_icon": STATUS_ICON[status],

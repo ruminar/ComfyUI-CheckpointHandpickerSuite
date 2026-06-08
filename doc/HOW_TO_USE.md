@@ -67,7 +67,7 @@ If your workflow is a simple one-pass generation workflow, the next job may star
 - Add an `Ephemeral Preview` node.
   - Connect it to the `IMAGE` output of a `VAE Decode` node in the middle of your workflow.
 - Add a `Checkpoint Status Tagger` node.
-  - Connect the Tagger's `ckpt_name_str` input to the Cycler's `ckpt_name_str` output.
+  - Connect the Tagger's `ckpt_name` input to the Cycler's `ckpt_name` output.
 
 Now, while a job is running, you can check the preview image and tag the checkpoint as favorite, nice, keep, or delete-reserved.
 
@@ -92,10 +92,10 @@ This mode only uses the ComfyUI user interface as a review screen. To avoid acci
 - Open ComfyUI in another browser tab.
 - Add a `Checkpoint List Selector` node.
 - Add a `Checkpoint Status Tagger` node.
-  - Connect the Tagger's `ckpt_name_str` input to the Selector's `ckpt_name_str` output.
+  - Connect the Tagger's `ckpt_name` input to the Selector's `ckpt_name` output.
   - The Selector button will change from `🏹 Push to Local List` to `🎯 Sync Checkpoint`.
 - Add an `ImageDir Preview` node.
-  - Connect its `ckpt_name_str` input as well.
+  - Connect its `ckpt_name` input as well.
   - By default, it searches images in the ComfyUI output folder.
   - If you want to use another directory, provide a full path string to `search_directory`.
     - It searches subdirectories and prioritizes newer files.

@@ -33,8 +33,8 @@ Restart ComfyUI.
 
 `Checkpoint List Selector` can work in two modes.
 
-- `🏹 Push to Local List`: shown when no review node is connected to `ckpt_name_str`.
-- `🎯 Sync Checkpoint`: shown when `ckpt_name_str` is connected to `Checkpoint Status Tagger` or `ImageDir Preview`.
+- `🏹 Push to Local List`: shown when no review node is connected to `ckpt_name`.
+- `🎯 Sync Checkpoint`: shown when `ckpt_name` is connected to `Checkpoint Status Tagger` or `ImageDir Preview`.
 
 `Sync Checkpoint` does not queue or execute the workflow. It synchronizes the currently selected checkpoint to connected review nodes only.
 
@@ -122,7 +122,7 @@ Preview contact sheets do not upscale images. If the sheet fits within the 4096p
 
 UI operation events are tab-local. Local List updates, Cycler UI updates, Tagger sync, and preview/progress updates include a tab id and are ignored by other tabs.
 
-The Cycler also writes the last executed checkpoint to a tab-local frontend execution state. `Ephemeral Preview` may use that state to label previews. `Checkpoint Status Tagger` never uses this shared state; it only acts on an explicitly connected `ckpt_name_str` input.
+The Cycler also writes the last executed checkpoint to a tab-local frontend execution state. `Ephemeral Preview` may use that state to label previews. `Checkpoint Status Tagger` never uses this shared state; it only acts on an explicitly connected `ckpt_name` input.
 
 Checkpoint statuses are global. When a status changes, all tabs may refresh their own Selector lists, but global notifications do not directly modify arbitrary node titles by node id.
 
