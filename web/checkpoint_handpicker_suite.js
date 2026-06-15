@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v9c: ListSelector hover thumbnail popup.
 // v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
@@ -877,6 +878,147 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
 // ---------- Selector ----------
 const SELECTOR_VISIBLE_ROWS = 20;
 const ROW_H = 20;
+const SELECTOR_THUMBNAIL_POPUP_W = 250;
+const SELECTOR_THUMBNAIL_POPUP_H = 250;
+const selectorThumbnailCache = new Map();
+
+function selectorThumbnailCacheKey(ckptName) {
+  return String(ckptName || "");
+}
+
+function clearSelectorThumbnailHover(node) {
+  if (!node) return;
+  if (node.__hpsHoverCkptName || node.__hpsHoverRowIndex != null) {
+    node.__hpsHoverCkptName = "";
+    node.__hpsHoverRowIndex = null;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function selectorItemAtLocal(node, local) {
+  if (!local) return null;
+  const r = selectorRects(node);
+  if (!hit(local, r.list)) return null;
+  const row = Math.floor((local[1] - r.list.y) / ROW_H);
+  if (row < 0 || row >= SELECTOR_VISIBLE_ROWS) return null;
+  const item = selectorItems(node)[(node.__hpsScroll || 0) + row];
+  if (!item) return null;
+  return { item, row };
+}
+
+async function requestSelectorThumbnail(node, ckptName) {
+  const key = selectorThumbnailCacheKey(ckptName);
+  if (!key) return;
+  const cached = selectorThumbnailCache.get(key);
+  if (cached?.status === "loading" || cached?.status === "ready" || cached?.status === "missing") return;
+  selectorThumbnailCache.set(key, { status: "loading" });
+  app.graph?.setDirtyCanvas?.(true, true);
+  try {
+    const query = new URLSearchParams({ ckpt_name_str: key });
+    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/selector/thumbnail?${query.toString()}`, { cache: "no-store" });
+    const result = await response.json();
+    if (!result?.ok || !result.found || !result.image) {
+      selectorThumbnailCache.set(key, { status: "missing" });
+      app.graph?.setDirtyCanvas?.(true, true);
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      selectorThumbnailCache.set(key, {
+        status: "ready",
+        image: img,
+        width: result.width || img.width,
+        height: result.height || img.height,
+        thumbnail_path: result.thumbnail_path || "",
+      });
+      app.graph?.setDirtyCanvas?.(true, true);
+    };
+    img.onerror = () => {
+      selectorThumbnailCache.set(key, { status: "missing" });
+      app.graph?.setDirtyCanvas?.(true, true);
+    };
+    img.src = `data:image/${result.format || "jpeg"};base64,${result.image}`;
+  } catch (error) {
+    selectorThumbnailCache.set(key, { status: "missing", error: String(error) });
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function updateSelectorThumbnailHover(node, event, pos) {
+  if (!node || hpsNodeCollapsed(node)) return;
+  const local = selectorLocalFromEventOrPos(node, event, pos);
+  const hitItem = selectorItemAtLocal(node, local);
+  if (!hitItem) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+  const ckpt = hitItem.item.ckpt_name_str || "";
+  if (!ckpt) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+  if (node.__hpsHoverCkptName !== ckpt || node.__hpsHoverRowIndex !== hitItem.row) {
+    node.__hpsHoverCkptName = ckpt;
+    node.__hpsHoverRowIndex = hitItem.row;
+    requestSelectorThumbnail(node, ckpt);
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function drawSelectorThumbnailPopup(ctx, node) {
+  const ckpt = node.__hpsHoverCkptName || "";
+  if (!ckpt) return;
+  const r = selectorRects(node);
+  const cache = selectorThumbnailCache.get(selectorThumbnailCacheKey(ckpt)) || { status: "loading" };
+  const x = r.list.x + r.list.w + 12;
+  const rowIndex = Number.isFinite(node.__hpsHoverRowIndex) ? node.__hpsHoverRowIndex : 0;
+  const preferredY = r.list.y + rowIndex * ROW_H - 8;
+  const y = Math.max(8, Math.min(preferredY, (node.size?.[1] || 540) - SELECTOR_THUMBNAIL_POPUP_H - 8));
+  const w = SELECTOR_THUMBNAIL_POPUP_W;
+  const h = SELECTOR_THUMBNAIL_POPUP_H;
+
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = 16;
+  ctx.fillStyle = "rgba(20,20,20,0.94)";
+  ctx.strokeStyle = "rgba(255,255,255,0.28)";
+  ctx.lineWidth = 1;
+  drawRounded(ctx, x, y, w, h, 10);
+  ctx.fill();
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  const pad = 8;
+  const titleH = 22;
+  ctx.fillStyle = "#ddd";
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(ckpt, x + pad, y + 14, w - pad * 2);
+
+  const imgBox = { x: x + pad, y: y + titleH + pad, w: w - pad * 2, h: h - titleH - pad * 2 };
+  if (cache.status === "ready" && cache.image) {
+    const img = cache.image;
+    let dw = imgBox.w;
+    let dh = dw * (img.height / img.width);
+    if (dh > imgBox.h) {
+      dh = imgBox.h;
+      dw = dh * (img.width / img.height);
+    }
+    const ix = imgBox.x + (imgBox.w - dw) / 2;
+    const iy = imgBox.y + (imgBox.h - dh) / 2;
+    ctx.drawImage(img, ix, iy, dw, dh);
+  } else {
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    ctx.fillRect(imgBox.x, imgBox.y, imgBox.w, imgBox.h);
+    ctx.fillStyle = cache.status === "missing" ? "#aaa" : "#ddd";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(cache.status === "missing" ? "No sidecar thumbnail" : "Loading thumbnail...", imgBox.x + imgBox.w / 2, imgBox.y + imgBox.h / 2, imgBox.w - 12);
+  }
+  ctx.restore();
+}
+
 
 function selectorWidget(node) {
   return getWidget(node, "checkpoint");
@@ -1095,6 +1237,7 @@ async function refreshSelector(node, all = false) {
     }
 
     if (all) {
+      selectorThumbnailCache.clear();
       const checkpointValues = await checkpointValuesFromRefreshPayload(result);
       lastCheckpointValues = checkpointValues;
       const stats = applyCheckpointValuesToGraph(checkpointValues);
@@ -1176,6 +1319,7 @@ function maxSelectorScroll(node) {
 
 function scrollSelector(node, delta) {
   node.__hpsScroll = Math.max(0, Math.min(maxSelectorScroll(node), (node.__hpsScroll || 0) + delta));
+  clearSelectorThumbnailHover(node);
   app.graph.setDirtyCanvas(true, true);
 }
 
@@ -1346,6 +1490,7 @@ function setupSelectorNode(nodeType) {
     ctx.restore();
 
     drawSelectorRows(ctx, this);
+    drawSelectorThumbnailPopup(ctx, this);
   };
 
   const origMouseDown = nodeType.prototype.onMouseDown;
@@ -1456,6 +1601,7 @@ function setupSelectorNode(nodeType) {
       return true;
     }
 
+    updateSelectorThumbnailHover(this, event, pos);
     return origMouseMove ? origMouseMove.apply(this, arguments) : false;
   };
 

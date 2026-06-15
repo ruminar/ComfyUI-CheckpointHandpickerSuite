@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9c: ListSelector hover thumbnail popup.
 # v9b: v8l baseline plus delete-script thumbnail sidecar candidates.
 # v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
@@ -796,6 +797,33 @@ def _checkpoint_thumbnail_candidates(safetensors_path: Path) -> list[Path]:
         if candidate.exists() and candidate.is_file():
             candidates.append(candidate)
     return candidates
+
+
+def _load_sidecar_thumbnail_preview(relpath: str) -> tuple[Image.Image | None, str]:
+    """Load the first conservative sidecar thumbnail for a checkpoint.
+
+    This is the display counterpart of the v9b delete-script sidecar policy.
+    It intentionally does not scan output/review folders or ImageDirPreview
+    source directories: hover thumbnails are direct checkpoint sidecars only.
+    """
+    resolved = _resolve_checkpoint_unique(relpath)
+    if not resolved:
+        return None, ""
+    safetensors_path = Path(resolved["path"]).resolve()
+    roots = _checkpoint_roots()
+    if roots and not any(_is_path_under_root(safetensors_path, root) for root in roots):
+        return None, ""
+    for thumb_path in _checkpoint_thumbnail_candidates(safetensors_path):
+        if roots and not any(_is_path_under_root(thumb_path, root) for root in roots):
+            continue
+        try:
+            with Image.open(thumb_path) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                return img.convert("RGB"), str(thumb_path)
+        except Exception:
+            logger.exception("Failed to load ListSelector thumbnail: %s", thumb_path)
+    return None, ""
 
 
 def _delete_plan_targets() -> list[dict]:
@@ -1953,6 +1981,26 @@ async def node_state(request):
         state.update({"ok": True, "node_id": node_id, "node_class": node_class})
         return web.json_response(state)
     return web.json_response({"ok": False, "error": "Unsupported node_class."}, status=400)
+
+
+@routes.get(f"/{EXTENSION_PREFIX}/selector/thumbnail")
+async def selector_thumbnail(request):
+    relpath = _normalize_relpath(request.query.get("ckpt_name_str", ""))
+    if not relpath:
+        return web.json_response({"ok": False, "error": "ckpt_name_str is required."}, status=400)
+    if not _is_valid_checkpoint_relpath(relpath):
+        return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+    image, path = _load_sidecar_thumbnail_preview(relpath)
+    if image is None:
+        return web.json_response({"ok": True, "found": False, "ckpt_name_str": relpath})
+    payload = _encode_preview_payload(image)
+    payload.update({
+        "ok": True,
+        "found": True,
+        "ckpt_name_str": relpath,
+        "thumbnail_path": path,
+    })
+    return web.json_response(payload)
 
 
 @routes.get(f"/{EXTENSION_PREFIX}/list_checkpoints")
