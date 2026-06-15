@@ -58,11 +58,11 @@ function patchCheckpointTitle(node, prefix, ckptName, status = "none") {
   node.title = `${prefix} : ${titleDisplayForCheckpoint(ckptName, status)}${suffix}`;
 }
 
-const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
-const TAGGER_STATUS_ORDER = ["favorite", "nice", "keep", "delete"];
-const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
-const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
-const STATUS_CURRENT_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "Marked for deletion", none: "none" };
+const STATUS_ORDER = ["god", "favorite", "nice", "keep", "delete", "none"];
+const TAGGER_STATUS_ORDER = ["god", "favorite", "nice", "keep", "delete"];
+const STATUS_ICON = { god: "👑", favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
+const STATUS_LABEL = { god: "god!", favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
+const STATUS_CURRENT_LABEL = { god: "god!", favorite: "favorite", nice: "nice", keep: "keep", delete: "Marked for deletion", none: "none" };
 
 function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
@@ -377,7 +377,7 @@ function ensureHiddenWidgetValue(node, name, value) {
   return true;
 }
 
-const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
+const CYCLER_FILTER_STATUSES = ["god", "favorite", "nice", "keep", "delete", "none"];
 
 function normalizeCyclerFilterStatuses(value) {
   let raw = value;
@@ -1122,7 +1122,7 @@ function setSelectorSelected(node, value) {
 }
 function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
-  return `${prefix}${s.total ?? 0} total (💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
+  return `${prefix}${s.total ?? 0} total (👑:${s.god ?? 0}, 💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
 }
 function getSelectorReviewTargets(node) {
   const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name_str") ?? -1;
@@ -1705,19 +1705,22 @@ function currentTaggerPath(node) {
   return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
-  // Keep controls right-aligned and away from LiteGraph input pins/labels.
+  // Keep positive status controls on the first row and delete separated below.
   const buttonW = 76;
   const gap = 6;
-  const totalW = TAGGER_STATUS_ORDER.length * buttonW + (TAGGER_STATUS_ORDER.length - 1) * gap;
   const right = Math.max(442, (node.size?.[0] || 450) - 8);
+  const topStatuses = ["god", "favorite", "nice", "keep"];
+  const totalW = topStatuses.length * buttonW + (topStatuses.length - 1) * gap;
   const startX = right - totalW;
-  return TAGGER_STATUS_ORDER.map((status, i) => ({
+  const buttons = topStatuses.map((status, i) => ({
     status,
     x: startX + i * (buttonW + gap),
     y: 3,
     w: buttonW,
     h: 26,
   }));
+  buttons.push({ status: "delete", x: right - buttonW, y: 35, w: buttonW, h: 26 });
+  return buttons;
 }
 function taggerDeleteEnabled(node) {
   const current = node.__hpsTaggerStatus || "none";
@@ -1753,13 +1756,13 @@ function taggerCursorAt(node, local) {
 }
 
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 450, 104);
+  installMinSize(nodeType, 450, 128);
   installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 450, 104);
+    ensureSize(this, 450, 128);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -1792,16 +1795,16 @@ function setupTaggerNode(nodeType) {
     const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 50);
+    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 76);
     const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
     ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
-    ctx.fillText(msg, 8, 70);
+    ctx.fillText(msg, 8, 96);
     if (current !== "none" && current !== "delete") {
       ctx.fillStyle = "#aaa";
-      ctx.fillText("Delete is available only from none.", 8, 90);
+      ctx.fillText("Delete is available only from none.", 8, 116);
     } else if (current === "delete") {
       ctx.fillStyle = "#aaa";
-      ctx.fillText("Run exported script in temp. (Asks [y/N] before deletion.)", 8, 90);
+      ctx.fillText("Run exported script in temp. (Asks [y/N] before deletion.)", 8, 116);
     }
     ctx.restore();
   };

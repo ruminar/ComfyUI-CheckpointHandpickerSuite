@@ -22,6 +22,8 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9e: add top-tier god checkpoint status.
+# v9d: sticky/current-selection thumbnail popup refinement.
 # v9c: ListSelector hover thumbnail popup.
 # v9b: v8l baseline plus delete-script thumbnail sidecar candidates.
 # v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
@@ -31,9 +33,9 @@ CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
 TAGGER_EVENT = "ruminar.checkpoint_handpicker_suite.tagger"
 STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed"
 
-STATUS_VALUES = ["favorite", "nice", "keep", "delete", "none"]
-STATUS_ICON = {"favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
-STATUS_LABEL = {"favorite": "favorite", "nice": "nice", "keep": "keep", "delete": "delete", "none": "none"}
+STATUS_VALUES = ["god", "favorite", "nice", "keep", "delete", "none"]
+STATUS_ICON = {"god": "👑", "favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
+STATUS_LABEL = {"god": "god!", "favorite": "favorite", "nice": "nice", "keep": "keep", "delete": "delete", "none": "none"}
 
 NODE_DIR = Path(__file__).resolve().parent
 DATA_DIR = NODE_DIR / "data"
@@ -300,12 +302,12 @@ def _status_summary_text(prefix: str) -> str:
     summary = _delete_status_summary()
     return (
         f"{prefix}: {summary['total']} total "
-        f"(💛:{summary['favorite']}, 👍:{summary['nice']}, ✔:{summary['keep']}, 🗑:{summary['delete']}, —:{summary['none']})"
+        f"(👑:{summary['god']}, 💛:{summary['favorite']}, 👍:{summary['nice']}, ✔:{summary['keep']}, 🗑:{summary['delete']}, —:{summary['none']})"
     )
 
 
 def _status_icons_for_filter(active_statuses: list[str]) -> str:
-    return "".join(STATUS_ICON[s] for s in ["favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
+    return "".join(STATUS_ICON[s] for s in ["god", "favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
 
 
 def _filter_display(active_statuses: list[str]) -> str:
