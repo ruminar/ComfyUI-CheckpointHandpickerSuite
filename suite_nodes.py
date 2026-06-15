@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9b: v8l baseline plus delete-script thumbnail sidecar candidates.
 # v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
@@ -52,6 +53,7 @@ IMAGE_DIR_MAX_IMAGES = 80
 IMAGE_DIR_SCAN_LIMIT = 3000
 MAX_CONTENT_EDGE = 4096
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+ALLOWED_THUMBNAIL_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_CHECKPOINT_SUFFIX = ".safetensors"
 
 _STATE_LOCK = threading.Lock()
@@ -761,6 +763,41 @@ def _is_path_under_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _checkpoint_thumbnail_candidates(safetensors_path: Path) -> list[Path]:
+    """Return conservative sidecar thumbnail candidates for a checkpoint.
+
+    Only files in the same directory as the checkpoint are considered. This is
+    intentionally stricter than ImageDirPreview source-image scanning: delete
+    script targets must be direct sidecars, not arbitrary generated images.
+    """
+    path = Path(safetensors_path).resolve()
+    parent = path.parent
+    stem = path.stem
+    name = path.name
+    patterns: list[str] = []
+    for ext in sorted(ALLOWED_THUMBNAIL_SUFFIXES):
+        patterns.extend([
+            f"{stem}{ext}",
+            f"{name}{ext}",
+            f"{stem}.thumbnail{ext}",
+            f"{stem}.thumb{ext}",
+            f"{stem}.preview{ext}",
+            f"{name}.thumbnail{ext}",
+            f"{name}.thumb{ext}",
+            f"{name}.preview{ext}",
+        ])
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        candidate = (parent / pattern).resolve()
+        if str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        if candidate.exists() and candidate.is_file():
+            candidates.append(candidate)
+    return candidates
+
+
 def _delete_plan_targets() -> list[dict]:
     roots = _checkpoint_roots()
     targets = []
@@ -779,10 +816,16 @@ def _delete_plan_targets() -> list[dict]:
             continue
         raw_json_path = rec.get("json_path") or ""
         json_path = Path(raw_json_path).resolve() if raw_json_path else safetensors_path.with_suffix(".json")
+        thumbnail_paths = []
+        for thumb_path in _checkpoint_thumbnail_candidates(safetensors_path):
+            if roots and not any(_is_path_under_root(thumb_path, root) for root in roots):
+                continue
+            thumbnail_paths.append(str(thumb_path))
         targets.append({
             "ckpt_name_str": relpath,
             "safetensors_path": str(safetensors_path),
             "json_path": str(json_path),
+            "thumbnail_paths": thumbnail_paths,
             "reserved_at": rec.get("reserved_at", ""),
         })
     return targets
@@ -805,7 +848,8 @@ def _write_delete_script():
         "SCRIPT_DIR = Path(__file__).resolve().parent",
         "QUEUE_PATH = SCRIPT_DIR / 'checkpoint_delete_queue.jsonl'",
         f"ALLOWED_ROOTS = [Path(p).resolve() for p in {roots_json}]",
-        "ALLOWED_SUFFIXES = {'.safetensors', '.json'}",
+        "ALLOWED_THUMBNAIL_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}",
+        "ALLOWED_SUFFIXES = {'.safetensors', '.json'} | ALLOWED_THUMBNAIL_SUFFIXES",
         "",
         "def is_under_root(path, root):",
         "    path = Path(path).resolve()",
@@ -817,6 +861,29 @@ def _write_delete_script():
         "    if path.suffix.lower() not in ALLOWED_SUFFIXES:",
         "        return False",
         "    return any(is_under_root(path, root) for root in ALLOWED_ROOTS)",
+        "",
+        "def thumbnail_candidates(safetensors_path):",
+        "    path = Path(safetensors_path).resolve()",
+        "    parent = path.parent",
+        "    stem = path.stem",
+        "    name = path.name",
+        "    patterns = []",
+        "    for ext in sorted(ALLOWED_THUMBNAIL_SUFFIXES):",
+        "        patterns.extend([",
+        "            f'{stem}{ext}', f'{name}{ext}',",
+        "            f'{stem}.thumbnail{ext}', f'{stem}.thumb{ext}', f'{stem}.preview{ext}',",
+        "            f'{name}.thumbnail{ext}', f'{name}.thumb{ext}', f'{name}.preview{ext}',",
+        "        ])",
+        "    found = []",
+        "    seen = set()",
+        "    for pattern in patterns:",
+        "        candidate = (parent / pattern).resolve()",
+        "        if str(candidate) in seen:",
+        "            continue",
+        "        seen.add(str(candidate))",
+        "        if candidate.exists() and candidate.is_file() and is_safe_target(candidate):",
+        "            found.append(candidate)",
+        "    return found",
         "",
         "def read_records():",
         "    if not QUEUE_PATH.exists():",
@@ -865,20 +932,29 @@ def _write_delete_script():
         "            print('Skipping target without resolved_path:', relpath); continue",
         "        safetensors_path = Path(raw).resolve()",
         "        json_path = Path(rec.get('json_path') or safetensors_path.with_suffix('.json')).resolve()",
-        "        targets.append((relpath, safetensors_path, json_path, rec.get('reserved_at', '')))",
+        "        thumbnails = thumbnail_candidates(safetensors_path)",
+        "        targets.append((relpath, safetensors_path, json_path, thumbnails, rec.get('reserved_at', '')))",
         "    print('Checkpoint delete script')",
         "    print('Queue file:', QUEUE_PATH)",
         "    print('Targets:', len(targets))",
-        "    for idx, (relpath, safetensors_path, json_path, reserved_at) in enumerate(targets, start=1):",
+        "    for idx, (relpath, safetensors_path, json_path, thumbnails, reserved_at) in enumerate(targets, start=1):",
         "        print()",
         "        print('[{}/{}] Delete checkpoint?'.format(idx, len(targets)))",
         "        print('  relpath:', relpath)",
         "        print('  safetensors:', safetensors_path)",
         "        print('  json:', json_path)",
-        "        answer = input('Delete this checkpoint? (y/N): ').strip().lower()",
+        "        if thumbnails:",
+        "            print('  thumbnails:')",
+        "            for thumb in thumbnails:",
+        "                print('    -', thumb)",
+        "        else:",
+        "            print('  thumbnails: (none)')",
+        "        answer = input('Delete this checkpoint and listed sidecar thumbnails? (y/N): ').strip().lower()",
         "        if answer != 'y': print('Skipped.'); continue",
         "        delete_file(safetensors_path)",
         "        delete_file(json_path)",
+        "        for thumb in thumbnails:",
+        "            delete_file(thumb)",
         "    print()",
         "    print('Deletion completed. Please return to ComfyUI and click Refresh All.')",
         "",
@@ -898,6 +974,8 @@ def _write_delete_script():
             f"[{idx}] {item['ckpt_name_str']}",
             f"    safetensors: {item['safetensors_path']}",
             f"    json:        {item['json_path']}",
+            "    thumbnails:",
+            *([f"        - {thumb}" for thumb in item.get("thumbnail_paths", [])] or ["        (none)"]),
             f"    reserved_at: {item.get('reserved_at', '')}",
             "",
         ])
