@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// v9c: ListSelector hover thumbnail popup.
+// v9d: Selector thumbnail popup follows row hover or current selection inside node.
 // v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
@@ -682,6 +682,14 @@ function hpsNodeCollapsed(node) {
   return Boolean(node?.flags?.collapsed);
 }
 
+function hpsLocalInsideNode(node, local) {
+  return Boolean(local)
+    && local[0] >= 0
+    && local[1] >= 0
+    && local[0] <= (node.size?.[0] || 0)
+    && local[1] <= (node.size?.[1] || 0);
+}
+
 let cursorCaptureInstalled = false;
 function installCursorCapture() {
   if (cursorCaptureInstalled) return;
@@ -691,7 +699,18 @@ function installCursorCapture() {
   canvasEl.addEventListener("mousemove", (event) => {
     const graph = app.graph;
     if (!graph) return;
-    const nodes = [...(graph._nodes || [])].reverse();
+    const allNodes = graph._nodes || [];
+    for (const node of allNodes) {
+      if (!(node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS)) continue;
+      if (node.flags?.collapsed) {
+        clearSelectorThumbnailHover(node);
+        continue;
+      }
+      const local = graphEventToLocal(node, event);
+      if (!hpsLocalInsideNode(node, local)) clearSelectorThumbnailHover(node);
+    }
+
+    const nodes = [...allNodes].reverse();
     for (const node of nodes) {
       if (node.flags?.collapsed) continue;
       let cursor = "";
@@ -705,7 +724,12 @@ function installCursorCapture() {
     }
     setCanvasCursor("");
   });
-  canvasEl.addEventListener("mouseleave", () => setCanvasCursor(""));
+  canvasEl.addEventListener("mouseleave", () => {
+    for (const node of app.graph?._nodes || []) {
+      if (node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS) clearSelectorThumbnailHover(node);
+    }
+    setCanvasCursor("");
+  });
 }
 
 // ---------- Backend state restore ----------
@@ -888,9 +912,32 @@ function selectorThumbnailCacheKey(ckptName) {
 
 function clearSelectorThumbnailHover(node) {
   if (!node) return;
-  if (node.__hpsHoverCkptName || node.__hpsHoverRowIndex != null) {
+  if (node.__hpsHoverCkptName || node.__hpsHoverRowIndex != null || node.__hpsHoverSource) {
     node.__hpsHoverCkptName = "";
     node.__hpsHoverRowIndex = null;
+    node.__hpsHoverSource = "";
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function selectorVisibleRowIndexForCheckpoint(node, ckptName) {
+  if (!ckptName) return null;
+  const idx = selectorItems(node).findIndex((entry) => entry.ckpt_name_str === ckptName);
+  if (idx < 0) return null;
+  const row = idx - (node.__hpsScroll || 0);
+  return row >= 0 && row < SELECTOR_VISIBLE_ROWS ? row : null;
+}
+
+function setSelectorThumbnailHover(node, ckptName, rowIndex = null, source = "") {
+  if (!node || !ckptName) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+  if (node.__hpsHoverCkptName !== ckptName || node.__hpsHoverRowIndex !== rowIndex || node.__hpsHoverSource !== source) {
+    node.__hpsHoverCkptName = ckptName;
+    node.__hpsHoverRowIndex = rowIndex;
+    node.__hpsHoverSource = source;
+    requestSelectorThumbnail(node, ckptName);
     app.graph?.setDirtyCanvas?.(true, true);
   }
 }
@@ -947,22 +994,24 @@ async function requestSelectorThumbnail(node, ckptName) {
 function updateSelectorThumbnailHover(node, event, pos) {
   if (!node || hpsNodeCollapsed(node)) return;
   const local = selectorLocalFromEventOrPos(node, event, pos);
+  if (!hpsLocalInsideNode(node, local)) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+
   const hitItem = selectorItemAtLocal(node, local);
-  if (!hitItem) {
-    clearSelectorThumbnailHover(node);
+  if (hitItem?.item?.ckpt_name_str) {
+    setSelectorThumbnailHover(node, hitItem.item.ckpt_name_str, hitItem.row, "list");
     return;
   }
-  const ckpt = hitItem.item.ckpt_name_str || "";
-  if (!ckpt) {
-    clearSelectorThumbnailHover(node);
+
+  const selected = selectorSelected(node);
+  if (selected) {
+    setSelectorThumbnailHover(node, selected, selectorVisibleRowIndexForCheckpoint(node, selected), "selected");
     return;
   }
-  if (node.__hpsHoverCkptName !== ckpt || node.__hpsHoverRowIndex !== hitItem.row) {
-    node.__hpsHoverCkptName = ckpt;
-    node.__hpsHoverRowIndex = hitItem.row;
-    requestSelectorThumbnail(node, ckpt);
-    app.graph?.setDirtyCanvas?.(true, true);
-  }
+
+  clearSelectorThumbnailHover(node);
 }
 
 function drawSelectorThumbnailPopup(ctx, node) {
@@ -971,8 +1020,8 @@ function drawSelectorThumbnailPopup(ctx, node) {
   const r = selectorRects(node);
   const cache = selectorThumbnailCache.get(selectorThumbnailCacheKey(ckpt)) || { status: "loading" };
   const x = r.list.x + r.list.w + 12;
-  const rowIndex = Number.isFinite(node.__hpsHoverRowIndex) ? node.__hpsHoverRowIndex : 0;
-  const preferredY = r.list.y + rowIndex * ROW_H - 8;
+  const rowIndex = Number.isFinite(node.__hpsHoverRowIndex) ? node.__hpsHoverRowIndex : null;
+  const preferredY = rowIndex == null ? 46 : r.list.y + rowIndex * ROW_H - 8;
   const y = Math.max(8, Math.min(preferredY, (node.size?.[1] || 540) - SELECTOR_THUMBNAIL_POPUP_H - 8));
   const w = SELECTOR_THUMBNAIL_POPUP_W;
   const h = SELECTOR_THUMBNAIL_POPUP_H;
