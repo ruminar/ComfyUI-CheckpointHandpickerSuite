@@ -774,9 +774,11 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
 }
 
 
+
 // ---------- Preview ----------
 let hpsContextMenuEl = null;
 let hpsContextMenuHideInstalled = false;
+let imageDirHoverCaptureInstalled = false;
 
 function ensureHpsContextMenu() {
   if (hpsContextMenuEl) return hpsContextMenuEl;
@@ -806,7 +808,10 @@ function hideHpsContextMenu() {
 function installHpsContextMenuHide() {
   if (hpsContextMenuHideInstalled) return;
   hpsContextMenuHideInstalled = true;
-  document.addEventListener("mousedown", () => hideHpsContextMenu(), true);
+  document.addEventListener("mousedown", (event) => {
+    if (hpsContextMenuEl?.contains?.(event.target)) return;
+    hideHpsContextMenu();
+  }, true);
   document.addEventListener("scroll", () => hideHpsContextMenu(), true);
   window.addEventListener("blur", () => hideHpsContextMenu());
 }
@@ -907,20 +912,91 @@ function imageDirPreviewItemAtLocal(node, local) {
   return { index, sourcePath: String(sourcePaths[index] || ""), ckptName: String(st.ckpt_name_str || "") };
 }
 
+function imageDirPreviewTileRect(node, index) {
+  const st = node.__hpsPreviewState || {};
+  const cols = Number(st.columns || 0);
+  const tileW = Number(st.tile_width || 0);
+  const tileH = Number(st.tile_height || 0);
+  const gap = Number(st.gap || 0);
+  if (!cols || !tileW || !tileH || index == null || index < 0) return null;
+  const box = previewDrawBox(node);
+  if (!box) return null;
+  const row = Math.floor(index / cols);
+  const col = index % cols;
+  const sx = col * (tileW + gap);
+  const sy = row * (tileH + gap);
+  const scaleX = box.w / box.imageW;
+  const scaleY = box.h / box.imageH;
+  return { x: box.x + sx * scaleX, y: box.y + sy * scaleY, w: tileW * scaleX, h: tileH * scaleY };
+}
+
+function clearImageDirHover(node) {
+  if (!node) return;
+  if (node.__hpsHoveredPreviewIndex != null) {
+    node.__hpsHoveredPreviewIndex = null;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function setImageDirHover(node, item) {
+  const index = item?.index ?? null;
+  if (node.__hpsHoveredPreviewIndex !== index) {
+    node.__hpsHoveredPreviewIndex = index;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function updateImageDirHoverFromEvent(event) {
+  let handled = false;
+  const nodes = [...(app.graph?._nodes || [])].reverse();
+  for (const node of nodes) {
+    if (!node || node.flags?.collapsed || !isNodeClass(node, "ImageDirPreview")) continue;
+    const local = graphEventToLocal(node, event);
+    if (!hpsLocalInsideNode(node, local)) {
+      clearImageDirHover(node);
+      continue;
+    }
+    const item = imageDirPreviewItemAtLocal(node, local);
+    setImageDirHover(node, item);
+    handled = true;
+    break;
+  }
+  if (!handled) {
+    for (const node of app.graph?._nodes || []) {
+      if (isNodeClass(node, "ImageDirPreview")) clearImageDirHover(node);
+    }
+  }
+}
+
+function installImageDirHoverCapture() {
+  if (imageDirHoverCaptureInstalled) return;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+  imageDirHoverCaptureInstalled = true;
+  canvasEl.addEventListener("mousemove", (event) => updateImageDirHoverFromEvent(event), true);
+  canvasEl.addEventListener("mouseleave", () => {
+    for (const node of app.graph?._nodes || []) {
+      if (isNodeClass(node, "ImageDirPreview")) clearImageDirHover(node);
+    }
+  });
+}
+
 async function fetchImageDirContextMenu(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/context_menu`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, tab_id: HPS_TAB_ID }),
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
   });
   return await response.json();
 }
 
 async function setImageDirCheckpointThumbnail(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/set_thumbnail`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, tab_id: HPS_TAB_ID }),
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
   });
   const result = await response.json();
   if (result?.ok) {
@@ -954,54 +1030,11 @@ async function openImageDirContextMenu(node, item, event) {
   }
 }
 
-
-let imageDirContextCaptureInstalled = false;
-
-function findImageDirContextTarget(event) {
-  const nodes = [...(app.graph?._nodes || [])].reverse();
-  for (const node of nodes) {
-    if (!node || node.flags?.collapsed || !isNodeClass(node, "ImageDirPreview")) continue;
-    const local = graphEventToLocal(node, event);
-    if (!hpsLocalInsideNode(node, local)) continue;
-    const item = imageDirPreviewItemAtLocal(node, local);
-    // Return the node even when the click is on ImageDirPreview blank space.
-    // Blank-space right-clicks should suppress the standard ComfyUI menu but
-    // must not open an action menu.
-    return { node, item };
-  }
-  return null;
-}
-
-function installImageDirContextMenuCapture() {
-  if (imageDirContextCaptureInstalled) return;
-  const canvasEl = app.canvas?.canvas;
-  if (!canvasEl) return;
-  imageDirContextCaptureInstalled = true;
-
-  canvasEl.addEventListener("contextmenu", (event) => {
-    const target = findImageDirContextTarget(event);
-    if (!target) return;
-
-    // Any right-click inside ImageDirPreview is owned by HPS. This prevents
-    // browser/LiteGraph menus from leaking through blank areas.
-    event.preventDefault?.();
-    event.stopPropagation?.();
-    event.stopImmediatePropagation?.();
-
-    if (target.item) {
-      openImageDirContextMenu(target.node, target.item, event);
-    } else {
-      hideHpsContextMenu();
-    }
-    return false;
-  }, true);
-}
-
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
   installTabIdSupport(nodeType);
   installCursorCapture();
-  installImageDirContextMenuCapture();
+  installImageDirHoverCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -1054,6 +1087,19 @@ function setupPreviewNode(nodeType) {
     const drawBox = previewDrawBox(this);
     if (img && drawBox) {
       ctx.drawImage(img, drawBox.x, drawBox.y, drawBox.w, drawBox.h);
+      if (g.isImageDir && this.__hpsHoveredPreviewIndex != null) {
+        const rect = imageDirPreviewTileRect(this, this.__hpsHoveredPreviewIndex);
+        if (rect) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(255,255,255,0.95)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(rect.x + 1, rect.y + 1, Math.max(1, rect.w - 2), Math.max(1, rect.h - 2));
+          ctx.strokeStyle = "rgba(0,0,0,0.75)";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(rect.x + 3, rect.y + 3, Math.max(1, rect.w - 6), Math.max(1, rect.h - 6));
+          ctx.restore();
+        }
+      }
     } else {
       const st = this.__hpsPreviewState || {};
       const isLoading = st.status === "loading" || !!st.progress;
@@ -1080,17 +1126,22 @@ function setupPreviewNode(nodeType) {
     ctx.restore();
   };
 
-  const origMouseDown = nodeType.prototype.onRightClick;
-  nodeType.prototype.onRightClick = function (event, local_pos) {
-    // LiteGraphの onRightClick は第2引数にすでにローカル座標 (local_pos) が渡ってくる
-    if (isNodeClass(this, "ImageDirPreview")) {
-      if (hpsLocalInsideNode(this, local_pos)) {
-        // true を返すことで、LiteGraphの標準ノードメニュー展開を完全にブロックする！
-        // (実際の独自メニュー表示は、既存の contextmenu イベントキャプチャ側が担当する)
+  const origMouseDown = nodeType.prototype.onMouseDown;
+  nodeType.prototype.onMouseDown = function (event, pos, canvas) {
+    if (isNodeClass(this, "ImageDirPreview") && event?.button === 0) {
+      const local = previewLocalFromEventOrPos(this, event, pos);
+      const item = imageDirPreviewItemAtLocal(this, local);
+      if (item) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        event.stopImmediatePropagation?.();
+        setImageDirHover(this, item);
+        openImageDirContextMenu(this, item, event);
         return true;
       }
+      hideHpsContextMenu();
     }
-    return origRightClick ? origRightClick.apply(this, arguments) : false;
+    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 }
 
@@ -1118,6 +1169,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   }
 
   node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), ...detail };
+  if (isNodeClass(node, "ImageDirPreview")) node.__hpsHoveredPreviewIndex = null;
   const caption = detail.progress_message || detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   node.__hpsPreviewCaption = caption;
   if (!detail.image) {

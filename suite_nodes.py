@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9i: ImageDirPreview left-click menu, hover frame, and preview-state source path fix.
 # v9h: ImageDirPreview right-click event separation and blank-area suppression.
 # v9g: ImageDirPreview right-click capture fix for ComfyUI/LiteGraph context menu.
 # v9f: ImageDirPreview context menu foundation and Set as checkpoint thumbnail.
@@ -838,10 +839,12 @@ def _preferred_checkpoint_thumbnail_path(safetensors_path: Path) -> Path:
     return Path(safetensors_path).resolve().with_suffix(".jpg")
 
 
-def _get_preview_state_item(tab_id, node_id, item_index):
+def _get_preview_state_item(tab_id, node_id, item_index, preview_session_id=None):
     key = _state_key(tab_id, node_id)
     with _STATE_LOCK:
         state = dict(_PREVIEW_STATES.get(key, {}))
+    if preview_session_id and state.get("preview_session_id") != str(preview_session_id):
+        return state, None, None, None
     source_paths = state.get("source_paths")
     if not isinstance(source_paths, list):
         return None, None, None, None
@@ -1451,6 +1454,7 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
         "search_directory": str(_safe_search_root(search_directory) or ""),
         "max_preview_images": max_preview_images,
         "source_paths": [str(p) for p in loaded_paths],
+        "preview_session_id": str(uuid.uuid4()),
     })
     return sheet, extra
 
@@ -2020,7 +2024,8 @@ class ImageDirPreview:
         relpath = _normalize_relpath(ckpt_name_str)
         sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True, max_preview_images=max_preview_images)
         status = _get_status(relpath)
-        _store_preview_state(hps_tab_id, unique_id, relpath, status, node_class="ImageDirPreview")
+        state_extra = {k: v for k, v in extra.items() if k not in ("ckpt_name_str", "status")}
+        _store_preview_state(hps_tab_id, unique_id, relpath, status, **state_extra)
         _send_preview(unique_id, _image_dir_title(relpath), sheet, extra, tab_id=hps_tab_id)
         return ()
 
@@ -2085,7 +2090,7 @@ async def image_dir_preview_context_menu(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
-    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
     if not state or index is None or source_path is None or not relpath:
         return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
     exists = _preview_item_exists_for_state(state, source_path)
@@ -2115,7 +2120,7 @@ async def image_dir_preview_set_thumbnail(request):
     data = await request.json()
     node_id = str(data.get("node_id", ""))
     tab_id = _clean_tab_id(data.get("tab_id", ""))
-    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
     if not state or index is None or source_path is None or not relpath:
         return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
     if not _preview_item_exists_for_state(state, source_path):
@@ -2401,7 +2406,8 @@ async def review_sync_checkpoint(request):
                 True,
                 max_preview_images,
             )
-            _store_preview_state(tab_id, node_id, relpath, status, node_class="ImageDirPreview")
+            state_extra = {k: v for k, v in extra.items() if k not in ("ckpt_name_str", "status")}
+            _store_preview_state(tab_id, node_id, relpath, status, **state_extra)
             _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
             preview_count += 1
         except Exception:
