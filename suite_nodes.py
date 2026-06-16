@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9h: ImageDirPreview right-click event separation and blank-area suppression.
 # v9g: ImageDirPreview right-click capture fix for ComfyUI/LiteGraph context menu.
 # v9f: ImageDirPreview context menu foundation and Set as checkpoint thumbnail.
 # v9e: add top-tier god checkpoint status.

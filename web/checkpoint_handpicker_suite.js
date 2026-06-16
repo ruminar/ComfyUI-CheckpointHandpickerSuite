@@ -964,7 +964,10 @@ function findImageDirContextTarget(event) {
     const local = graphEventToLocal(node, event);
     if (!hpsLocalInsideNode(node, local)) continue;
     const item = imageDirPreviewItemAtLocal(node, local);
-    if (item) return { node, item };
+    // Return the node even when the click is on ImageDirPreview blank space.
+    // Blank-space right-clicks should suppress the standard ComfyUI menu but
+    // must not open an action menu.
+    return { node, item };
   }
   return null;
 }
@@ -979,11 +982,17 @@ function installImageDirContextMenuCapture() {
     const target = findImageDirContextTarget(event);
     if (!target) return;
 
+    // Any right-click inside ImageDirPreview is owned by HPS. This prevents
+    // browser/LiteGraph menus from leaking through blank areas.
     event.preventDefault?.();
     event.stopPropagation?.();
     event.stopImmediatePropagation?.();
 
-    openImageDirContextMenu(target.node, target.item, event);
+    if (target.item) {
+      openImageDirContextMenu(target.node, target.item, event);
+    } else {
+      hideHpsContextMenu();
+    }
     return false;
   }, true);
 }
@@ -1075,14 +1084,16 @@ function setupPreviewNode(nodeType) {
   nodeType.prototype.onMouseDown = function (event, pos, canvas) {
     if (isNodeClass(this, "ImageDirPreview") && event?.button === 2) {
       const local = previewLocalFromEventOrPos(this, event, pos);
-      const item = imageDirPreviewItemAtLocal(this, local);
-      if (item) {
+      if (hpsLocalInsideNode(this, local)) {
+        // Do not open the HPS menu from mousedown. Browsers fire contextmenu
+        // after right-button mousedown, and opening the menu here causes a
+        // double-trigger race. The contextmenu capture listener is the single
+        // menu-opening path.
         event.preventDefault?.();
         event.stopPropagation?.();
-        openImageDirContextMenu(this, item, event);
+        event.stopImmediatePropagation?.();
         return true;
       }
-      hideHpsContextMenu();
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
