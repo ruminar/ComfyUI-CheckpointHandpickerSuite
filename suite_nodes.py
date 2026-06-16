@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9f: ImageDirPreview context menu foundation and Set as checkpoint thumbnail.
 # v9e: add top-tier god checkpoint status.
 # v9d: sticky/current-selection thumbnail popup refinement.
 # v9c: ListSelector hover thumbnail popup.
@@ -828,6 +829,76 @@ def _load_sidecar_thumbnail_preview(relpath: str) -> tuple[Image.Image | None, s
     return None, ""
 
 
+def _preferred_checkpoint_thumbnail_path(safetensors_path: Path) -> Path:
+    existing = _checkpoint_thumbnail_candidates(safetensors_path)
+    if existing:
+        return Path(existing[0]).resolve()
+    return Path(safetensors_path).resolve().with_suffix(".jpg")
+
+
+def _get_preview_state_item(tab_id, node_id, item_index):
+    key = _state_key(tab_id, node_id)
+    with _STATE_LOCK:
+        state = dict(_PREVIEW_STATES.get(key, {}))
+    source_paths = state.get("source_paths")
+    if not isinstance(source_paths, list):
+        return None, None, None, None
+    try:
+        index = int(item_index)
+    except Exception:
+        return state, None, None, None
+    if index < 0 or index >= len(source_paths):
+        return state, None, None, None
+    raw_path = str(source_paths[index] or "").strip()
+    if not raw_path:
+        return state, None, None, None
+    try:
+        source_path = Path(raw_path).resolve()
+    except Exception:
+        return state, None, None, None
+    return state, index, source_path, _normalize_relpath(state.get("ckpt_name_str", ""))
+
+
+def _preview_item_exists_for_state(state: dict | None, source_path: Path | None) -> bool:
+    if not state or source_path is None:
+        return False
+    try:
+        if not source_path.exists() or not source_path.is_file():
+            return False
+    except Exception:
+        return False
+    search_root = _safe_search_root(state.get("search_directory"))
+    if search_root is not None and not _is_path_under_root(source_path, search_root):
+        return False
+    if source_path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
+        return False
+    return True
+
+
+def _set_checkpoint_thumbnail_from_preview_item(relpath: str, source_path: Path) -> dict:
+    relpath = _normalize_relpath(relpath)
+    if not _is_valid_checkpoint_relpath(relpath):
+        raise ValueError("Invalid checkpoint path.")
+    resolved = _resolve_checkpoint_unique(relpath)
+    if not resolved:
+        raise ValueError("Checkpoint not found.")
+    ckpt_path = Path(resolved["path"]).resolve()
+    target_path = _preferred_checkpoint_thumbnail_path(ckpt_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path) as img:
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        if max(img.width, img.height) > 1024:
+            img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        img.save(target_path, format="JPEG", quality=JPEG_QUALITY, optimize=JPEG_OPTIMIZE)
+    return {
+        "ckpt_name_str": relpath,
+        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+        "source_path": str(source_path),
+        "thumbnail_path": str(target_path),
+    }
+
+
 def _delete_plan_targets() -> list[dict]:
     roots = _checkpoint_roots()
     targets = []
@@ -1348,12 +1419,14 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
     progress(len(selected_paths), max_preview_images, f"Found preview images {len(selected_paths)}/{max_preview_images}")
 
     images = []
+    loaded_paths = []
     total = len(selected_paths)
     for idx, path in enumerate(selected_paths, start=1):
         progress(idx - 1, max(1, total), f"Loading preview image {idx}/{total}")
         img = _load_image_file(path)
         if img is not None:
             images.append(img)
+            loaded_paths.append(path)
         progress(idx, max(1, total), f"Loading preview image {idx}/{total}")
 
     def cb(value, total, message):
@@ -1375,7 +1448,7 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
         "progress_total": max_preview_images,
         "search_directory": str(_safe_search_root(search_directory) or ""),
         "max_preview_images": max_preview_images,
-        "source_paths": [str(p) for p in selected_paths],
+        "source_paths": [str(p) for p in loaded_paths],
     })
     return sheet, extra
 
@@ -2001,6 +2074,67 @@ async def selector_thumbnail(request):
         "found": True,
         "ckpt_name_str": relpath,
         "thumbnail_path": path,
+    })
+    return web.json_response(payload)
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/context_menu")
+async def image_dir_preview_context_menu(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    exists = _preview_item_exists_for_state(state, source_path)
+    if not exists:
+        return web.json_response({
+            "ok": True,
+            "node_id": node_id,
+            "item_index": index,
+            "exists": False,
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+            "items": [{"id": "deleted", "label": "Image deleted", "enabled": False}],
+        })
+    return web.json_response({
+        "ok": True,
+        "node_id": node_id,
+        "item_index": index,
+        "exists": True,
+        "ckpt_name_str": relpath,
+        "source_path": str(source_path),
+        "items": [{"id": "set_thumbnail", "label": "Set as checkpoint thumbnail", "enabled": True}],
+    })
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/set_thumbnail")
+async def image_dir_preview_set_thumbnail(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if not _preview_item_exists_for_state(state, source_path):
+        return web.json_response({
+            "ok": True,
+            "exists": False,
+            "message": "Image deleted",
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    try:
+        payload = _set_checkpoint_thumbnail_from_preview_item(relpath, source_path)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except Exception:
+        logger.exception("[CheckpointHandpickerSuite] failed to set checkpoint thumbnail")
+        return web.json_response({"ok": False, "error": "Failed to set checkpoint thumbnail."}, status=500)
+    payload.update({
+        "ok": True,
+        "exists": True,
+        "message": "Checkpoint thumbnail updated.",
     })
     return web.json_response(payload)
 

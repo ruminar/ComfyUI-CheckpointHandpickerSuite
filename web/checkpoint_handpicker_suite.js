@@ -773,7 +773,187 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
   }
 }
 
+
 // ---------- Preview ----------
+let hpsContextMenuEl = null;
+let hpsContextMenuHideInstalled = false;
+
+function ensureHpsContextMenu() {
+  if (hpsContextMenuEl) return hpsContextMenuEl;
+  const el = document.createElement("div");
+  el.style.position = "fixed";
+  el.style.zIndex = "99999";
+  el.style.minWidth = "220px";
+  el.style.background = "rgba(22,22,22,0.98)";
+  el.style.border = "1px solid rgba(255,255,255,0.18)";
+  el.style.borderRadius = "8px";
+  el.style.boxShadow = "0 10px 28px rgba(0,0,0,0.45)";
+  el.style.padding = "6px";
+  el.style.display = "none";
+  el.style.font = "12px sans-serif";
+  el.style.color = "#eee";
+  document.body.appendChild(el);
+  hpsContextMenuEl = el;
+  return el;
+}
+
+function hideHpsContextMenu() {
+  const el = ensureHpsContextMenu();
+  el.style.display = "none";
+  el.innerHTML = "";
+}
+
+function installHpsContextMenuHide() {
+  if (hpsContextMenuHideInstalled) return;
+  hpsContextMenuHideInstalled = true;
+  document.addEventListener("mousedown", () => hideHpsContextMenu(), true);
+  document.addEventListener("scroll", () => hideHpsContextMenu(), true);
+  window.addEventListener("blur", () => hideHpsContextMenu());
+}
+
+function showHpsContextMenu(items, clientX, clientY) {
+  installHpsContextMenuHide();
+  const el = ensureHpsContextMenu();
+  el.innerHTML = "";
+  const menuItems = Array.isArray(items) ? items : [];
+  for (const item of menuItems) {
+    const row = document.createElement("div");
+    row.textContent = String(item?.label || "");
+    row.style.padding = "7px 10px";
+    row.style.borderRadius = "6px";
+    row.style.whiteSpace = "nowrap";
+    row.style.userSelect = "none";
+    const enabled = item?.enabled !== false && typeof item?.onClick === "function";
+    if (enabled) {
+      row.style.cursor = "pointer";
+      row.addEventListener("mouseenter", () => { row.style.background = "rgba(255,255,255,0.10)"; });
+      row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideHpsContextMenu();
+        item.onClick();
+      });
+    } else {
+      row.style.color = "#999";
+      row.style.cursor = "default";
+    }
+    el.appendChild(row);
+  }
+  el.style.left = `${Math.max(4, Number(clientX || 0))}px`;
+  el.style.top = `${Math.max(4, Number(clientY || 0))}px`;
+  el.style.display = "block";
+  const rect = el.getBoundingClientRect();
+  const maxX = Math.max(4, window.innerWidth - rect.width - 4);
+  const maxY = Math.max(4, window.innerHeight - rect.height - 4);
+  el.style.left = `${Math.min(Math.max(4, Number(clientX || 0)), maxX)}px`;
+  el.style.top = `${Math.min(Math.max(4, Number(clientY || 0)), maxY)}px`;
+}
+
+function previewGeometry(node) {
+  const isImageDir = isNodeClass(node, "ImageDirPreview");
+  const top = isImageDir ? 72 : 30;
+  const margin = 8;
+  const w = Math.max(1, (node.size?.[0] || 340) - margin * 2);
+  const h = Math.max(1, (node.size?.[1] || 300) - top - margin);
+  return { isImageDir, top, margin, w, h };
+}
+
+function previewDrawBox(node) {
+  const img = node?.__hpsPreview;
+  if (!img) return null;
+  const g = previewGeometry(node);
+  let dw = g.w;
+  let dh = dw * (img.height / img.width);
+  if (dh > g.h) {
+    dh = g.h;
+    dw = dh * (img.width / img.height);
+  }
+  const x = g.margin + (g.w - dw) / 2;
+  const y = g.top + (g.h - dh) / 2;
+  return { x, y, w: dw, h: dh, imageW: img.width, imageH: img.height };
+}
+
+function previewLocalFromEventOrPos(node, event, pos) {
+  return graphEventToLocal(node, event) || localPos(node, pos);
+}
+
+function imageDirPreviewItemAtLocal(node, local) {
+  if (!node || !isNodeClass(node, "ImageDirPreview") || !local) return null;
+  const st = node.__hpsPreviewState || {};
+  const sourcePaths = Array.isArray(st.source_paths) ? st.source_paths : [];
+  const count = Number(st.count || sourcePaths.length || 0);
+  const cols = Number(st.columns || 0);
+  const rows = Number(st.rows || 0);
+  const tileW = Number(st.tile_width || 0);
+  const tileH = Number(st.tile_height || 0);
+  const gap = Number(st.gap || 0);
+  if (!count || !cols || !rows || !tileW || !tileH || !sourcePaths.length) return null;
+  const box = previewDrawBox(node);
+  if (!box || !hit(local, box)) return null;
+  const sx = (local[0] - box.x) * (box.imageW / box.w);
+  const sy = (local[1] - box.y) * (box.imageH / box.h);
+  const stepX = tileW + gap;
+  const stepY = tileH + gap;
+  if (stepX <= 0 || stepY <= 0) return null;
+  const col = Math.floor(sx / stepX);
+  const row = Math.floor(sy / stepY);
+  if (col < 0 || row < 0 || col >= cols || row >= rows) return null;
+  const inTileX = sx - col * stepX;
+  const inTileY = sy - row * stepY;
+  if (inTileX < 0 || inTileX > tileW || inTileY < 0 || inTileY > tileH) return null;
+  const index = row * cols + col;
+  if (index < 0 || index >= count || index >= sourcePaths.length) return null;
+  return { index, sourcePath: String(sourcePaths[index] || ""), ckptName: String(st.ckpt_name_str || "") };
+}
+
+async function fetchImageDirContextMenu(node, itemIndex) {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/context_menu`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, tab_id: HPS_TAB_ID }),
+  });
+  return await response.json();
+}
+
+async function setImageDirCheckpointThumbnail(node, itemIndex) {
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/set_thumbnail`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, tab_id: HPS_TAB_ID }),
+  });
+  const result = await response.json();
+  if (result?.ok) {
+    selectorThumbnailCache.delete(selectorThumbnailCacheKey(result.ckpt_name_str || ""));
+    node.__hpsPreviewContextMessage = result.message || "Checkpoint thumbnail updated.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  } else {
+    node.__hpsPreviewContextMessage = result?.error || "Failed to set checkpoint thumbnail.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  }
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+async function openImageDirContextMenu(node, item, event) {
+  hideHpsContextMenu();
+  try {
+    const result = await fetchImageDirContextMenu(node, item.index);
+    if (!result?.ok) {
+      showHpsContextMenu([{ label: result?.error || "Preview item not found", enabled: false }], event.clientX, event.clientY);
+      return;
+    }
+    const items = (result.items || []).map((entry) => {
+      if (entry?.id === "set_thumbnail" && entry?.enabled !== false) {
+        return { label: entry.label || "Set as checkpoint thumbnail", enabled: true, onClick: () => setImageDirCheckpointThumbnail(node, item.index) };
+      }
+      return { label: entry?.label || "Image deleted", enabled: false };
+    });
+    showHpsContextMenu(items, event.clientX, event.clientY);
+  } catch (error) {
+    showHpsContextMenu([{ label: "Failed to open menu", enabled: false }], event.clientX, event.clientY);
+  }
+}
+
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
   installTabIdSupport(nodeType);
@@ -798,19 +978,15 @@ function setupPreviewNode(nodeType) {
     ensureHiddenTabIdWidget(this);
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
-    const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 72 : 30;
-    const margin = 8;
-    const messageX = Math.min(140, Math.max(margin, this.size[0] - 80));
-    const captionY = isImageDir ? 36 : 20;
-    const messageW = Math.max(1, this.size[0] - messageX - margin);
-    const w = Math.max(1, this.size[0] - margin * 2);
-    const h = Math.max(1, this.size[1] - top - margin);
+    const g = previewGeometry(this);
+    const messageX = Math.min(140, Math.max(g.margin, this.size[0] - 80));
+    const captionY = g.isImageDir ? 36 : 20;
+    const messageW = Math.max(1, this.size[0] - messageX - g.margin);
     ctx.save();
     if (this.__hpsPreviewCaption) {
       const st = this.__hpsPreviewState || {};
       const isWarning = st.status && !["ready", "loading"].includes(st.status);
-      if (isImageDir) {
+      if (g.isImageDir) {
         ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.18)";
         ctx.fillRect(messageX - 4, captionY - 13, messageW + 4, 18);
       }
@@ -818,29 +994,22 @@ function setupPreviewNode(nodeType) {
       ctx.font = "12px sans-serif";
       ctx.fillText(this.__hpsPreviewCaption, messageX, captionY, messageW);
     }
-    if (isImageDir && (this.__hpsPreviewState?.progress || this.__hpsPreviewState?.progress_total)) {
+    if (g.isImageDir && (this.__hpsPreviewState?.progress || this.__hpsPreviewState?.progress_total)) {
       const st = this.__hpsPreviewState || {};
       const total = Math.max(1, Number(st.progress_total || st.max_preview_images || 1));
       const value = Math.max(0, Math.min(total, Number(st.progress_value || 0)));
-      const barX = margin;
+      const barX = g.margin;
       const barY = 0;
-      const barW = Math.max(1, this.size[0] - margin * 2);
+      const barW = Math.max(1, this.size[0] - g.margin * 2);
       const barH = 6;
       ctx.fillStyle = "rgba(255,255,255,0.14)";
       ctx.fillRect(barX, barY, barW, barH);
       ctx.fillStyle = "rgba(255,255,255,0.58)";
       ctx.fillRect(barX, barY, barW * (value / total), barH);
     }
-    if (img) {
-      let dw = w;
-      let dh = dw * (img.height / img.width);
-      if (dh > h) {
-        dh = h;
-        dw = dh * (img.width / img.height);
-      }
-      const x = margin + (w - dw) / 2;
-      const y = top + (h - dh) / 2;
-      ctx.drawImage(img, x, y, dw, dh);
+    const drawBox = previewDrawBox(this);
+    if (img && drawBox) {
+      ctx.drawImage(img, drawBox.x, drawBox.y, drawBox.w, drawBox.h);
     } else {
       const st = this.__hpsPreviewState || {};
       const isLoading = st.status === "loading" || !!st.progress;
@@ -850,12 +1019,37 @@ function setupPreviewNode(nodeType) {
         ctx.font = "12px sans-serif";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(text, this.size[0] / 2, top + h / 2, Math.max(1, w - 16));
+        ctx.fillText(text, this.size[0] / 2, g.top + g.h / 2, Math.max(1, g.w - 16));
         ctx.textAlign = "left";
         ctx.textBaseline = "alphabetic";
       }
     }
+    const contextMsg = this.__hpsPreviewContextMessage || "";
+    const msgAge = Date.now() - Number(this.__hpsPreviewContextMessageAt || 0);
+    if (contextMsg && msgAge < 5000 && g.isImageDir) {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(8, Math.max(46, g.top - 22), Math.max(140, this.size[0] - 16), 18);
+      ctx.fillStyle = "#ddd";
+      ctx.font = "12px sans-serif";
+      ctx.fillText(contextMsg, 12, Math.max(60, g.top - 9), Math.max(120, this.size[0] - 24));
+    }
     ctx.restore();
+  };
+
+  const origMouseDown = nodeType.prototype.onMouseDown;
+  nodeType.prototype.onMouseDown = function (event, pos, canvas) {
+    if (isNodeClass(this, "ImageDirPreview") && event?.button === 2) {
+      const local = previewLocalFromEventOrPos(this, event, pos);
+      const item = imageDirPreviewItemAtLocal(this, local);
+      if (item) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        openImageDirContextMenu(this, item, event);
+        return true;
+      }
+      hideHpsContextMenu();
+    }
+    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 }
 
