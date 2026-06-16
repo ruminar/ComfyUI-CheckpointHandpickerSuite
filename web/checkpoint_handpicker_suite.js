@@ -954,10 +954,45 @@ async function openImageDirContextMenu(node, item, event) {
   }
 }
 
+
+let imageDirContextCaptureInstalled = false;
+
+function findImageDirContextTarget(event) {
+  const nodes = [...(app.graph?._nodes || [])].reverse();
+  for (const node of nodes) {
+    if (!node || node.flags?.collapsed || !isNodeClass(node, "ImageDirPreview")) continue;
+    const local = graphEventToLocal(node, event);
+    if (!hpsLocalInsideNode(node, local)) continue;
+    const item = imageDirPreviewItemAtLocal(node, local);
+    if (item) return { node, item };
+  }
+  return null;
+}
+
+function installImageDirContextMenuCapture() {
+  if (imageDirContextCaptureInstalled) return;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+  imageDirContextCaptureInstalled = true;
+
+  canvasEl.addEventListener("contextmenu", (event) => {
+    const target = findImageDirContextTarget(event);
+    if (!target) return;
+
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    event.stopImmediatePropagation?.();
+
+    openImageDirContextMenu(target.node, target.item, event);
+    return false;
+  }, true);
+}
+
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
   installTabIdSupport(nodeType);
   installCursorCapture();
+  installImageDirContextMenuCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
