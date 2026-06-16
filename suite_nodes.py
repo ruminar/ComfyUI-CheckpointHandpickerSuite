@@ -880,6 +880,54 @@ def _preview_item_exists_for_state(state: dict | None, source_path: Path | None)
     return True
 
 
+def _preview_deleted_indices(state: dict | None) -> list[int]:
+    if not state:
+        return []
+    values = state.get("deleted_indices")
+    if not isinstance(values, list):
+        return []
+    out = []
+    for value in values:
+        try:
+            idx = int(value)
+        except Exception:
+            continue
+        if idx >= 0:
+            out.append(idx)
+    return sorted(set(out))
+
+
+def _preview_item_deleted_for_state(state: dict | None, index: int | None) -> bool:
+    if index is None:
+        return False
+    return index in set(_preview_deleted_indices(state))
+
+
+def _mark_preview_item_deleted(tab_id, node_id, index: int) -> list[int]:
+    key = _state_key(tab_id, node_id)
+    with _STATE_LOCK:
+        state = _PREVIEW_STATES.get(key)
+        if not state:
+            return []
+        deleted = set(_preview_deleted_indices(state))
+        deleted.add(int(index))
+        merged = sorted(deleted)
+        state["deleted_indices"] = merged
+        _PREVIEW_STATES[key] = state
+        return list(merged)
+
+
+def _delete_preview_source_image(state: dict, source_path: Path) -> None:
+    search_root = _safe_search_root(state.get("search_directory"))
+    if search_root is not None and not _is_path_under_root(source_path, search_root):
+        raise ValueError("Preview image is outside the allowed search directory.")
+    if source_path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
+        raise ValueError("Unsupported preview image format.")
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(str(source_path))
+    source_path.unlink()
+
+
 def _set_checkpoint_thumbnail_from_preview_item(relpath: str, source_path: Path) -> dict:
     relpath = _normalize_relpath(relpath)
     if not _is_valid_checkpoint_relpath(relpath):
@@ -1455,6 +1503,7 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
         "max_preview_images": max_preview_images,
         "source_paths": [str(p) for p in loaded_paths],
         "preview_session_id": str(uuid.uuid4()),
+        "deleted_indices": [],
     })
     return sheet, extra
 
@@ -2093,6 +2142,17 @@ async def image_dir_preview_context_menu(request):
     state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
     if not state or index is None or source_path is None or not relpath:
         return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if _preview_item_deleted_for_state(state, index):
+        return web.json_response({
+            "ok": True,
+            "node_id": node_id,
+            "item_index": index,
+            "exists": False,
+            "deleted": True,
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+            "items": [],
+        })
     exists = _preview_item_exists_for_state(state, source_path)
     if not exists:
         return web.json_response({
@@ -2100,18 +2160,72 @@ async def image_dir_preview_context_menu(request):
             "node_id": node_id,
             "item_index": index,
             "exists": False,
+            "deleted": False,
             "ckpt_name_str": relpath,
             "source_path": str(source_path),
-            "items": [{"id": "deleted", "label": "Image deleted", "enabled": False}],
+            "items": [],
         })
     return web.json_response({
         "ok": True,
         "node_id": node_id,
         "item_index": index,
         "exists": True,
+        "deleted": False,
         "ckpt_name_str": relpath,
         "source_path": str(source_path),
-        "items": [{"id": "set_thumbnail", "label": "Set as checkpoint thumbnail", "enabled": True}],
+        "items": [
+            {"id": "delete_image", "label": "Delete image", "enabled": True},
+            {"id": "set_thumbnail", "label": "Set as checkpoint thumbnail", "enabled": True},
+        ],
+    })
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/delete_image")
+async def image_dir_preview_delete_image(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if _preview_item_deleted_for_state(state, index):
+        return web.json_response({
+            "ok": True,
+            "deleted": True,
+            "exists": False,
+            "message": "Preview image already deleted.",
+            "deleted_indices": _preview_deleted_indices(state),
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    if not _preview_item_exists_for_state(state, source_path):
+        return web.json_response({
+            "ok": True,
+            "deleted": False,
+            "exists": False,
+            "message": "Preview image not found.",
+            "deleted_indices": _preview_deleted_indices(state),
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    try:
+        _delete_preview_source_image(state, source_path)
+        deleted_indices = _mark_preview_item_deleted(tab_id, node_id, index)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except FileNotFoundError:
+        return web.json_response({"ok": True, "deleted": False, "exists": False, "message": "Preview image not found.", "deleted_indices": _preview_deleted_indices(state), "ckpt_name_str": relpath, "source_path": str(source_path)})
+    except Exception:
+        logger.exception("[CheckpointHandpickerSuite] failed to delete preview image")
+        return web.json_response({"ok": False, "error": "Failed to delete preview image."}, status=500)
+    return web.json_response({
+        "ok": True,
+        "deleted": True,
+        "exists": False,
+        "message": "Preview image deleted.",
+        "deleted_indices": deleted_indices,
+        "ckpt_name_str": relpath,
+        "source_path": str(source_path),
     })
 
 
@@ -2123,7 +2237,7 @@ async def image_dir_preview_set_thumbnail(request):
     state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
     if not state or index is None or source_path is None or not relpath:
         return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
-    if not _preview_item_exists_for_state(state, source_path):
+    if _preview_item_deleted_for_state(state, index) or not _preview_item_exists_for_state(state, source_path):
         return web.json_response({
             "ok": True,
             "exists": False,

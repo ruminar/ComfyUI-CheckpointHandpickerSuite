@@ -909,6 +909,7 @@ function imageDirPreviewItemAtLocal(node, local) {
   if (inTileX < 0 || inTileX > tileW || inTileY < 0 || inTileY > tileH) return null;
   const index = row * cols + col;
   if (index < 0 || index >= count || index >= sourcePaths.length) return null;
+  if (isImageDirDeletedIndex(node, index)) return null;
   return { index, sourcePath: String(sourcePaths[index] || ""), ckptName: String(st.ckpt_name_str || "") };
 }
 
@@ -981,6 +982,65 @@ function installImageDirHoverCapture() {
   });
 }
 
+const NO_IMAGE_ASSET_URL = new URL("./assets/no_image.svg", import.meta.url).href;
+let noImageAsset = null;
+let noImageAssetRequested = false;
+
+function ensureNoImageAsset() {
+  if (noImageAsset || noImageAssetRequested) return noImageAsset;
+  noImageAssetRequested = true;
+  const img = new Image();
+  img.onload = () => {
+    noImageAsset = img;
+    app.graph?.setDirtyCanvas?.(true, true);
+  };
+  img.onerror = () => {
+    noImageAsset = null;
+  };
+  img.src = NO_IMAGE_ASSET_URL;
+  return null;
+}
+
+function deletedImageDirIndexSet(node) {
+  const raw = node?.__hpsPreviewState?.deleted_indices;
+  if (!Array.isArray(raw) || !raw.length) return null;
+  return new Set(raw.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v >= 0));
+}
+
+function isImageDirDeletedIndex(node, index) {
+  if (index == null || index < 0) return false;
+  const set = deletedImageDirIndexSet(node);
+  return !!set && set.has(Number(index));
+}
+
+function updateNodeDeletedIndices(node, values) {
+  if (!node) return;
+  const next = Array.isArray(values) ? values.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v >= 0) : [];
+  node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), deleted_indices: next };
+}
+
+function drawNoImagePlaceholder(ctx, rect) {
+  ctx.save();
+  ctx.fillStyle = "rgba(20,20,20,0.72)";
+  ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+  const asset = noImageAsset || ensureNoImageAsset();
+  if (asset) {
+    ctx.drawImage(asset, rect.x, rect.y, rect.w, rect.h);
+  } else {
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(1, rect.w - 1), Math.max(1, rect.h - 1));
+    ctx.fillStyle = "rgba(255,255,255,0.88)";
+    ctx.font = "bold 12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("NO IMAGE", rect.x + rect.w / 2, rect.y + rect.h / 2, Math.max(1, rect.w - 10));
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+  }
+  ctx.restore();
+}
+
 async function fetchImageDirContextMenu(node, itemIndex) {
   const st = node.__hpsPreviewState || {};
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/context_menu`, {
@@ -1010,6 +1070,26 @@ async function setImageDirCheckpointThumbnail(node, itemIndex) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
+async function deleteImageDirPreviewImage(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/delete_image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
+  });
+  const result = await response.json();
+  if (result?.ok) {
+    if (Array.isArray(result.deleted_indices)) updateNodeDeletedIndices(node, result.deleted_indices);
+    if (result.deleted) clearImageDirHover(node);
+    node.__hpsPreviewContextMessage = result.message || (result.deleted ? "Preview image deleted." : "Preview image not found.");
+    node.__hpsPreviewContextMessageAt = Date.now();
+  } else {
+    node.__hpsPreviewContextMessage = result?.error || "Failed to delete preview image.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  }
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
 async function openImageDirContextMenu(node, item, event) {
   hideHpsContextMenu();
   try {
@@ -1019,11 +1099,25 @@ async function openImageDirContextMenu(node, item, event) {
       return;
     }
     const items = (result.items || []).map((entry) => {
+      if (entry?.id === "delete_image" && entry?.enabled !== false) {
+        return {
+          label: entry.label || "Delete image",
+          enabled: true,
+          onClick: async () => {
+            if (!globalThis.confirm?.("Delete this image?")) return;
+            await deleteImageDirPreviewImage(node, item.index);
+          },
+        };
+      }
       if (entry?.id === "set_thumbnail" && entry?.enabled !== false) {
         return { label: entry.label || "Set as checkpoint thumbnail", enabled: true, onClick: () => setImageDirCheckpointThumbnail(node, item.index) };
       }
-      return { label: entry?.label || "Image deleted", enabled: false };
-    });
+      return null;
+    }).filter(Boolean);
+    if (!items.length) {
+      hideHpsContextMenu();
+      return;
+    }
     showHpsContextMenu(items, event.clientX, event.clientY);
   } catch (error) {
     showHpsContextMenu([{ label: "Failed to open menu", enabled: false }], event.clientX, event.clientY);
@@ -1087,7 +1181,13 @@ function setupPreviewNode(nodeType) {
     const drawBox = previewDrawBox(this);
     if (img && drawBox) {
       ctx.drawImage(img, drawBox.x, drawBox.y, drawBox.w, drawBox.h);
-      if (g.isImageDir && this.__hpsHoveredPreviewIndex != null) {
+      if (g.isImageDir) {
+        for (const index of deletedImageDirIndexSet(this) || []) {
+          const rect = imageDirPreviewTileRect(this, index);
+          if (rect) drawNoImagePlaceholder(ctx, rect);
+        }
+      }
+      if (g.isImageDir && this.__hpsHoveredPreviewIndex != null && !isImageDirDeletedIndex(this, this.__hpsHoveredPreviewIndex)) {
         const rect = imageDirPreviewTileRect(this, this.__hpsHoveredPreviewIndex);
         if (rect) {
           ctx.save();
