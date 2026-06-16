@@ -1080,22 +1080,17 @@ function setupPreviewNode(nodeType) {
     ctx.restore();
   };
 
-  const origMouseDown = nodeType.prototype.onMouseDown;
-  nodeType.prototype.onMouseDown = function (event, pos, canvas) {
-    if (isNodeClass(this, "ImageDirPreview") && event?.button === 2) {
-      const local = previewLocalFromEventOrPos(this, event, pos);
-      if (hpsLocalInsideNode(this, local)) {
-        // Do not open the HPS menu from mousedown. Browsers fire contextmenu
-        // after right-button mousedown, and opening the menu here causes a
-        // double-trigger race. The contextmenu capture listener is the single
-        // menu-opening path.
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        event.stopImmediatePropagation?.();
+  const origMouseDown = nodeType.prototype.onRightClick;
+  nodeType.prototype.onRightClick = function (event, local_pos) {
+    // LiteGraphの onRightClick は第2引数にすでにローカル座標 (local_pos) が渡ってくる
+    if (isNodeClass(this, "ImageDirPreview")) {
+      if (hpsLocalInsideNode(this, local_pos)) {
+        // true を返すことで、LiteGraphの標準ノードメニュー展開を完全にブロックする！
+        // (実際の独自メニュー表示は、既存の contextmenu イベントキャプチャ側が担当する)
         return true;
       }
     }
-    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+    return origRightClick ? origRightClick.apply(this, arguments) : false;
   };
 }
 
