@@ -22,6 +22,7 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9k: DirectLink mode and persistent output-side delete script folder.
 # v9i: ImageDirPreview left-click menu, hover frame, and preview-state source path fix.
 # v9h: ImageDirPreview right-click event separation and blank-area suppression.
 # v9g: ImageDirPreview right-click capture fix for ComfyUI/LiteGraph context menu.
@@ -46,11 +47,12 @@ DATA_DIR = NODE_DIR / "data"
 STATUS_DB_PATH = DATA_DIR / "checkpoint_statuses.json"
 FAVORITES_COMPAT_PATH = DATA_DIR / "checkpoint_favorites.json"
 try:
-    TEMP_DIR = Path(folder_paths.get_temp_directory()).resolve()
+    OUTPUT_DIR = Path(folder_paths.get_output_directory()).resolve()
 except Exception:
-    TEMP_DIR = NODE_DIR / "temp"
-DELETE_QUEUE_PATH = TEMP_DIR / "checkpoint_delete_queue.jsonl"
-DELETE_SCRIPT_PATH = TEMP_DIR / "delete_reserved_checkpoints.py"
+    OUTPUT_DIR = NODE_DIR / "output"
+DELETE_SCRIPT_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite" / "delete_scripts"
+DELETE_QUEUE_PATH = DELETE_SCRIPT_DIR / "checkpoint_delete_queue.jsonl"
+DELETE_SCRIPT_PATH = DELETE_SCRIPT_DIR / "delete_reserved_checkpoints.py"
 
 JPEG_QUALITY = 80
 JPEG_OPTIMIZE = False

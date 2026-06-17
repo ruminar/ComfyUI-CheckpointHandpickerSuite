@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v9k: DirectLink mode and output-side delete script folder.
 // v9d: Selector thumbnail popup follows row hover or current selection inside node.
 // v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 const EXT = "ruminar.checkpoint_handpicker_suite";
@@ -749,7 +750,9 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
         setPreviewTitleFromCheckpoint(node, result.ckpt_name_str, result.status || "none");
       }
     } else if (nodeClass === TAGGER_CLASS) {
-      if (result.ckpt_name_str) {
+      if (isTaggerDirectLinkBlocked(node)) {
+        clearTaggerTarget(node);
+      } else if (result.ckpt_name_str) {
         node.__hpsTaggerPath = result.ckpt_name_str;
         node.__hpsTaggerStatus = result.status || "none";
         node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
@@ -1489,8 +1492,8 @@ function selectorRects(node) {
     list: { x: margin, y: 104, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
-function selectorItems(node) { return node.__hpsItems || []; }
-function selectorSelected(node) { return selectorWidget(node)?.value || node.__hpsSelected || ""; }
+function selectorItems(node) { return node?.__hpsItems || []; }
+function selectorSelected(node) { return node ? (selectorWidget(node)?.value || node.__hpsSelected || "") : ""; }
 function selectorStatusFor(node, ckptName) {
   const item = selectorItems(node).find((entry) => entry.ckpt_name_str === ckptName);
   return item?.status || "none";
@@ -1506,6 +1509,7 @@ function setSelectorSelected(node, value) {
   const w = selectorWidget(node); if (w) w.value = value;
   node.__hpsSelected = value;
   node.title = selectorTitleText(node, value);
+  updateDirectLinkTaggers(node);
 }
 function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
@@ -1637,11 +1641,79 @@ function nextAnimationFrame() {
 
 function selectorActionMode(node) {
   const targets = getSelectorReviewTargets(node);
-  return (targets.taggers.length || targets.previews.length) ? "sync" : "push";
+  if (targets.previews.length) return "sync";
+  if (targets.taggers.length) return "directlink";
+  return "push";
+}
+
+function selectorDirectLinkEnabled(node) {
+  return selectorActionMode(node) === "directlink" && !!node.__hpsDirectLinkEnabled;
 }
 
 function selectorActionLabel(node) {
-  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push to Local List";
+  const mode = selectorActionMode(node);
+  if (mode === "sync") return "🎯 Sync Checkpoint";
+  if (mode === "directlink") return selectorDirectLinkEnabled(node) ? "🌕 DirectLink ON" : "🌑 DirectLink OFF";
+  return "🏹 Push to Local List";
+}
+
+const DIRECT_LINK_CONFIRM_MESSAGE = "Enable DirectLink?\n\nUse this mode only while checking generated images on a tablet, shared folder, or external viewer.\n\nOtherwise, connect ImageDirPreview and use Sync mode.\n\nTagger will label the checkpoint selected in ListSelector.";
+
+function directLinkTaggerTargets(node) {
+  const targets = getSelectorReviewTargets(node);
+  return selectorActionMode(node) === "directlink" ? targets.taggers : [];
+}
+
+function clearTaggerTarget(node) {
+  if (!node) return;
+  node.__hpsTaggerPath = "";
+  node.__hpsTaggerStatus = "none";
+  node.__hpsTaggerMessage = "";
+  if (isNodeClass(node, TAGGER_CLASS)) node.title = "Tagger";
+}
+
+function setTaggerTargetSnapshot(node, ckptName, status = "none") {
+  if (!node || !ckptName) return;
+  node.__hpsTaggerPath = ckptName;
+  node.__hpsTaggerStatus = status || "none";
+  node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
+  node.title = node.__hpsTaggerStatus === "none"
+    ? `Tagger : ${ckptName}`
+    : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${ckptName}`;
+}
+
+function updateDirectLinkTaggers(node) {
+  const taggers = directLinkTaggerTargets(node);
+  if (!taggers.length) return;
+  if (!selectorDirectLinkEnabled(node)) {
+    for (const tagger of taggers) clearTaggerTarget(tagger);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
+  const selected = selectorSelected(node);
+  if (!selected) {
+    for (const tagger of taggers) clearTaggerTarget(tagger);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
+  const status = selectorStatusFor(node, selected);
+  for (const tagger of taggers) setTaggerTargetSnapshot(tagger, selected, status);
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function toggleSelectorDirectLink(node) {
+  if (selectorActionMode(node) !== "directlink") return;
+  if (!node.__hpsDirectLinkEnabled) {
+    if (!globalThis.confirm?.(DIRECT_LINK_CONFIRM_MESSAGE)) return;
+    node.__hpsDirectLinkEnabled = true;
+  } else {
+    node.__hpsDirectLinkEnabled = false;
+  }
+  updateDirectLinkTaggers(node);
+  node.__hpsStatus = selectorDirectLinkEnabled(node)
+    ? "DirectLink ON: Tagger follows selected checkpoint."
+    : "DirectLink OFF: connect ImageDirPreview for Sync mode, or enable DirectLink for external review.";
+  app.graph?.setDirtyCanvas?.(true, true);
 }
 
 async function loadSelector(node, mode = "list") {
@@ -1912,6 +1984,19 @@ function setupSelectorNode(nodeType) {
     hideSelectorWidget(this);
     if (hpsNodeCollapsed(this)) return;
     const r = selectorRects(this);
+    if (selectorActionMode(this) !== "directlink" && this.__hpsDirectLinkEnabled) {
+      this.__hpsDirectLinkEnabled = false;
+    }
+    if (selectorDirectLinkEnabled(this)) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,245,170,0.95)";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(2.5, 2.5, Math.max(1, this.size[0] - 5), Math.max(1, this.size[1] - 5));
+      ctx.strokeStyle = "rgba(255,245,170,0.35)";
+      ctx.lineWidth = 7;
+      ctx.strokeRect(5.5, 5.5, Math.max(1, this.size[0] - 11), Math.max(1, this.size[1] - 11));
+      ctx.restore();
+    }
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
     drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
     drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
@@ -1949,7 +2034,9 @@ function setupSelectorNode(nodeType) {
     if (hitAny(this, pos, r.pushLocalList)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
-      if (selectorActionMode(this) === "sync") syncSelectedCheckpoint(this);
+      const mode = selectorActionMode(this);
+      if (mode === "sync") syncSelectedCheckpoint(this);
+      else if (mode === "directlink") toggleSelectorDirectLink(this);
       else pushSelectedToLocalList(this);
       return true;
     }
@@ -2069,16 +2156,33 @@ function setupSelectorNode(nodeType) {
 }
 
 // ---------- Tagger ----------
-function linkedCheckpointInputValue(node, inputName) {
+function linkedCheckpointInputSource(node, inputName) {
   const index = node.inputs?.findIndex((input) => input.name === inputName) ?? -1;
-  if (index < 0) return "";
+  if (index < 0) return null;
   const linkId = node.inputs?.[index]?.link;
-  if (linkId == null) return "";
+  if (linkId == null) return null;
   const link = app.graph?.links?.[linkId];
   const source = link ? app.graph?.getNodeById?.(link.origin_id) : null;
+  return source ? { link, source } : null;
+}
+
+function isTaggerDirectLinkBlocked(node) {
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const source = info?.source;
+  return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
+}
+
+function linkedCheckpointInputValue(node, inputName) {
+  const info = linkedCheckpointInputSource(node, inputName);
+  const source = info?.source;
+  const link = info?.link;
   if (!source) return "";
   if (isNodeClass(source, CYCLER_CLASS)) return source.__hpsCyclerCkptName || "";
-  if (isNodeClass(source, SELECTOR_CLASS)) return selectorSelected(source) || "";
+  if (isNodeClass(source, SELECTOR_CLASS)) {
+    const mode = selectorActionMode(source);
+    if (mode === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
+    return "";
+  }
   const outputName = String(source.outputs?.[link.origin_slot]?.name || "").toLowerCase();
   if (outputName === "ckpt_name_str" || outputName === "ckpt_name") {
     const ckptWidget = findCheckpointWidget(source) || findStartCheckpointWidget(source);
@@ -2089,6 +2193,13 @@ function linkedCheckpointInputValue(node, inputName) {
 }
 
 function currentTaggerPath(node) {
+  if (isTaggerDirectLinkBlocked(node)) return "";
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const source = info?.source;
+  if (source && isNodeClass(source, SELECTOR_CLASS)) {
+    if (selectorActionMode(source) === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
+    return node.__hpsTaggerPath || "";
+  }
   return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name_str") || "";
 }
 function taggerButtons(node) {
@@ -2110,12 +2221,21 @@ function taggerButtons(node) {
   return buttons;
 }
 function taggerDeleteEnabled(node) {
+  if (!currentTaggerPath(node)) return false;
   const current = node.__hpsTaggerStatus || "none";
   return current === "none" || current === "delete";
 }
+function taggerButtonsEnabled(node, status) {
+  if (!currentTaggerPath(node)) return false;
+  return status !== "delete" || taggerDeleteEnabled(node);
+}
 async function setTaggerStatus(node, status) {
   const ckpt = currentTaggerPath(node);
-  if (!ckpt) return;
+  if (!ckpt) {
+    clearTaggerTarget(node);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
   if (status === "delete" && !taggerDeleteEnabled(node)) return;
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tagger/set_status`, {
     method: "POST",
@@ -2136,7 +2256,7 @@ function taggerCursorAt(node, local) {
   if (!local) return "";
   for (const b of taggerButtons(node)) {
     if (!hit(local, b)) continue;
-    if (b.status === "delete" && !taggerDeleteEnabled(node)) return "not-allowed";
+    if (!taggerButtonsEnabled(node, b.status)) return "not-allowed";
     return "pointer";
   }
   return "";
@@ -2165,33 +2285,39 @@ function setupTaggerNode(nodeType) {
     ensureHiddenTabIdWidget(this);
     if (hpsNodeCollapsed(this)) return;
     ctx.save();
-    const current = this.__hpsTaggerStatus || "none";
+    const p = currentTaggerPath(this);
+    const linkedSource = linkedCheckpointInputSource(this, "ckpt_name_str")?.source;
+    const current = p ? (this.__hpsTaggerStatus || selectorStatusFor(linkedSource, p) || "none") : "none";
     for (const b of taggerButtons(this)) {
-      const enabled = b.status !== "delete" || taggerDeleteEnabled(this);
+      const enabled = taggerButtonsEnabled(this, b.status);
       const buttonColor = b.status === "delete" && enabled ? "rgba(105,90,90,0.65)" : null;
       drawButton(
         ctx,
         b,
         `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`,
         enabled,
-        current === b.status,
+        p && current === b.status,
         buttonColor,
         { textColor: enabled ? undefined : "#888" }
       );
     }
-    const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 76);
-    const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
-    ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
-    ctx.fillText(msg, 8, 96);
-    if (current !== "none" && current !== "delete") {
-      ctx.fillStyle = "#aaa";
-      ctx.fillText("Delete is available only from none.", 8, 116);
-    } else if (current === "delete") {
-      ctx.fillStyle = "#aaa";
-      ctx.fillText("Run exported script in temp. (Asks [y/N] before deletion.)", 8, 116);
+    if (p) {
+      ctx.fillText(p, 8, 76);
+      const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
+      ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
+      ctx.fillText(msg, 8, 96);
+      if (current !== "none" && current !== "delete") {
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Delete is available only from none.", 8, 116);
+      } else if (current === "delete") {
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Run exported script in output/CheckpointHandpickerSuite/delete_scripts/. (Asks [y/N].)", 8, 116);
+      }
+    } else {
+      ctx.fillStyle = "#ccc";
+      ctx.fillText(taggerCurrentMessage("none"), 8, 76);
     }
     ctx.restore();
   };
@@ -2200,7 +2326,7 @@ function setupTaggerNode(nodeType) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     for (const b of taggerButtons(this)) {
       if (hitAny(this, pos, b)) {
-        if (b.status === "delete" && !taggerDeleteEnabled(this)) return true;
+        if (!taggerButtonsEnabled(this, b.status)) return true;
         setTaggerStatus(this, b.status);
         return true;
       }
@@ -2211,6 +2337,11 @@ function setupTaggerNode(nodeType) {
 api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, TAGGER_CLASS);
   if (!node) return;
+  if (isTaggerDirectLinkBlocked(node)) {
+    clearTaggerTarget(node);
+    app.graph.setDirtyCanvas(true, true);
+    return;
+  }
   node.__hpsTaggerPath = detail.ckpt_name_str;
   node.__hpsTaggerStatus = detail.status;
   node.__hpsTaggerMessage = taggerCurrentMessage(detail.status || "none");
@@ -2237,6 +2368,7 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
       }
       if (selectorSelected(node) === detail.ckpt_name_str) {
         node.title = selectorTitleText(node, detail.ckpt_name_str);
+        if (selectorDirectLinkEnabled(node)) updateDirectLinkTaggers(node);
       }
     }
     if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
