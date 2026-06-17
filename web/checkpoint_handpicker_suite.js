@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v9l: UI polish, DirectLink green highlight, Tagger layout fix, and Cycler Tagger activation repair.
 // v9k: DirectLink mode and output-side delete script folder.
 // v9d: Selector thumbnail popup follows row hover or current selection inside node.
 // v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
@@ -1476,16 +1477,14 @@ function selectorRects(node) {
   const buttonH = 24;
   const arrowW = 32;
   const refreshW = 102;
-  const listOnlyW = 92;
   const pushW = selectorActionMode(node) === "sync" ? 150 : 174;
-  const pushX = margin + refreshW + gap + listOnlyW + gap;
+  const pushX = margin + refreshW + gap;
   // Keep scroll buttons close to the toolbar action buttons instead of anchoring
   // them to the right edge. The right edge belongs to ComfyUI output pins.
   const upX = pushX + pushW + gap;
   const downX = upX + arrowW + gap;
   return {
     refreshAll: { x: margin, y: buttonY, w: refreshW, h: buttonH },
-    listOnly: { x: margin + refreshW + gap, y: buttonY, w: listOnlyW, h: buttonH },
     pushLocalList: { x: pushX, y: buttonY, w: pushW, h: buttonH },
     up: { x: upX, y: buttonY, w: arrowW, h: buttonH },
     down: { x: downX, y: buttonY, w: arrowW, h: buttonH },
@@ -1908,7 +1907,7 @@ function installSelectorWheelCapture() {
 function selectorCursorAt(node, local) {
   if (!local) return "";
   const r = selectorRects(node);
-  if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
+  if (hit(local, r.refreshAll) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
   const sb = selectorScrollbar(node);
   if (sb && hit(local, sb.track)) return "pointer";
   const list = selectorItems(node);
@@ -1989,16 +1988,15 @@ function setupSelectorNode(nodeType) {
     }
     if (selectorDirectLinkEnabled(this)) {
       ctx.save();
-      ctx.strokeStyle = "rgba(255,245,170,0.95)";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(2.5, 2.5, Math.max(1, this.size[0] - 5), Math.max(1, this.size[1] - 5));
-      ctx.strokeStyle = "rgba(255,245,170,0.35)";
-      ctx.lineWidth = 7;
-      ctx.strokeRect(5.5, 5.5, Math.max(1, this.size[0] - 11), Math.max(1, this.size[1] - 11));
+      ctx.strokeStyle = "rgba(70,255,150,0.98)";
+      ctx.lineWidth = 5;
+      ctx.strokeRect(3.5, 3.5, Math.max(1, this.size[0] - 7), Math.max(1, this.size[1] - 7));
+      ctx.strokeStyle = "rgba(70,255,150,0.38)";
+      ctx.lineWidth = 11;
+      ctx.strokeRect(7.5, 7.5, Math.max(1, this.size[0] - 15), Math.max(1, this.size[1] - 15));
       ctx.restore();
     }
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
     drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
     drawButton(ctx, r.up, "▲", true);
     drawButton(ctx, r.down, "▼", true);
@@ -2019,61 +2017,60 @@ function setupSelectorNode(nodeType) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
 
     const r = selectorRects(this);
-    if (hitAny(this, pos, r.refreshAll)) {
+    const local = selectorLocalFromEventOrPos(this, event, pos);
+    if (!local) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+
+    if (hit(local, r.refreshAll)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       refreshSelector(this, true);
       return true;
     }
-    if (hitAny(this, pos, r.listOnly)) {
+    if (hit(local, r.pushLocalList)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
-      refreshSelector(this, false);
-      return true;
-    }
-    if (hitAny(this, pos, r.pushLocalList)) {
-      event?.preventDefault?.();
-      event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       const mode = selectorActionMode(this);
       if (mode === "sync") syncSelectedCheckpoint(this);
       else if (mode === "directlink") toggleSelectorDirectLink(this);
       else pushSelectedToLocalList(this);
       return true;
     }
-    if (hitAny(this, pos, r.up)) {
+    if (hit(local, r.up)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
       return true;
     }
-    if (hitAny(this, pos, r.down)) {
+    if (hit(local, r.down)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       scrollSelector(this, SELECTOR_VISIBLE_ROWS);
       return true;
     }
 
     const sb = selectorScrollbar(this);
     if (sb) {
-      const hitPositions = candidatePositions(this, pos);
-      const thumbHitPos = hitPositions.find((p) => hit(p, sb.thumb));
-      const trackHitPos = hitPositions.find((p) => hit(p, sb.track));
-
-      if (thumbHitPos) {
+      if (hit(local, sb.thumb)) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
         this.__hpsScrollbarDragging = true;
-        this.__hpsScrollbarDragOffset = thumbHitPos[1] - sb.thumb.y;
-        this.__hpsScrollbarStartY = thumbHitPos[1];
+        this.__hpsScrollbarDragOffset = local[1] - sb.thumb.y;
+        this.__hpsScrollbarStartY = local[1];
         this.__hpsScrollbarStartScroll = sb.scroll;
         app.graph?.setDirtyCanvas?.(true, true);
         return true;
       }
 
-      if (trackHitPos) {
+      if (hit(local, sb.track)) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
-        if (trackHitPos[1] < sb.thumb.y) {
+        event?.stopImmediatePropagation?.();
+        if (local[1] < sb.thumb.y) {
           scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
         } else {
           scrollSelector(this, SELECTOR_VISIBLE_ROWS);
@@ -2082,14 +2079,13 @@ function setupSelectorNode(nodeType) {
       }
     }
 
-    const positions = candidatePositions(this, pos);
-    for (const p of positions) {
-      if (!hit(p, r.list)) continue;
-      const row = Math.floor((p[1] - r.list.y) / ROW_H);
+    if (hit(local, r.list)) {
+      const row = Math.floor((local[1] - r.list.y) / ROW_H);
       const item = selectorItems(this)[(this.__hpsScroll || 0) + row];
       if (item) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
         setSelectorSelected(this, item.ckpt_name_str);
         app.graph.setDirtyCanvas(true, true);
         return true;
@@ -2144,7 +2140,8 @@ function setupSelectorNode(nodeType) {
   const origMouseWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (event, pos, canvas) {
     const r = selectorRects(this);
-    if (candidatePositions(this, pos).some((p) => hit(p, r.list))) {
+    const local = selectorLocalFromEventOrPos(this, event, pos);
+    if (hit(local, r.list)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
       event?.stopImmediatePropagation?.();
@@ -2167,9 +2164,11 @@ function linkedCheckpointInputSource(node, inputName) {
 }
 
 function isTaggerDirectLinkBlocked(node) {
-  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
-  const source = info?.source;
-  return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
+  const infos = [linkedCheckpointInputSource(node, "ckpt_name_str"), linkedCheckpointInputSource(node, "ckpt_name")];
+  return infos.some((info) => {
+    const source = info?.source;
+    return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
+  });
 }
 
 function linkedCheckpointInputValue(node, inputName) {
@@ -2194,13 +2193,16 @@ function linkedCheckpointInputValue(node, inputName) {
 
 function currentTaggerPath(node) {
   if (isTaggerDirectLinkBlocked(node)) return "";
-  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str") || linkedCheckpointInputSource(node, "ckpt_name");
   const source = info?.source;
   if (source && isNodeClass(source, SELECTOR_CLASS)) {
     if (selectorActionMode(source) === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
     return node.__hpsTaggerPath || "";
   }
-  return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name_str") || "";
+  return node.__hpsTaggerPath
+    || linkedCheckpointInputValue(node, "ckpt_name_str")
+    || linkedCheckpointInputValue(node, "ckpt_name")
+    || "";
 }
 function taggerButtons(node) {
   // Keep positive status controls on the first row and delete separated below.
@@ -2262,20 +2264,29 @@ function taggerCursorAt(node, local) {
   return "";
 }
 
+function normalizeTaggerHeight(node) {
+  if (!node?.size) return;
+  // v9l moves the message area up by 21px. Shrink only default-ish old layouts;
+  // user-expanded nodes should keep their chosen height.
+  if (node.size[1] > 107 && node.size[1] <= 128) node.size[1] = 107;
+}
+
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 450, 128);
+  installMinSize(nodeType, 450, 107);
   installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 450, 128);
+    ensureSize(this, 450, 107);
+    normalizeTaggerHeight(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    normalizeTaggerHeight(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -2286,7 +2297,7 @@ function setupTaggerNode(nodeType) {
     if (hpsNodeCollapsed(this)) return;
     ctx.save();
     const p = currentTaggerPath(this);
-    const linkedSource = linkedCheckpointInputSource(this, "ckpt_name_str")?.source;
+    const linkedSource = (linkedCheckpointInputSource(this, "ckpt_name_str") || linkedCheckpointInputSource(this, "ckpt_name"))?.source;
     const current = p ? (this.__hpsTaggerStatus || selectorStatusFor(linkedSource, p) || "none") : "none";
     for (const b of taggerButtons(this)) {
       const enabled = taggerButtonsEnabled(this, b.status);
@@ -2304,20 +2315,20 @@ function setupTaggerNode(nodeType) {
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
     if (p) {
-      ctx.fillText(p, 8, 76);
+      ctx.fillText(p, 8, 55);
       const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
       ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
-      ctx.fillText(msg, 8, 96);
+      ctx.fillText(msg, 8, 75);
       if (current !== "none" && current !== "delete") {
         ctx.fillStyle = "#aaa";
-        ctx.fillText("Delete is available only from none.", 8, 116);
+        ctx.fillText("Delete is available only from none.", 8, 95);
       } else if (current === "delete") {
         ctx.fillStyle = "#aaa";
-        ctx.fillText("Run exported script in output/CheckpointHandpickerSuite/delete_scripts/. (Asks [y/N].)", 8, 116);
+        ctx.fillText("Delete script exported to output. ([y/N])", 8, 95);
       }
     } else {
       ctx.fillStyle = "#ccc";
-      ctx.fillText(taggerCurrentMessage("none"), 8, 76);
+      ctx.fillText(taggerCurrentMessage("none"), 8, 55);
     }
     ctx.restore();
   };
