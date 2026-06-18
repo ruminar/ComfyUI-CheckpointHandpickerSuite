@@ -92,6 +92,7 @@ Fixed mode is compatible with a normal checkpoint selector.
 
 `Checkpoint Status Tagger` has four buttons:
 
+- 👑 god! 
 - 💛 favorite
 - 👍 nice
 - ✔ keep
@@ -131,3 +132,14 @@ Top-bar locking and localStorage-based queue sharing are intentionally not inclu
 ## Safety
 
 This suite is designed around review-first cleanup. Checkpoints marked for delete are only reserved for deletion. A generated script is used for actual deletion, with confirmation.
+
+## Recommended saver nodes
+
+- [`ComfyUI-GMImageSaver`](https://github.com/ruminar/ComfyUI-GMImageSaver)
+- [`ComfyUI-PillowImageSaver`](https://github.com/ruminar/ComfyUI-PillowImageSaver)
+
+Both saver nodes use the same filename and directory rules for checkpoint review workflows.
+Choose either one according to your environment.
+
+For checkpoint-based image organization, connect `ckpt_name_safe` to the saver node's `label` input.
+This lets generated images be saved under checkpoint-aware filenames/directories for preview and thumbnail workflows.

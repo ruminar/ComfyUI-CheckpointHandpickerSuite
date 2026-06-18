@@ -107,6 +107,20 @@ Taggerで `delete（🗑）` を押したモデルは、その場では物理削
 
 ---
 
+## 推奨出力ノード
+
+- [`ComfyUI-GMImageSaver`](https://github.com/ruminar/ComfyUI-GMImageSaver)
+- [`ComfyUI-PillowImageSaver`](https://github.com/ruminar/ComfyUI-PillowImageSaver)
+
+どちらもCheckpointレビュー向けに同じファイル名規則・ディレクトリ規則で保存するから、環境に合わせて好きな方を選べるようになっておるのじゃ！
+おすすめは、もちろん`GraphicsMagick`利用版じゃな！　（注：`GraphicsMagick`の別途インストールが必要です）
+外部コマンドなしで使いたい場合は、`ComfyUI-PillowImageSaver`を使うとよいぞ。
+
+これらのノードを使用する場合、`ckpt_name_safe` を、`ImageSaver` の `label` 入力に繋ぐのじゃ。
+すると生成された画像はチェックポイントを反映したファイル名やディレクトリで保存され、後でCheckpointの評価の際に参照できるようになるのじゃ！
+
+---
+
 ## 💎 ライセンス
 
 本Suiteは **GPL-3.0（ComfyUI本体の掟に従っておるぞ！）** のもとで世界に公開されておる。陰の叡智を、良識の範囲で自由に使い倒すがよい！
