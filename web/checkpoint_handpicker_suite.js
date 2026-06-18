@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v9m: DirectLink active button style, one-time confirmation dialog, and ckpt_name_str-only Tagger wiring cleanup.
 // v9l: UI polish, DirectLink green highlight, Tagger layout fix, and Cycler Tagger activation repair.
 // v9k: DirectLink mode and output-side delete script folder.
 // v9d: Selector thumbnail popup follows row hover or current selection inside node.
@@ -1657,6 +1658,7 @@ function selectorActionLabel(node) {
 }
 
 const DIRECT_LINK_CONFIRM_MESSAGE = "Enable DirectLink?\n\nUse this mode only while checking generated images on a tablet, shared folder, or external viewer.\n\nOtherwise, connect ImageDirPreview and use Sync mode.\n\nTagger will label the checkpoint selected in ListSelector.";
+let hpsDirectLinkConfirmShown = false;
 
 function directLinkTaggerTargets(node) {
   const targets = getSelectorReviewTargets(node);
@@ -1703,7 +1705,10 @@ function updateDirectLinkTaggers(node) {
 function toggleSelectorDirectLink(node) {
   if (selectorActionMode(node) !== "directlink") return;
   if (!node.__hpsDirectLinkEnabled) {
-    if (!globalThis.confirm?.(DIRECT_LINK_CONFIRM_MESSAGE)) return;
+    if (!hpsDirectLinkConfirmShown) {
+      hpsDirectLinkConfirmShown = true;
+      if (!globalThis.confirm?.(DIRECT_LINK_CONFIRM_MESSAGE)) return;
+    }
     node.__hpsDirectLinkEnabled = true;
   } else {
     node.__hpsDirectLinkEnabled = false;
@@ -1986,18 +1991,8 @@ function setupSelectorNode(nodeType) {
     if (selectorActionMode(this) !== "directlink" && this.__hpsDirectLinkEnabled) {
       this.__hpsDirectLinkEnabled = false;
     }
-    if (selectorDirectLinkEnabled(this)) {
-      ctx.save();
-      ctx.strokeStyle = "rgba(70,255,150,0.98)";
-      ctx.lineWidth = 5;
-      ctx.strokeRect(3.5, 3.5, Math.max(1, this.size[0] - 7), Math.max(1, this.size[1] - 7));
-      ctx.strokeStyle = "rgba(70,255,150,0.38)";
-      ctx.lineWidth = 11;
-      ctx.strokeRect(7.5, 7.5, Math.max(1, this.size[0] - 15), Math.max(1, this.size[1] - 15));
-      ctx.restore();
-    }
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
+    drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading, selectorDirectLinkEnabled(this));
     drawButton(ctx, r.up, "▲", true);
     drawButton(ctx, r.down, "▼", true);
 
@@ -2164,11 +2159,9 @@ function linkedCheckpointInputSource(node, inputName) {
 }
 
 function isTaggerDirectLinkBlocked(node) {
-  const infos = [linkedCheckpointInputSource(node, "ckpt_name_str"), linkedCheckpointInputSource(node, "ckpt_name")];
-  return infos.some((info) => {
-    const source = info?.source;
-    return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
-  });
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const source = info?.source;
+  return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
 }
 
 function linkedCheckpointInputValue(node, inputName) {
@@ -2183,7 +2176,7 @@ function linkedCheckpointInputValue(node, inputName) {
     return "";
   }
   const outputName = String(source.outputs?.[link.origin_slot]?.name || "").toLowerCase();
-  if (outputName === "ckpt_name_str" || outputName === "ckpt_name") {
+  if (outputName === "ckpt_name_str") {
     const ckptWidget = findCheckpointWidget(source) || findStartCheckpointWidget(source);
     const value = String(ckptWidget?.value || "");
     return value.endsWith(".safetensors") ? value : "";
@@ -2193,7 +2186,7 @@ function linkedCheckpointInputValue(node, inputName) {
 
 function currentTaggerPath(node) {
   if (isTaggerDirectLinkBlocked(node)) return "";
-  const info = linkedCheckpointInputSource(node, "ckpt_name_str") || linkedCheckpointInputSource(node, "ckpt_name");
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
   const source = info?.source;
   if (source && isNodeClass(source, SELECTOR_CLASS)) {
     if (selectorActionMode(source) === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
@@ -2201,7 +2194,6 @@ function currentTaggerPath(node) {
   }
   return node.__hpsTaggerPath
     || linkedCheckpointInputValue(node, "ckpt_name_str")
-    || linkedCheckpointInputValue(node, "ckpt_name")
     || "";
 }
 function taggerButtons(node) {
@@ -2297,7 +2289,7 @@ function setupTaggerNode(nodeType) {
     if (hpsNodeCollapsed(this)) return;
     ctx.save();
     const p = currentTaggerPath(this);
-    const linkedSource = (linkedCheckpointInputSource(this, "ckpt_name_str") || linkedCheckpointInputSource(this, "ckpt_name"))?.source;
+    const linkedSource = linkedCheckpointInputSource(this, "ckpt_name_str")?.source;
     const current = p ? (this.__hpsTaggerStatus || selectorStatusFor(linkedSource, p) || "none") : "none";
     for (const b of taggerButtons(this)) {
       const enabled = taggerButtonsEnabled(this, b.status);
