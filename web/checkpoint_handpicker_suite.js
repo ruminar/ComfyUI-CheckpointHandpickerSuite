@@ -1,6 +1,10 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// v9m: DirectLink active button style, one-time confirmation dialog, and ckpt_name_str-only Tagger wiring cleanup.
+// v9l: UI polish, DirectLink green highlight, Tagger layout fix, and Cycler Tagger activation repair.
+// v9k: DirectLink mode and output-side delete script folder.
+// v9d: Selector thumbnail popup follows row hover or current selection inside node.
 // v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 const EXT = "ruminar.checkpoint_handpicker_suite";
 const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
@@ -57,11 +61,11 @@ function patchCheckpointTitle(node, prefix, ckptName, status = "none") {
   node.title = `${prefix} : ${titleDisplayForCheckpoint(ckptName, status)}${suffix}`;
 }
 
-const STATUS_ORDER = ["favorite", "nice", "keep", "delete", "none"];
-const TAGGER_STATUS_ORDER = ["favorite", "nice", "keep", "delete"];
-const STATUS_ICON = { favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
-const STATUS_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
-const STATUS_CURRENT_LABEL = { favorite: "favorite", nice: "nice", keep: "keep", delete: "Marked for deletion", none: "none" };
+const STATUS_ORDER = ["god", "favorite", "nice", "keep", "delete", "none"];
+const TAGGER_STATUS_ORDER = ["god", "favorite", "nice", "keep", "delete"];
+const STATUS_ICON = { god: "👑", favorite: "💛", nice: "👍", keep: "✔", delete: "🗑", none: "—" };
+const STATUS_LABEL = { god: "god!", favorite: "favorite", nice: "nice", keep: "keep", delete: "delete", none: "none" };
+const STATUS_CURRENT_LABEL = { god: "god!", favorite: "favorite", nice: "nice", keep: "keep", delete: "Marked for deletion", none: "none" };
 
 function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
@@ -376,7 +380,7 @@ function ensureHiddenWidgetValue(node, name, value) {
   return true;
 }
 
-const CYCLER_FILTER_STATUSES = ["favorite", "nice", "keep", "delete", "none"];
+const CYCLER_FILTER_STATUSES = ["god", "favorite", "nice", "keep", "delete", "none"];
 
 function normalizeCyclerFilterStatuses(value) {
   let raw = value;
@@ -681,6 +685,14 @@ function hpsNodeCollapsed(node) {
   return Boolean(node?.flags?.collapsed);
 }
 
+function hpsLocalInsideNode(node, local) {
+  return Boolean(local)
+    && local[0] >= 0
+    && local[1] >= 0
+    && local[0] <= (node.size?.[0] || 0)
+    && local[1] <= (node.size?.[1] || 0);
+}
+
 let cursorCaptureInstalled = false;
 function installCursorCapture() {
   if (cursorCaptureInstalled) return;
@@ -690,7 +702,18 @@ function installCursorCapture() {
   canvasEl.addEventListener("mousemove", (event) => {
     const graph = app.graph;
     if (!graph) return;
-    const nodes = [...(graph._nodes || [])].reverse();
+    const allNodes = graph._nodes || [];
+    for (const node of allNodes) {
+      if (!(node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS)) continue;
+      if (node.flags?.collapsed) {
+        clearSelectorThumbnailHover(node);
+        continue;
+      }
+      const local = graphEventToLocal(node, event);
+      if (!hpsLocalInsideNode(node, local)) clearSelectorThumbnailHover(node);
+    }
+
+    const nodes = [...allNodes].reverse();
     for (const node of nodes) {
       if (node.flags?.collapsed) continue;
       let cursor = "";
@@ -704,7 +727,12 @@ function installCursorCapture() {
     }
     setCanvasCursor("");
   });
-  canvasEl.addEventListener("mouseleave", () => setCanvasCursor(""));
+  canvasEl.addEventListener("mouseleave", () => {
+    for (const node of app.graph?._nodes || []) {
+      if (node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS) clearSelectorThumbnailHover(node);
+    }
+    setCanvasCursor("");
+  });
 }
 
 // ---------- Backend state restore ----------
@@ -724,7 +752,9 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
         setPreviewTitleFromCheckpoint(node, result.ckpt_name_str, result.status || "none");
       }
     } else if (nodeClass === TAGGER_CLASS) {
-      if (result.ckpt_name_str) {
+      if (isTaggerDirectLinkBlocked(node)) {
+        clearTaggerTarget(node);
+      } else if (result.ckpt_name_str) {
         node.__hpsTaggerPath = result.ckpt_name_str;
         node.__hpsTaggerStatus = result.status || "none";
         node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
@@ -748,11 +778,362 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
   }
 }
 
+
+
 // ---------- Preview ----------
+let hpsContextMenuEl = null;
+let hpsContextMenuHideInstalled = false;
+let imageDirHoverCaptureInstalled = false;
+
+function ensureHpsContextMenu() {
+  if (hpsContextMenuEl) return hpsContextMenuEl;
+  const el = document.createElement("div");
+  el.style.position = "fixed";
+  el.style.zIndex = "99999";
+  el.style.minWidth = "220px";
+  el.style.background = "rgba(22,22,22,0.98)";
+  el.style.border = "1px solid rgba(255,255,255,0.18)";
+  el.style.borderRadius = "8px";
+  el.style.boxShadow = "0 10px 28px rgba(0,0,0,0.45)";
+  el.style.padding = "6px";
+  el.style.display = "none";
+  el.style.font = "12px sans-serif";
+  el.style.color = "#eee";
+  document.body.appendChild(el);
+  hpsContextMenuEl = el;
+  return el;
+}
+
+function hideHpsContextMenu() {
+  const el = ensureHpsContextMenu();
+  el.style.display = "none";
+  el.innerHTML = "";
+}
+
+function installHpsContextMenuHide() {
+  if (hpsContextMenuHideInstalled) return;
+  hpsContextMenuHideInstalled = true;
+  document.addEventListener("mousedown", (event) => {
+    if (hpsContextMenuEl?.contains?.(event.target)) return;
+    hideHpsContextMenu();
+  }, true);
+  document.addEventListener("scroll", () => hideHpsContextMenu(), true);
+  window.addEventListener("blur", () => hideHpsContextMenu());
+}
+
+function showHpsContextMenu(items, clientX, clientY) {
+  installHpsContextMenuHide();
+  const el = ensureHpsContextMenu();
+  el.innerHTML = "";
+  const menuItems = Array.isArray(items) ? items : [];
+  for (const item of menuItems) {
+    const row = document.createElement("div");
+    row.textContent = String(item?.label || "");
+    row.style.padding = "7px 10px";
+    row.style.borderRadius = "6px";
+    row.style.whiteSpace = "nowrap";
+    row.style.userSelect = "none";
+    const enabled = item?.enabled !== false && typeof item?.onClick === "function";
+    if (enabled) {
+      row.style.cursor = "pointer";
+      row.addEventListener("mouseenter", () => { row.style.background = "rgba(255,255,255,0.10)"; });
+      row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideHpsContextMenu();
+        item.onClick();
+      });
+    } else {
+      row.style.color = "#999";
+      row.style.cursor = "default";
+    }
+    el.appendChild(row);
+  }
+  el.style.left = `${Math.max(4, Number(clientX || 0))}px`;
+  el.style.top = `${Math.max(4, Number(clientY || 0))}px`;
+  el.style.display = "block";
+  const rect = el.getBoundingClientRect();
+  const maxX = Math.max(4, window.innerWidth - rect.width - 4);
+  const maxY = Math.max(4, window.innerHeight - rect.height - 4);
+  el.style.left = `${Math.min(Math.max(4, Number(clientX || 0)), maxX)}px`;
+  el.style.top = `${Math.min(Math.max(4, Number(clientY || 0)), maxY)}px`;
+}
+
+function previewGeometry(node) {
+  const isImageDir = isNodeClass(node, "ImageDirPreview");
+  const top = isImageDir ? 72 : 30;
+  const margin = 8;
+  const w = Math.max(1, (node.size?.[0] || 340) - margin * 2);
+  const h = Math.max(1, (node.size?.[1] || 300) - top - margin);
+  return { isImageDir, top, margin, w, h };
+}
+
+function previewDrawBox(node) {
+  const img = node?.__hpsPreview;
+  if (!img) return null;
+  const g = previewGeometry(node);
+  let dw = g.w;
+  let dh = dw * (img.height / img.width);
+  if (dh > g.h) {
+    dh = g.h;
+    dw = dh * (img.width / img.height);
+  }
+  const x = g.margin + (g.w - dw) / 2;
+  const y = g.top + (g.h - dh) / 2;
+  return { x, y, w: dw, h: dh, imageW: img.width, imageH: img.height };
+}
+
+function previewLocalFromEventOrPos(node, event, pos) {
+  return graphEventToLocal(node, event) || localPos(node, pos);
+}
+
+function imageDirPreviewItemAtLocal(node, local) {
+  if (!node || !isNodeClass(node, "ImageDirPreview") || !local) return null;
+  const st = node.__hpsPreviewState || {};
+  const sourcePaths = Array.isArray(st.source_paths) ? st.source_paths : [];
+  const count = Number(st.count || sourcePaths.length || 0);
+  const cols = Number(st.columns || 0);
+  const rows = Number(st.rows || 0);
+  const tileW = Number(st.tile_width || 0);
+  const tileH = Number(st.tile_height || 0);
+  const gap = Number(st.gap || 0);
+  if (!count || !cols || !rows || !tileW || !tileH || !sourcePaths.length) return null;
+  const box = previewDrawBox(node);
+  if (!box || !hit(local, box)) return null;
+  const sx = (local[0] - box.x) * (box.imageW / box.w);
+  const sy = (local[1] - box.y) * (box.imageH / box.h);
+  const stepX = tileW + gap;
+  const stepY = tileH + gap;
+  if (stepX <= 0 || stepY <= 0) return null;
+  const col = Math.floor(sx / stepX);
+  const row = Math.floor(sy / stepY);
+  if (col < 0 || row < 0 || col >= cols || row >= rows) return null;
+  const inTileX = sx - col * stepX;
+  const inTileY = sy - row * stepY;
+  if (inTileX < 0 || inTileX > tileW || inTileY < 0 || inTileY > tileH) return null;
+  const index = row * cols + col;
+  if (index < 0 || index >= count || index >= sourcePaths.length) return null;
+  if (isImageDirDeletedIndex(node, index)) return null;
+  return { index, sourcePath: String(sourcePaths[index] || ""), ckptName: String(st.ckpt_name_str || "") };
+}
+
+function imageDirPreviewTileRect(node, index) {
+  const st = node.__hpsPreviewState || {};
+  const cols = Number(st.columns || 0);
+  const tileW = Number(st.tile_width || 0);
+  const tileH = Number(st.tile_height || 0);
+  const gap = Number(st.gap || 0);
+  if (!cols || !tileW || !tileH || index == null || index < 0) return null;
+  const box = previewDrawBox(node);
+  if (!box) return null;
+  const row = Math.floor(index / cols);
+  const col = index % cols;
+  const sx = col * (tileW + gap);
+  const sy = row * (tileH + gap);
+  const scaleX = box.w / box.imageW;
+  const scaleY = box.h / box.imageH;
+  return { x: box.x + sx * scaleX, y: box.y + sy * scaleY, w: tileW * scaleX, h: tileH * scaleY };
+}
+
+function clearImageDirHover(node) {
+  if (!node) return;
+  if (node.__hpsHoveredPreviewIndex != null) {
+    node.__hpsHoveredPreviewIndex = null;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function setImageDirHover(node, item) {
+  const index = item?.index ?? null;
+  if (node.__hpsHoveredPreviewIndex !== index) {
+    node.__hpsHoveredPreviewIndex = index;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function updateImageDirHoverFromEvent(event) {
+  let handled = false;
+  const nodes = [...(app.graph?._nodes || [])].reverse();
+  for (const node of nodes) {
+    if (!node || node.flags?.collapsed || !isNodeClass(node, "ImageDirPreview")) continue;
+    const local = graphEventToLocal(node, event);
+    if (!hpsLocalInsideNode(node, local)) {
+      clearImageDirHover(node);
+      continue;
+    }
+    const item = imageDirPreviewItemAtLocal(node, local);
+    setImageDirHover(node, item);
+    handled = true;
+    break;
+  }
+  if (!handled) {
+    for (const node of app.graph?._nodes || []) {
+      if (isNodeClass(node, "ImageDirPreview")) clearImageDirHover(node);
+    }
+  }
+}
+
+function installImageDirHoverCapture() {
+  if (imageDirHoverCaptureInstalled) return;
+  const canvasEl = app.canvas?.canvas;
+  if (!canvasEl) return;
+  imageDirHoverCaptureInstalled = true;
+  canvasEl.addEventListener("mousemove", (event) => updateImageDirHoverFromEvent(event), true);
+  canvasEl.addEventListener("mouseleave", () => {
+    for (const node of app.graph?._nodes || []) {
+      if (isNodeClass(node, "ImageDirPreview")) clearImageDirHover(node);
+    }
+  });
+}
+
+const NO_IMAGE_ASSET_URL = new URL("./assets/no_image.svg", import.meta.url).href;
+let noImageAsset = null;
+let noImageAssetRequested = false;
+
+function ensureNoImageAsset() {
+  if (noImageAsset || noImageAssetRequested) return noImageAsset;
+  noImageAssetRequested = true;
+  const img = new Image();
+  img.onload = () => {
+    noImageAsset = img;
+    app.graph?.setDirtyCanvas?.(true, true);
+  };
+  img.onerror = () => {
+    noImageAsset = null;
+  };
+  img.src = NO_IMAGE_ASSET_URL;
+  return null;
+}
+
+function deletedImageDirIndexSet(node) {
+  const raw = node?.__hpsPreviewState?.deleted_indices;
+  if (!Array.isArray(raw) || !raw.length) return null;
+  return new Set(raw.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v >= 0));
+}
+
+function isImageDirDeletedIndex(node, index) {
+  if (index == null || index < 0) return false;
+  const set = deletedImageDirIndexSet(node);
+  return !!set && set.has(Number(index));
+}
+
+function updateNodeDeletedIndices(node, values) {
+  if (!node) return;
+  const next = Array.isArray(values) ? values.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v >= 0) : [];
+  node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), deleted_indices: next };
+}
+
+function drawNoImagePlaceholder(ctx, rect) {
+  ctx.save();
+  ctx.fillStyle = "rgba(20,20,20,0.72)";
+  ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+  const asset = noImageAsset || ensureNoImageAsset();
+  if (asset) {
+    ctx.drawImage(asset, rect.x, rect.y, rect.w, rect.h);
+  } else {
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(1, rect.w - 1), Math.max(1, rect.h - 1));
+    ctx.fillStyle = "rgba(255,255,255,0.88)";
+    ctx.font = "bold 12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("NO IMAGE", rect.x + rect.w / 2, rect.y + rect.h / 2, Math.max(1, rect.w - 10));
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+  }
+  ctx.restore();
+}
+
+async function fetchImageDirContextMenu(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/context_menu`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
+  });
+  return await response.json();
+}
+
+async function setImageDirCheckpointThumbnail(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/set_thumbnail`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
+  });
+  const result = await response.json();
+  if (result?.ok) {
+    selectorThumbnailCache.delete(selectorThumbnailCacheKey(result.ckpt_name_str || ""));
+    node.__hpsPreviewContextMessage = result.message || "Checkpoint thumbnail updated.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  } else {
+    node.__hpsPreviewContextMessage = result?.error || "Failed to set checkpoint thumbnail.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  }
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+async function deleteImageDirPreviewImage(node, itemIndex) {
+  const st = node.__hpsPreviewState || {};
+  const response = await api.fetchApi(`/${EXTENSION_PREFIX}/image_dir_preview/delete_image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: node.id, item_index: itemIndex, preview_session_id: st.preview_session_id || "", tab_id: HPS_TAB_ID }),
+  });
+  const result = await response.json();
+  if (result?.ok) {
+    if (Array.isArray(result.deleted_indices)) updateNodeDeletedIndices(node, result.deleted_indices);
+    if (result.deleted) clearImageDirHover(node);
+    node.__hpsPreviewContextMessage = result.message || (result.deleted ? "Preview image deleted." : "Preview image not found.");
+    node.__hpsPreviewContextMessageAt = Date.now();
+  } else {
+    node.__hpsPreviewContextMessage = result?.error || "Failed to delete preview image.";
+    node.__hpsPreviewContextMessageAt = Date.now();
+  }
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+async function openImageDirContextMenu(node, item, event) {
+  hideHpsContextMenu();
+  try {
+    const result = await fetchImageDirContextMenu(node, item.index);
+    if (!result?.ok) {
+      showHpsContextMenu([{ label: result?.error || "Preview item not found", enabled: false }], event.clientX, event.clientY);
+      return;
+    }
+    const items = (result.items || []).map((entry) => {
+      if (entry?.id === "delete_image" && entry?.enabled !== false) {
+        return {
+          label: entry.label || "Delete image",
+          enabled: true,
+          onClick: async () => {
+            if (!globalThis.confirm?.("Delete this image?")) return;
+            await deleteImageDirPreviewImage(node, item.index);
+          },
+        };
+      }
+      if (entry?.id === "set_thumbnail" && entry?.enabled !== false) {
+        return { label: entry.label || "Set as checkpoint thumbnail", enabled: true, onClick: () => setImageDirCheckpointThumbnail(node, item.index) };
+      }
+      return null;
+    }).filter(Boolean);
+    if (!items.length) {
+      hideHpsContextMenu();
+      return;
+    }
+    showHpsContextMenu(items, event.clientX, event.clientY);
+  } catch (error) {
+    showHpsContextMenu([{ label: "Failed to open menu", enabled: false }], event.clientX, event.clientY);
+  }
+}
+
 function setupPreviewNode(nodeType) {
   installMinSize(nodeType, 340, 300);
   installTabIdSupport(nodeType);
   installCursorCapture();
+  installImageDirHoverCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
@@ -773,19 +1154,15 @@ function setupPreviewNode(nodeType) {
     ensureHiddenTabIdWidget(this);
     if (this.flags?.collapsed) return;
     const img = this.__hpsPreview;
-    const isImageDir = isNodeClass(this, "ImageDirPreview");
-    const top = isImageDir ? 72 : 30;
-    const margin = 8;
-    const messageX = Math.min(140, Math.max(margin, this.size[0] - 80));
-    const captionY = isImageDir ? 36 : 20;
-    const messageW = Math.max(1, this.size[0] - messageX - margin);
-    const w = Math.max(1, this.size[0] - margin * 2);
-    const h = Math.max(1, this.size[1] - top - margin);
+    const g = previewGeometry(this);
+    const messageX = Math.min(140, Math.max(g.margin, this.size[0] - 80));
+    const captionY = g.isImageDir ? 36 : 20;
+    const messageW = Math.max(1, this.size[0] - messageX - g.margin);
     ctx.save();
     if (this.__hpsPreviewCaption) {
       const st = this.__hpsPreviewState || {};
       const isWarning = st.status && !["ready", "loading"].includes(st.status);
-      if (isImageDir) {
+      if (g.isImageDir) {
         ctx.fillStyle = isWarning ? "rgba(255,180,80,0.18)" : "rgba(0,0,0,0.18)";
         ctx.fillRect(messageX - 4, captionY - 13, messageW + 4, 18);
       }
@@ -793,29 +1170,41 @@ function setupPreviewNode(nodeType) {
       ctx.font = "12px sans-serif";
       ctx.fillText(this.__hpsPreviewCaption, messageX, captionY, messageW);
     }
-    if (isImageDir && (this.__hpsPreviewState?.progress || this.__hpsPreviewState?.progress_total)) {
+    if (g.isImageDir && (this.__hpsPreviewState?.progress || this.__hpsPreviewState?.progress_total)) {
       const st = this.__hpsPreviewState || {};
       const total = Math.max(1, Number(st.progress_total || st.max_preview_images || 1));
       const value = Math.max(0, Math.min(total, Number(st.progress_value || 0)));
-      const barX = margin;
+      const barX = g.margin;
       const barY = 0;
-      const barW = Math.max(1, this.size[0] - margin * 2);
+      const barW = Math.max(1, this.size[0] - g.margin * 2);
       const barH = 6;
       ctx.fillStyle = "rgba(255,255,255,0.14)";
       ctx.fillRect(barX, barY, barW, barH);
       ctx.fillStyle = "rgba(255,255,255,0.58)";
       ctx.fillRect(barX, barY, barW * (value / total), barH);
     }
-    if (img) {
-      let dw = w;
-      let dh = dw * (img.height / img.width);
-      if (dh > h) {
-        dh = h;
-        dw = dh * (img.width / img.height);
+    const drawBox = previewDrawBox(this);
+    if (img && drawBox) {
+      ctx.drawImage(img, drawBox.x, drawBox.y, drawBox.w, drawBox.h);
+      if (g.isImageDir) {
+        for (const index of deletedImageDirIndexSet(this) || []) {
+          const rect = imageDirPreviewTileRect(this, index);
+          if (rect) drawNoImagePlaceholder(ctx, rect);
+        }
       }
-      const x = margin + (w - dw) / 2;
-      const y = top + (h - dh) / 2;
-      ctx.drawImage(img, x, y, dw, dh);
+      if (g.isImageDir && this.__hpsHoveredPreviewIndex != null && !isImageDirDeletedIndex(this, this.__hpsHoveredPreviewIndex)) {
+        const rect = imageDirPreviewTileRect(this, this.__hpsHoveredPreviewIndex);
+        if (rect) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(255,255,255,0.95)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(rect.x + 1, rect.y + 1, Math.max(1, rect.w - 2), Math.max(1, rect.h - 2));
+          ctx.strokeStyle = "rgba(0,0,0,0.75)";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(rect.x + 3, rect.y + 3, Math.max(1, rect.w - 6), Math.max(1, rect.h - 6));
+          ctx.restore();
+        }
+      }
     } else {
       const st = this.__hpsPreviewState || {};
       const isLoading = st.status === "loading" || !!st.progress;
@@ -825,12 +1214,39 @@ function setupPreviewNode(nodeType) {
         ctx.font = "12px sans-serif";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(text, this.size[0] / 2, top + h / 2, Math.max(1, w - 16));
+        ctx.fillText(text, this.size[0] / 2, g.top + g.h / 2, Math.max(1, g.w - 16));
         ctx.textAlign = "left";
         ctx.textBaseline = "alphabetic";
       }
     }
+    const contextMsg = this.__hpsPreviewContextMessage || "";
+    const msgAge = Date.now() - Number(this.__hpsPreviewContextMessageAt || 0);
+    if (contextMsg && msgAge < 5000 && g.isImageDir) {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(8, Math.max(46, g.top - 22), Math.max(140, this.size[0] - 16), 18);
+      ctx.fillStyle = "#ddd";
+      ctx.font = "12px sans-serif";
+      ctx.fillText(contextMsg, 12, Math.max(60, g.top - 9), Math.max(120, this.size[0] - 24));
+    }
     ctx.restore();
+  };
+
+  const origMouseDown = nodeType.prototype.onMouseDown;
+  nodeType.prototype.onMouseDown = function (event, pos, canvas) {
+    if (isNodeClass(this, "ImageDirPreview") && event?.button === 0) {
+      const local = previewLocalFromEventOrPos(this, event, pos);
+      const item = imageDirPreviewItemAtLocal(this, local);
+      if (item) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        event.stopImmediatePropagation?.();
+        setImageDirHover(this, item);
+        openImageDirContextMenu(this, item, event);
+        return true;
+      }
+      hideHpsContextMenu();
+    }
+    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
   };
 }
 
@@ -858,6 +1274,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   }
 
   node.__hpsPreviewState = { ...(node.__hpsPreviewState || {}), ...detail };
+  if (isNodeClass(node, "ImageDirPreview")) node.__hpsHoveredPreviewIndex = null;
   const caption = detail.progress_message || detail.message || `${detail.count ?? 0} img · ${detail.columns ?? 0}×${detail.rows ?? 0} · ${detail.width ?? 0}×${detail.height ?? 0}`;
   node.__hpsPreviewCaption = caption;
   if (!detail.image) {
@@ -877,6 +1294,172 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
 // ---------- Selector ----------
 const SELECTOR_VISIBLE_ROWS = 20;
 const ROW_H = 20;
+const SELECTOR_THUMBNAIL_POPUP_W = 250;
+const SELECTOR_THUMBNAIL_POPUP_H = 250;
+const selectorThumbnailCache = new Map();
+
+function selectorThumbnailCacheKey(ckptName) {
+  return String(ckptName || "");
+}
+
+function clearSelectorThumbnailHover(node) {
+  if (!node) return;
+  if (node.__hpsHoverCkptName || node.__hpsHoverRowIndex != null || node.__hpsHoverSource) {
+    node.__hpsHoverCkptName = "";
+    node.__hpsHoverRowIndex = null;
+    node.__hpsHoverSource = "";
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function selectorVisibleRowIndexForCheckpoint(node, ckptName) {
+  if (!ckptName) return null;
+  const idx = selectorItems(node).findIndex((entry) => entry.ckpt_name_str === ckptName);
+  if (idx < 0) return null;
+  const row = idx - (node.__hpsScroll || 0);
+  return row >= 0 && row < SELECTOR_VISIBLE_ROWS ? row : null;
+}
+
+function setSelectorThumbnailHover(node, ckptName, rowIndex = null, source = "") {
+  if (!node || !ckptName) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+  if (node.__hpsHoverCkptName !== ckptName || node.__hpsHoverRowIndex !== rowIndex || node.__hpsHoverSource !== source) {
+    node.__hpsHoverCkptName = ckptName;
+    node.__hpsHoverRowIndex = rowIndex;
+    node.__hpsHoverSource = source;
+    requestSelectorThumbnail(node, ckptName);
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function selectorItemAtLocal(node, local) {
+  if (!local) return null;
+  const r = selectorRects(node);
+  if (!hit(local, r.list)) return null;
+  const row = Math.floor((local[1] - r.list.y) / ROW_H);
+  if (row < 0 || row >= SELECTOR_VISIBLE_ROWS) return null;
+  const item = selectorItems(node)[(node.__hpsScroll || 0) + row];
+  if (!item) return null;
+  return { item, row };
+}
+
+async function requestSelectorThumbnail(node, ckptName) {
+  const key = selectorThumbnailCacheKey(ckptName);
+  if (!key) return;
+  const cached = selectorThumbnailCache.get(key);
+  if (cached?.status === "loading" || cached?.status === "ready" || cached?.status === "missing") return;
+  selectorThumbnailCache.set(key, { status: "loading" });
+  app.graph?.setDirtyCanvas?.(true, true);
+  try {
+    const query = new URLSearchParams({ ckpt_name_str: key });
+    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/selector/thumbnail?${query.toString()}`, { cache: "no-store" });
+    const result = await response.json();
+    if (!result?.ok || !result.found || !result.image) {
+      selectorThumbnailCache.set(key, { status: "missing" });
+      app.graph?.setDirtyCanvas?.(true, true);
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      selectorThumbnailCache.set(key, {
+        status: "ready",
+        image: img,
+        width: result.width || img.width,
+        height: result.height || img.height,
+        thumbnail_path: result.thumbnail_path || "",
+      });
+      app.graph?.setDirtyCanvas?.(true, true);
+    };
+    img.onerror = () => {
+      selectorThumbnailCache.set(key, { status: "missing" });
+      app.graph?.setDirtyCanvas?.(true, true);
+    };
+    img.src = `data:image/${result.format || "jpeg"};base64,${result.image}`;
+  } catch (error) {
+    selectorThumbnailCache.set(key, { status: "missing", error: String(error) });
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function updateSelectorThumbnailHover(node, event, pos) {
+  if (!node || hpsNodeCollapsed(node)) return;
+  const local = selectorLocalFromEventOrPos(node, event, pos);
+  if (!hpsLocalInsideNode(node, local)) {
+    clearSelectorThumbnailHover(node);
+    return;
+  }
+
+  const hitItem = selectorItemAtLocal(node, local);
+  if (hitItem?.item?.ckpt_name_str) {
+    setSelectorThumbnailHover(node, hitItem.item.ckpt_name_str, hitItem.row, "list");
+    return;
+  }
+
+  const selected = selectorSelected(node);
+  if (selected) {
+    setSelectorThumbnailHover(node, selected, selectorVisibleRowIndexForCheckpoint(node, selected), "selected");
+    return;
+  }
+
+  clearSelectorThumbnailHover(node);
+}
+
+function drawSelectorThumbnailPopup(ctx, node) {
+  const ckpt = node.__hpsHoverCkptName || "";
+  if (!ckpt) return;
+  const r = selectorRects(node);
+  const cache = selectorThumbnailCache.get(selectorThumbnailCacheKey(ckpt)) || { status: "loading" };
+  const x = r.list.x + r.list.w + 12;
+  const rowIndex = Number.isFinite(node.__hpsHoverRowIndex) ? node.__hpsHoverRowIndex : null;
+  const preferredY = rowIndex == null ? 46 : r.list.y + rowIndex * ROW_H - 8;
+  const y = Math.max(8, Math.min(preferredY, (node.size?.[1] || 540) - SELECTOR_THUMBNAIL_POPUP_H - 8));
+  const w = SELECTOR_THUMBNAIL_POPUP_W;
+  const h = SELECTOR_THUMBNAIL_POPUP_H;
+
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = 16;
+  ctx.fillStyle = "rgba(20,20,20,0.94)";
+  ctx.strokeStyle = "rgba(255,255,255,0.28)";
+  ctx.lineWidth = 1;
+  drawRounded(ctx, x, y, w, h, 10);
+  ctx.fill();
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  const pad = 8;
+  const titleH = 22;
+  ctx.fillStyle = "#ddd";
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(ckpt, x + pad, y + 14, w - pad * 2);
+
+  const imgBox = { x: x + pad, y: y + titleH + pad, w: w - pad * 2, h: h - titleH - pad * 2 };
+  if (cache.status === "ready" && cache.image) {
+    const img = cache.image;
+    let dw = imgBox.w;
+    let dh = dw * (img.height / img.width);
+    if (dh > imgBox.h) {
+      dh = imgBox.h;
+      dw = dh * (img.width / img.height);
+    }
+    const ix = imgBox.x + (imgBox.w - dw) / 2;
+    const iy = imgBox.y + (imgBox.h - dh) / 2;
+    ctx.drawImage(img, ix, iy, dw, dh);
+  } else {
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    ctx.fillRect(imgBox.x, imgBox.y, imgBox.w, imgBox.h);
+    ctx.fillStyle = cache.status === "missing" ? "#aaa" : "#ddd";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(cache.status === "missing" ? "No sidecar thumbnail" : "Loading thumbnail...", imgBox.x + imgBox.w / 2, imgBox.y + imgBox.h / 2, imgBox.w - 12);
+  }
+  ctx.restore();
+}
+
 
 function selectorWidget(node) {
   return getWidget(node, "checkpoint");
@@ -895,24 +1478,22 @@ function selectorRects(node) {
   const buttonH = 24;
   const arrowW = 32;
   const refreshW = 102;
-  const listOnlyW = 92;
   const pushW = selectorActionMode(node) === "sync" ? 150 : 174;
-  const pushX = margin + refreshW + gap + listOnlyW + gap;
+  const pushX = margin + refreshW + gap;
   // Keep scroll buttons close to the toolbar action buttons instead of anchoring
   // them to the right edge. The right edge belongs to ComfyUI output pins.
   const upX = pushX + pushW + gap;
   const downX = upX + arrowW + gap;
   return {
     refreshAll: { x: margin, y: buttonY, w: refreshW, h: buttonH },
-    listOnly: { x: margin + refreshW + gap, y: buttonY, w: listOnlyW, h: buttonH },
     pushLocalList: { x: pushX, y: buttonY, w: pushW, h: buttonH },
     up: { x: upX, y: buttonY, w: arrowW, h: buttonH },
     down: { x: downX, y: buttonY, w: arrowW, h: buttonH },
     list: { x: margin, y: 104, w: node.size[0] - 16, h: ROW_H * SELECTOR_VISIBLE_ROWS },
   };
 }
-function selectorItems(node) { return node.__hpsItems || []; }
-function selectorSelected(node) { return selectorWidget(node)?.value || node.__hpsSelected || ""; }
+function selectorItems(node) { return node?.__hpsItems || []; }
+function selectorSelected(node) { return node ? (selectorWidget(node)?.value || node.__hpsSelected || "") : ""; }
 function selectorStatusFor(node, ckptName) {
   const item = selectorItems(node).find((entry) => entry.ckpt_name_str === ckptName);
   return item?.status || "none";
@@ -928,10 +1509,11 @@ function setSelectorSelected(node, value) {
   const w = selectorWidget(node); if (w) w.value = value;
   node.__hpsSelected = value;
   node.title = selectorTitleText(node, value);
+  updateDirectLinkTaggers(node);
 }
 function selectorStatusText(result, prefix = "") {
   const s = result?.summary || {};
-  return `${prefix}${s.total ?? 0} total (💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
+  return `${prefix}${s.total ?? 0} total (👑:${s.god ?? 0}, 💛:${s.favorite ?? 0}, 👍:${s.nice ?? 0}, ✔:${s.keep ?? 0}, 🗑:${s.delete ?? 0}, —:${s.none ?? 0})`;
 }
 function getSelectorReviewTargets(node) {
   const outIndex = node.outputs?.findIndex((o) => o.name === "ckpt_name_str") ?? -1;
@@ -1059,11 +1641,83 @@ function nextAnimationFrame() {
 
 function selectorActionMode(node) {
   const targets = getSelectorReviewTargets(node);
-  return (targets.taggers.length || targets.previews.length) ? "sync" : "push";
+  if (targets.previews.length) return "sync";
+  if (targets.taggers.length) return "directlink";
+  return "push";
+}
+
+function selectorDirectLinkEnabled(node) {
+  return selectorActionMode(node) === "directlink" && !!node.__hpsDirectLinkEnabled;
 }
 
 function selectorActionLabel(node) {
-  return selectorActionMode(node) === "sync" ? "🎯 Sync Checkpoint" : "🏹 Push to Local List";
+  const mode = selectorActionMode(node);
+  if (mode === "sync") return "🎯 Sync Checkpoint";
+  if (mode === "directlink") return selectorDirectLinkEnabled(node) ? "🌕 DirectLink ON" : "🌑 DirectLink OFF";
+  return "🏹 Push to Local List";
+}
+
+const DIRECT_LINK_CONFIRM_MESSAGE = "Enable DirectLink?\n\nUse this mode only while checking generated images on a tablet, shared folder, or external viewer.\n\nOtherwise, connect ImageDirPreview and use Sync mode.\n\nTagger will label the checkpoint selected in ListSelector.";
+let hpsDirectLinkConfirmShown = false;
+
+function directLinkTaggerTargets(node) {
+  const targets = getSelectorReviewTargets(node);
+  return selectorActionMode(node) === "directlink" ? targets.taggers : [];
+}
+
+function clearTaggerTarget(node) {
+  if (!node) return;
+  node.__hpsTaggerPath = "";
+  node.__hpsTaggerStatus = "none";
+  node.__hpsTaggerMessage = "";
+  if (isNodeClass(node, TAGGER_CLASS)) node.title = "Tagger";
+}
+
+function setTaggerTargetSnapshot(node, ckptName, status = "none") {
+  if (!node || !ckptName) return;
+  node.__hpsTaggerPath = ckptName;
+  node.__hpsTaggerStatus = status || "none";
+  node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
+  node.title = node.__hpsTaggerStatus === "none"
+    ? `Tagger : ${ckptName}`
+    : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${ckptName}`;
+}
+
+function updateDirectLinkTaggers(node) {
+  const taggers = directLinkTaggerTargets(node);
+  if (!taggers.length) return;
+  if (!selectorDirectLinkEnabled(node)) {
+    for (const tagger of taggers) clearTaggerTarget(tagger);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
+  const selected = selectorSelected(node);
+  if (!selected) {
+    for (const tagger of taggers) clearTaggerTarget(tagger);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
+  const status = selectorStatusFor(node, selected);
+  for (const tagger of taggers) setTaggerTargetSnapshot(tagger, selected, status);
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function toggleSelectorDirectLink(node) {
+  if (selectorActionMode(node) !== "directlink") return;
+  if (!node.__hpsDirectLinkEnabled) {
+    if (!hpsDirectLinkConfirmShown) {
+      hpsDirectLinkConfirmShown = true;
+      if (!globalThis.confirm?.(DIRECT_LINK_CONFIRM_MESSAGE)) return;
+    }
+    node.__hpsDirectLinkEnabled = true;
+  } else {
+    node.__hpsDirectLinkEnabled = false;
+  }
+  updateDirectLinkTaggers(node);
+  node.__hpsStatus = selectorDirectLinkEnabled(node)
+    ? "DirectLink ON: Tagger follows selected checkpoint."
+    : "DirectLink OFF: connect ImageDirPreview for Sync mode, or enable DirectLink for external review.";
+  app.graph?.setDirtyCanvas?.(true, true);
 }
 
 async function loadSelector(node, mode = "list") {
@@ -1095,6 +1749,7 @@ async function refreshSelector(node, all = false) {
     }
 
     if (all) {
+      selectorThumbnailCache.clear();
       const checkpointValues = await checkpointValuesFromRefreshPayload(result);
       lastCheckpointValues = checkpointValues;
       const stats = applyCheckpointValuesToGraph(checkpointValues);
@@ -1176,6 +1831,7 @@ function maxSelectorScroll(node) {
 
 function scrollSelector(node, delta) {
   node.__hpsScroll = Math.max(0, Math.min(maxSelectorScroll(node), (node.__hpsScroll || 0) + delta));
+  clearSelectorThumbnailHover(node);
   app.graph.setDirtyCanvas(true, true);
 }
 
@@ -1256,7 +1912,7 @@ function installSelectorWheelCapture() {
 function selectorCursorAt(node, local) {
   if (!local) return "";
   const r = selectorRects(node);
-  if (hit(local, r.refreshAll) || hit(local, r.listOnly) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
+  if (hit(local, r.refreshAll) || hit(local, r.pushLocalList) || hit(local, r.up) || hit(local, r.down)) return "pointer";
   const sb = selectorScrollbar(node);
   if (sb && hit(local, sb.track)) return "pointer";
   const list = selectorItems(node);
@@ -1332,9 +1988,11 @@ function setupSelectorNode(nodeType) {
     hideSelectorWidget(this);
     if (hpsNodeCollapsed(this)) return;
     const r = selectorRects(this);
+    if (selectorActionMode(this) !== "directlink" && this.__hpsDirectLinkEnabled) {
+      this.__hpsDirectLinkEnabled = false;
+    }
     drawButton(ctx, r.refreshAll, "🔄 Refresh All", !this.__hpsLoading);
-    drawButton(ctx, r.listOnly, "📋 List Only", !this.__hpsLoading);
-    drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading);
+    drawButton(ctx, r.pushLocalList, selectorActionLabel(this), !this.__hpsLoading, selectorDirectLinkEnabled(this));
     drawButton(ctx, r.up, "▲", true);
     drawButton(ctx, r.down, "▼", true);
 
@@ -1346,6 +2004,7 @@ function setupSelectorNode(nodeType) {
     ctx.restore();
 
     drawSelectorRows(ctx, this);
+    drawSelectorThumbnailPopup(ctx, this);
   };
 
   const origMouseDown = nodeType.prototype.onMouseDown;
@@ -1353,59 +2012,60 @@ function setupSelectorNode(nodeType) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
 
     const r = selectorRects(this);
-    if (hitAny(this, pos, r.refreshAll)) {
+    const local = selectorLocalFromEventOrPos(this, event, pos);
+    if (!local) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+
+    if (hit(local, r.refreshAll)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       refreshSelector(this, true);
       return true;
     }
-    if (hitAny(this, pos, r.listOnly)) {
+    if (hit(local, r.pushLocalList)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
-      refreshSelector(this, false);
-      return true;
-    }
-    if (hitAny(this, pos, r.pushLocalList)) {
-      event?.preventDefault?.();
-      event?.stopPropagation?.();
-      if (selectorActionMode(this) === "sync") syncSelectedCheckpoint(this);
+      event?.stopImmediatePropagation?.();
+      const mode = selectorActionMode(this);
+      if (mode === "sync") syncSelectedCheckpoint(this);
+      else if (mode === "directlink") toggleSelectorDirectLink(this);
       else pushSelectedToLocalList(this);
       return true;
     }
-    if (hitAny(this, pos, r.up)) {
+    if (hit(local, r.up)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
       return true;
     }
-    if (hitAny(this, pos, r.down)) {
+    if (hit(local, r.down)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
       scrollSelector(this, SELECTOR_VISIBLE_ROWS);
       return true;
     }
 
     const sb = selectorScrollbar(this);
     if (sb) {
-      const hitPositions = candidatePositions(this, pos);
-      const thumbHitPos = hitPositions.find((p) => hit(p, sb.thumb));
-      const trackHitPos = hitPositions.find((p) => hit(p, sb.track));
-
-      if (thumbHitPos) {
+      if (hit(local, sb.thumb)) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
         this.__hpsScrollbarDragging = true;
-        this.__hpsScrollbarDragOffset = thumbHitPos[1] - sb.thumb.y;
-        this.__hpsScrollbarStartY = thumbHitPos[1];
+        this.__hpsScrollbarDragOffset = local[1] - sb.thumb.y;
+        this.__hpsScrollbarStartY = local[1];
         this.__hpsScrollbarStartScroll = sb.scroll;
         app.graph?.setDirtyCanvas?.(true, true);
         return true;
       }
 
-      if (trackHitPos) {
+      if (hit(local, sb.track)) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
-        if (trackHitPos[1] < sb.thumb.y) {
+        event?.stopImmediatePropagation?.();
+        if (local[1] < sb.thumb.y) {
           scrollSelector(this, -SELECTOR_VISIBLE_ROWS);
         } else {
           scrollSelector(this, SELECTOR_VISIBLE_ROWS);
@@ -1414,14 +2074,13 @@ function setupSelectorNode(nodeType) {
       }
     }
 
-    const positions = candidatePositions(this, pos);
-    for (const p of positions) {
-      if (!hit(p, r.list)) continue;
-      const row = Math.floor((p[1] - r.list.y) / ROW_H);
+    if (hit(local, r.list)) {
+      const row = Math.floor((local[1] - r.list.y) / ROW_H);
       const item = selectorItems(this)[(this.__hpsScroll || 0) + row];
       if (item) {
         event?.preventDefault?.();
         event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
         setSelectorSelected(this, item.ckpt_name_str);
         app.graph.setDirtyCanvas(true, true);
         return true;
@@ -1456,6 +2115,7 @@ function setupSelectorNode(nodeType) {
       return true;
     }
 
+    updateSelectorThumbnailHover(this, event, pos);
     return origMouseMove ? origMouseMove.apply(this, arguments) : false;
   };
 
@@ -1475,7 +2135,8 @@ function setupSelectorNode(nodeType) {
   const origMouseWheel = nodeType.prototype.onMouseWheel;
   nodeType.prototype.onMouseWheel = function (event, pos, canvas) {
     const r = selectorRects(this);
-    if (candidatePositions(this, pos).some((p) => hit(p, r.list))) {
+    const local = selectorLocalFromEventOrPos(this, event, pos);
+    if (hit(local, r.list)) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
       event?.stopImmediatePropagation?.();
@@ -1487,18 +2148,35 @@ function setupSelectorNode(nodeType) {
 }
 
 // ---------- Tagger ----------
-function linkedCheckpointInputValue(node, inputName) {
+function linkedCheckpointInputSource(node, inputName) {
   const index = node.inputs?.findIndex((input) => input.name === inputName) ?? -1;
-  if (index < 0) return "";
+  if (index < 0) return null;
   const linkId = node.inputs?.[index]?.link;
-  if (linkId == null) return "";
+  if (linkId == null) return null;
   const link = app.graph?.links?.[linkId];
   const source = link ? app.graph?.getNodeById?.(link.origin_id) : null;
+  return source ? { link, source } : null;
+}
+
+function isTaggerDirectLinkBlocked(node) {
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const source = info?.source;
+  return !!(source && isNodeClass(source, SELECTOR_CLASS) && selectorActionMode(source) === "directlink" && !selectorDirectLinkEnabled(source));
+}
+
+function linkedCheckpointInputValue(node, inputName) {
+  const info = linkedCheckpointInputSource(node, inputName);
+  const source = info?.source;
+  const link = info?.link;
   if (!source) return "";
   if (isNodeClass(source, CYCLER_CLASS)) return source.__hpsCyclerCkptName || "";
-  if (isNodeClass(source, SELECTOR_CLASS)) return selectorSelected(source) || "";
+  if (isNodeClass(source, SELECTOR_CLASS)) {
+    const mode = selectorActionMode(source);
+    if (mode === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
+    return "";
+  }
   const outputName = String(source.outputs?.[link.origin_slot]?.name || "").toLowerCase();
-  if (outputName === "ckpt_name_str" || outputName === "ckpt_name") {
+  if (outputName === "ckpt_name_str") {
     const ckptWidget = findCheckpointWidget(source) || findStartCheckpointWidget(source);
     const value = String(ckptWidget?.value || "");
     return value.endsWith(".safetensors") ? value : "";
@@ -1507,30 +2185,51 @@ function linkedCheckpointInputValue(node, inputName) {
 }
 
 function currentTaggerPath(node) {
-  return node.__hpsTaggerPath || linkedCheckpointInputValue(node, "ckpt_name_str") || "";
+  if (isTaggerDirectLinkBlocked(node)) return "";
+  const info = linkedCheckpointInputSource(node, "ckpt_name_str");
+  const source = info?.source;
+  if (source && isNodeClass(source, SELECTOR_CLASS)) {
+    if (selectorActionMode(source) === "directlink") return selectorDirectLinkEnabled(source) ? (selectorSelected(source) || "") : "";
+    return node.__hpsTaggerPath || "";
+  }
+  return node.__hpsTaggerPath
+    || linkedCheckpointInputValue(node, "ckpt_name_str")
+    || "";
 }
 function taggerButtons(node) {
-  // Keep controls right-aligned and away from LiteGraph input pins/labels.
+  // Keep positive status controls on the first row and delete separated below.
   const buttonW = 76;
   const gap = 6;
-  const totalW = TAGGER_STATUS_ORDER.length * buttonW + (TAGGER_STATUS_ORDER.length - 1) * gap;
   const right = Math.max(442, (node.size?.[0] || 450) - 8);
+  const topStatuses = ["god", "favorite", "nice", "keep"];
+  const totalW = topStatuses.length * buttonW + (topStatuses.length - 1) * gap;
   const startX = right - totalW;
-  return TAGGER_STATUS_ORDER.map((status, i) => ({
+  const buttons = topStatuses.map((status, i) => ({
     status,
     x: startX + i * (buttonW + gap),
     y: 3,
     w: buttonW,
     h: 26,
   }));
+  buttons.push({ status: "delete", x: right - buttonW, y: 35, w: buttonW, h: 26 });
+  return buttons;
 }
 function taggerDeleteEnabled(node) {
+  if (!currentTaggerPath(node)) return false;
   const current = node.__hpsTaggerStatus || "none";
   return current === "none" || current === "delete";
 }
+function taggerButtonsEnabled(node, status) {
+  if (!currentTaggerPath(node)) return false;
+  return status !== "delete" || taggerDeleteEnabled(node);
+}
 async function setTaggerStatus(node, status) {
   const ckpt = currentTaggerPath(node);
-  if (!ckpt) return;
+  if (!ckpt) {
+    clearTaggerTarget(node);
+    app.graph?.setDirtyCanvas?.(true, true);
+    return;
+  }
   if (status === "delete" && !taggerDeleteEnabled(node)) return;
   const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tagger/set_status`, {
     method: "POST",
@@ -1551,26 +2250,35 @@ function taggerCursorAt(node, local) {
   if (!local) return "";
   for (const b of taggerButtons(node)) {
     if (!hit(local, b)) continue;
-    if (b.status === "delete" && !taggerDeleteEnabled(node)) return "not-allowed";
+    if (!taggerButtonsEnabled(node, b.status)) return "not-allowed";
     return "pointer";
   }
   return "";
 }
 
+function normalizeTaggerHeight(node) {
+  if (!node?.size) return;
+  // v9l moves the message area up by 21px. Shrink only default-ish old layouts;
+  // user-expanded nodes should keep their chosen height.
+  if (node.size[1] > 107 && node.size[1] <= 128) node.size[1] = 107;
+}
+
 function setupTaggerNode(nodeType) {
-  installMinSize(nodeType, 450, 104);
+  installMinSize(nodeType, 450, 107);
   installTabIdSupport(nodeType);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 450, 104);
+    ensureSize(this, 450, 107);
+    normalizeTaggerHeight(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    normalizeTaggerHeight(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -1580,33 +2288,39 @@ function setupTaggerNode(nodeType) {
     ensureHiddenTabIdWidget(this);
     if (hpsNodeCollapsed(this)) return;
     ctx.save();
-    const current = this.__hpsTaggerStatus || "none";
+    const p = currentTaggerPath(this);
+    const linkedSource = linkedCheckpointInputSource(this, "ckpt_name_str")?.source;
+    const current = p ? (this.__hpsTaggerStatus || selectorStatusFor(linkedSource, p) || "none") : "none";
     for (const b of taggerButtons(this)) {
-      const enabled = b.status !== "delete" || taggerDeleteEnabled(this);
+      const enabled = taggerButtonsEnabled(this, b.status);
       const buttonColor = b.status === "delete" && enabled ? "rgba(105,90,90,0.65)" : null;
       drawButton(
         ctx,
         b,
         `${STATUS_ICON[b.status]} ${STATUS_LABEL[b.status]}`,
         enabled,
-        current === b.status,
+        p && current === b.status,
         buttonColor,
         { textColor: enabled ? undefined : "#888" }
       );
     }
-    const p = currentTaggerPath(this);
     ctx.fillStyle = "#ddd";
     ctx.font = "12px sans-serif";
-    ctx.fillText(p ? p : "Execute once to bind current checkpoint.", 8, 50);
-    const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
-    ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
-    ctx.fillText(msg, 8, 70);
-    if (current !== "none" && current !== "delete") {
-      ctx.fillStyle = "#aaa";
-      ctx.fillText("Delete is available only from none.", 8, 90);
-    } else if (current === "delete") {
-      ctx.fillStyle = "#aaa";
-      ctx.fillText("Run exported script in temp. (Asks [y/N] before deletion.)", 8, 90);
+    if (p) {
+      ctx.fillText(p, 8, 55);
+      const msg = this.__hpsTaggerMessage || taggerCurrentMessage(current);
+      ctx.fillStyle = current === "none" ? "#ccc" : "#ddd";
+      ctx.fillText(msg, 8, 75);
+      if (current !== "none" && current !== "delete") {
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Delete is available only from none.", 8, 95);
+      } else if (current === "delete") {
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Delete script exported to output. ([y/N])", 8, 95);
+      }
+    } else {
+      ctx.fillStyle = "#ccc";
+      ctx.fillText(taggerCurrentMessage("none"), 8, 55);
     }
     ctx.restore();
   };
@@ -1615,7 +2329,7 @@ function setupTaggerNode(nodeType) {
     if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
     for (const b of taggerButtons(this)) {
       if (hitAny(this, pos, b)) {
-        if (b.status === "delete" && !taggerDeleteEnabled(this)) return true;
+        if (!taggerButtonsEnabled(this, b.status)) return true;
         setTaggerStatus(this, b.status);
         return true;
       }
@@ -1626,6 +2340,11 @@ function setupTaggerNode(nodeType) {
 api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, TAGGER_CLASS);
   if (!node) return;
+  if (isTaggerDirectLinkBlocked(node)) {
+    clearTaggerTarget(node);
+    app.graph.setDirtyCanvas(true, true);
+    return;
+  }
   node.__hpsTaggerPath = detail.ckpt_name_str;
   node.__hpsTaggerStatus = detail.status;
   node.__hpsTaggerMessage = taggerCurrentMessage(detail.status || "none");
@@ -1652,6 +2371,7 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
       }
       if (selectorSelected(node) === detail.ckpt_name_str) {
         node.title = selectorTitleText(node, detail.ckpt_name_str);
+        if (selectorDirectLinkEnabled(node)) updateDirectLinkTaggers(node);
       }
     }
     if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {

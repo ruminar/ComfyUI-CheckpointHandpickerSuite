@@ -22,6 +22,15 @@ from server import PromptServer
 
 logger = logging.getLogger(__name__)
 
+# v9k: DirectLink mode and persistent output-side delete script folder.
+# v9i: ImageDirPreview left-click menu, hover frame, and preview-state source path fix.
+# v9h: ImageDirPreview right-click event separation and blank-area suppression.
+# v9g: ImageDirPreview right-click capture fix for ComfyUI/LiteGraph context menu.
+# v9f: ImageDirPreview context menu foundation and Set as checkpoint thumbnail.
+# v9e: add top-tier god checkpoint status.
+# v9d: sticky/current-selection thumbnail popup refinement.
+# v9c: ListSelector hover thumbnail popup.
+# v9b: v8l baseline plus delete-script thumbnail sidecar candidates.
 # v8g: restore-safe Cycler runtime controls, global shuffle deck, and UI regression fixes.
 EXTENSION_PREFIX = "checkpoint_handpicker_suite"
 PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
@@ -29,20 +38,21 @@ CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
 TAGGER_EVENT = "ruminar.checkpoint_handpicker_suite.tagger"
 STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed"
 
-STATUS_VALUES = ["favorite", "nice", "keep", "delete", "none"]
-STATUS_ICON = {"favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
-STATUS_LABEL = {"favorite": "favorite", "nice": "nice", "keep": "keep", "delete": "delete", "none": "none"}
+STATUS_VALUES = ["god", "favorite", "nice", "keep", "delete", "none"]
+STATUS_ICON = {"god": "👑", "favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
+STATUS_LABEL = {"god": "god!", "favorite": "favorite", "nice": "nice", "keep": "keep", "delete": "delete", "none": "none"}
 
 NODE_DIR = Path(__file__).resolve().parent
 DATA_DIR = NODE_DIR / "data"
 STATUS_DB_PATH = DATA_DIR / "checkpoint_statuses.json"
 FAVORITES_COMPAT_PATH = DATA_DIR / "checkpoint_favorites.json"
 try:
-    TEMP_DIR = Path(folder_paths.get_temp_directory()).resolve()
+    OUTPUT_DIR = Path(folder_paths.get_output_directory()).resolve()
 except Exception:
-    TEMP_DIR = NODE_DIR / "temp"
-DELETE_QUEUE_PATH = TEMP_DIR / "checkpoint_delete_queue.jsonl"
-DELETE_SCRIPT_PATH = TEMP_DIR / "delete_reserved_checkpoints.py"
+    OUTPUT_DIR = NODE_DIR / "output"
+DELETE_SCRIPT_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite" / "delete_scripts"
+DELETE_QUEUE_PATH = DELETE_SCRIPT_DIR / "checkpoint_delete_queue.jsonl"
+DELETE_SCRIPT_PATH = DELETE_SCRIPT_DIR / "delete_reserved_checkpoints.py"
 
 JPEG_QUALITY = 80
 JPEG_OPTIMIZE = False
@@ -52,6 +62,7 @@ IMAGE_DIR_MAX_IMAGES = 80
 IMAGE_DIR_SCAN_LIMIT = 3000
 MAX_CONTENT_EDGE = 4096
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+ALLOWED_THUMBNAIL_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_CHECKPOINT_SUFFIX = ".safetensors"
 
 _STATE_LOCK = threading.Lock()
@@ -297,12 +308,12 @@ def _status_summary_text(prefix: str) -> str:
     summary = _delete_status_summary()
     return (
         f"{prefix}: {summary['total']} total "
-        f"(💛:{summary['favorite']}, 👍:{summary['nice']}, ✔:{summary['keep']}, 🗑:{summary['delete']}, —:{summary['none']})"
+        f"(👑:{summary['god']}, 💛:{summary['favorite']}, 👍:{summary['nice']}, ✔:{summary['keep']}, 🗑:{summary['delete']}, —:{summary['none']})"
     )
 
 
 def _status_icons_for_filter(active_statuses: list[str]) -> str:
-    return "".join(STATUS_ICON[s] for s in ["favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
+    return "".join(STATUS_ICON[s] for s in ["god", "favorite", "nice", "keep", "delete", "none"] if s in active_statuses)
 
 
 def _filter_display(active_statuses: list[str]) -> str:
@@ -761,6 +772,188 @@ def _is_path_under_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _checkpoint_thumbnail_candidates(safetensors_path: Path) -> list[Path]:
+    """Return conservative sidecar thumbnail candidates for a checkpoint.
+
+    Only files in the same directory as the checkpoint are considered. This is
+    intentionally stricter than ImageDirPreview source-image scanning: delete
+    script targets must be direct sidecars, not arbitrary generated images.
+    """
+    path = Path(safetensors_path).resolve()
+    parent = path.parent
+    stem = path.stem
+    name = path.name
+    patterns: list[str] = []
+    for ext in sorted(ALLOWED_THUMBNAIL_SUFFIXES):
+        patterns.extend([
+            f"{stem}{ext}",
+            f"{name}{ext}",
+            f"{stem}.thumbnail{ext}",
+            f"{stem}.thumb{ext}",
+            f"{stem}.preview{ext}",
+            f"{name}.thumbnail{ext}",
+            f"{name}.thumb{ext}",
+            f"{name}.preview{ext}",
+        ])
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        candidate = (parent / pattern).resolve()
+        if str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        if candidate.exists() and candidate.is_file():
+            candidates.append(candidate)
+    return candidates
+
+
+def _load_sidecar_thumbnail_preview(relpath: str) -> tuple[Image.Image | None, str]:
+    """Load the first conservative sidecar thumbnail for a checkpoint.
+
+    This is the display counterpart of the v9b delete-script sidecar policy.
+    It intentionally does not scan output/review folders or ImageDirPreview
+    source directories: hover thumbnails are direct checkpoint sidecars only.
+    """
+    resolved = _resolve_checkpoint_unique(relpath)
+    if not resolved:
+        return None, ""
+    safetensors_path = Path(resolved["path"]).resolve()
+    roots = _checkpoint_roots()
+    if roots and not any(_is_path_under_root(safetensors_path, root) for root in roots):
+        return None, ""
+    for thumb_path in _checkpoint_thumbnail_candidates(safetensors_path):
+        if roots and not any(_is_path_under_root(thumb_path, root) for root in roots):
+            continue
+        try:
+            with Image.open(thumb_path) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                return img.convert("RGB"), str(thumb_path)
+        except Exception:
+            logger.exception("Failed to load ListSelector thumbnail: %s", thumb_path)
+    return None, ""
+
+
+def _preferred_checkpoint_thumbnail_path(safetensors_path: Path) -> Path:
+    existing = _checkpoint_thumbnail_candidates(safetensors_path)
+    if existing:
+        return Path(existing[0]).resolve()
+    return Path(safetensors_path).resolve().with_suffix(".jpg")
+
+
+def _get_preview_state_item(tab_id, node_id, item_index, preview_session_id=None):
+    key = _state_key(tab_id, node_id)
+    with _STATE_LOCK:
+        state = dict(_PREVIEW_STATES.get(key, {}))
+    if preview_session_id and state.get("preview_session_id") != str(preview_session_id):
+        return state, None, None, None
+    source_paths = state.get("source_paths")
+    if not isinstance(source_paths, list):
+        return None, None, None, None
+    try:
+        index = int(item_index)
+    except Exception:
+        return state, None, None, None
+    if index < 0 or index >= len(source_paths):
+        return state, None, None, None
+    raw_path = str(source_paths[index] or "").strip()
+    if not raw_path:
+        return state, None, None, None
+    try:
+        source_path = Path(raw_path).resolve()
+    except Exception:
+        return state, None, None, None
+    return state, index, source_path, _normalize_relpath(state.get("ckpt_name_str", ""))
+
+
+def _preview_item_exists_for_state(state: dict | None, source_path: Path | None) -> bool:
+    if not state or source_path is None:
+        return False
+    try:
+        if not source_path.exists() or not source_path.is_file():
+            return False
+    except Exception:
+        return False
+    search_root = _safe_search_root(state.get("search_directory"))
+    if search_root is not None and not _is_path_under_root(source_path, search_root):
+        return False
+    if source_path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
+        return False
+    return True
+
+
+def _preview_deleted_indices(state: dict | None) -> list[int]:
+    if not state:
+        return []
+    values = state.get("deleted_indices")
+    if not isinstance(values, list):
+        return []
+    out = []
+    for value in values:
+        try:
+            idx = int(value)
+        except Exception:
+            continue
+        if idx >= 0:
+            out.append(idx)
+    return sorted(set(out))
+
+
+def _preview_item_deleted_for_state(state: dict | None, index: int | None) -> bool:
+    if index is None:
+        return False
+    return index in set(_preview_deleted_indices(state))
+
+
+def _mark_preview_item_deleted(tab_id, node_id, index: int) -> list[int]:
+    key = _state_key(tab_id, node_id)
+    with _STATE_LOCK:
+        state = _PREVIEW_STATES.get(key)
+        if not state:
+            return []
+        deleted = set(_preview_deleted_indices(state))
+        deleted.add(int(index))
+        merged = sorted(deleted)
+        state["deleted_indices"] = merged
+        _PREVIEW_STATES[key] = state
+        return list(merged)
+
+
+def _delete_preview_source_image(state: dict, source_path: Path) -> None:
+    search_root = _safe_search_root(state.get("search_directory"))
+    if search_root is not None and not _is_path_under_root(source_path, search_root):
+        raise ValueError("Preview image is outside the allowed search directory.")
+    if source_path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
+        raise ValueError("Unsupported preview image format.")
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(str(source_path))
+    source_path.unlink()
+
+
+def _set_checkpoint_thumbnail_from_preview_item(relpath: str, source_path: Path) -> dict:
+    relpath = _normalize_relpath(relpath)
+    if not _is_valid_checkpoint_relpath(relpath):
+        raise ValueError("Invalid checkpoint path.")
+    resolved = _resolve_checkpoint_unique(relpath)
+    if not resolved:
+        raise ValueError("Checkpoint not found.")
+    ckpt_path = Path(resolved["path"]).resolve()
+    target_path = _preferred_checkpoint_thumbnail_path(ckpt_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path) as img:
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        if max(img.width, img.height) > 1024:
+            img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        img.save(target_path, format="JPEG", quality=JPEG_QUALITY, optimize=JPEG_OPTIMIZE)
+    return {
+        "ckpt_name_str": relpath,
+        "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+        "source_path": str(source_path),
+        "thumbnail_path": str(target_path),
+    }
+
+
 def _delete_plan_targets() -> list[dict]:
     roots = _checkpoint_roots()
     targets = []
@@ -779,10 +972,16 @@ def _delete_plan_targets() -> list[dict]:
             continue
         raw_json_path = rec.get("json_path") or ""
         json_path = Path(raw_json_path).resolve() if raw_json_path else safetensors_path.with_suffix(".json")
+        thumbnail_paths = []
+        for thumb_path in _checkpoint_thumbnail_candidates(safetensors_path):
+            if roots and not any(_is_path_under_root(thumb_path, root) for root in roots):
+                continue
+            thumbnail_paths.append(str(thumb_path))
         targets.append({
             "ckpt_name_str": relpath,
             "safetensors_path": str(safetensors_path),
             "json_path": str(json_path),
+            "thumbnail_paths": thumbnail_paths,
             "reserved_at": rec.get("reserved_at", ""),
         })
     return targets
@@ -805,7 +1004,8 @@ def _write_delete_script():
         "SCRIPT_DIR = Path(__file__).resolve().parent",
         "QUEUE_PATH = SCRIPT_DIR / 'checkpoint_delete_queue.jsonl'",
         f"ALLOWED_ROOTS = [Path(p).resolve() for p in {roots_json}]",
-        "ALLOWED_SUFFIXES = {'.safetensors', '.json'}",
+        "ALLOWED_THUMBNAIL_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}",
+        "ALLOWED_SUFFIXES = {'.safetensors', '.json'} | ALLOWED_THUMBNAIL_SUFFIXES",
         "",
         "def is_under_root(path, root):",
         "    path = Path(path).resolve()",
@@ -817,6 +1017,29 @@ def _write_delete_script():
         "    if path.suffix.lower() not in ALLOWED_SUFFIXES:",
         "        return False",
         "    return any(is_under_root(path, root) for root in ALLOWED_ROOTS)",
+        "",
+        "def thumbnail_candidates(safetensors_path):",
+        "    path = Path(safetensors_path).resolve()",
+        "    parent = path.parent",
+        "    stem = path.stem",
+        "    name = path.name",
+        "    patterns = []",
+        "    for ext in sorted(ALLOWED_THUMBNAIL_SUFFIXES):",
+        "        patterns.extend([",
+        "            f'{stem}{ext}', f'{name}{ext}',",
+        "            f'{stem}.thumbnail{ext}', f'{stem}.thumb{ext}', f'{stem}.preview{ext}',",
+        "            f'{name}.thumbnail{ext}', f'{name}.thumb{ext}', f'{name}.preview{ext}',",
+        "        ])",
+        "    found = []",
+        "    seen = set()",
+        "    for pattern in patterns:",
+        "        candidate = (parent / pattern).resolve()",
+        "        if str(candidate) in seen:",
+        "            continue",
+        "        seen.add(str(candidate))",
+        "        if candidate.exists() and candidate.is_file() and is_safe_target(candidate):",
+        "            found.append(candidate)",
+        "    return found",
         "",
         "def read_records():",
         "    if not QUEUE_PATH.exists():",
@@ -865,20 +1088,29 @@ def _write_delete_script():
         "            print('Skipping target without resolved_path:', relpath); continue",
         "        safetensors_path = Path(raw).resolve()",
         "        json_path = Path(rec.get('json_path') or safetensors_path.with_suffix('.json')).resolve()",
-        "        targets.append((relpath, safetensors_path, json_path, rec.get('reserved_at', '')))",
+        "        thumbnails = thumbnail_candidates(safetensors_path)",
+        "        targets.append((relpath, safetensors_path, json_path, thumbnails, rec.get('reserved_at', '')))",
         "    print('Checkpoint delete script')",
         "    print('Queue file:', QUEUE_PATH)",
         "    print('Targets:', len(targets))",
-        "    for idx, (relpath, safetensors_path, json_path, reserved_at) in enumerate(targets, start=1):",
+        "    for idx, (relpath, safetensors_path, json_path, thumbnails, reserved_at) in enumerate(targets, start=1):",
         "        print()",
         "        print('[{}/{}] Delete checkpoint?'.format(idx, len(targets)))",
         "        print('  relpath:', relpath)",
         "        print('  safetensors:', safetensors_path)",
         "        print('  json:', json_path)",
-        "        answer = input('Delete this checkpoint? (y/N): ').strip().lower()",
+        "        if thumbnails:",
+        "            print('  thumbnails:')",
+        "            for thumb in thumbnails:",
+        "                print('    -', thumb)",
+        "        else:",
+        "            print('  thumbnails: (none)')",
+        "        answer = input('Delete this checkpoint and listed sidecar thumbnails? (y/N): ').strip().lower()",
         "        if answer != 'y': print('Skipped.'); continue",
         "        delete_file(safetensors_path)",
         "        delete_file(json_path)",
+        "        for thumb in thumbnails:",
+        "            delete_file(thumb)",
         "    print()",
         "    print('Deletion completed. Please return to ComfyUI and click Refresh All.')",
         "",
@@ -898,6 +1130,8 @@ def _write_delete_script():
             f"[{idx}] {item['ckpt_name_str']}",
             f"    safetensors: {item['safetensors_path']}",
             f"    json:        {item['json_path']}",
+            "    thumbnails:",
+            *([f"        - {thumb}" for thumb in item.get("thumbnail_paths", [])] or ["        (none)"]),
             f"    reserved_at: {item.get('reserved_at', '')}",
             "",
         ])
@@ -1240,12 +1474,14 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
     progress(len(selected_paths), max_preview_images, f"Found preview images {len(selected_paths)}/{max_preview_images}")
 
     images = []
+    loaded_paths = []
     total = len(selected_paths)
     for idx, path in enumerate(selected_paths, start=1):
         progress(idx - 1, max(1, total), f"Loading preview image {idx}/{total}")
         img = _load_image_file(path)
         if img is not None:
             images.append(img)
+            loaded_paths.append(path)
         progress(idx, max(1, total), f"Loading preview image {idx}/{total}")
 
     def cb(value, total, message):
@@ -1267,7 +1503,9 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
         "progress_total": max_preview_images,
         "search_directory": str(_safe_search_root(search_directory) or ""),
         "max_preview_images": max_preview_images,
-        "source_paths": [str(p) for p in selected_paths],
+        "source_paths": [str(p) for p in loaded_paths],
+        "preview_session_id": str(uuid.uuid4()),
+        "deleted_indices": [],
     })
     return sheet, extra
 
@@ -1837,7 +2075,8 @@ class ImageDirPreview:
         relpath = _normalize_relpath(ckpt_name_str)
         sheet, extra = _load_image_dir_preview(unique_id, relpath, search_directory, tab_id=hps_tab_id, send_progress=True, max_preview_images=max_preview_images)
         status = _get_status(relpath)
-        _store_preview_state(hps_tab_id, unique_id, relpath, status, node_class="ImageDirPreview")
+        state_extra = {k: v for k, v in extra.items() if k not in ("ckpt_name_str", "status")}
+        _store_preview_state(hps_tab_id, unique_id, relpath, status, **state_extra)
         _send_preview(unique_id, _image_dir_title(relpath), sheet, extra, tab_id=hps_tab_id)
         return ()
 
@@ -1875,6 +2114,152 @@ async def node_state(request):
         state.update({"ok": True, "node_id": node_id, "node_class": node_class})
         return web.json_response(state)
     return web.json_response({"ok": False, "error": "Unsupported node_class."}, status=400)
+
+
+@routes.get(f"/{EXTENSION_PREFIX}/selector/thumbnail")
+async def selector_thumbnail(request):
+    relpath = _normalize_relpath(request.query.get("ckpt_name_str", ""))
+    if not relpath:
+        return web.json_response({"ok": False, "error": "ckpt_name_str is required."}, status=400)
+    if not _is_valid_checkpoint_relpath(relpath):
+        return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
+    image, path = _load_sidecar_thumbnail_preview(relpath)
+    if image is None:
+        return web.json_response({"ok": True, "found": False, "ckpt_name_str": relpath})
+    payload = _encode_preview_payload(image)
+    payload.update({
+        "ok": True,
+        "found": True,
+        "ckpt_name_str": relpath,
+        "thumbnail_path": path,
+    })
+    return web.json_response(payload)
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/context_menu")
+async def image_dir_preview_context_menu(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if _preview_item_deleted_for_state(state, index):
+        return web.json_response({
+            "ok": True,
+            "node_id": node_id,
+            "item_index": index,
+            "exists": False,
+            "deleted": True,
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+            "items": [],
+        })
+    exists = _preview_item_exists_for_state(state, source_path)
+    if not exists:
+        return web.json_response({
+            "ok": True,
+            "node_id": node_id,
+            "item_index": index,
+            "exists": False,
+            "deleted": False,
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+            "items": [],
+        })
+    return web.json_response({
+        "ok": True,
+        "node_id": node_id,
+        "item_index": index,
+        "exists": True,
+        "deleted": False,
+        "ckpt_name_str": relpath,
+        "source_path": str(source_path),
+        "items": [
+            {"id": "delete_image", "label": "Delete image", "enabled": True},
+            {"id": "set_thumbnail", "label": "Set as checkpoint thumbnail", "enabled": True},
+        ],
+    })
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/delete_image")
+async def image_dir_preview_delete_image(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if _preview_item_deleted_for_state(state, index):
+        return web.json_response({
+            "ok": True,
+            "deleted": True,
+            "exists": False,
+            "message": "Preview image already deleted.",
+            "deleted_indices": _preview_deleted_indices(state),
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    if not _preview_item_exists_for_state(state, source_path):
+        return web.json_response({
+            "ok": True,
+            "deleted": False,
+            "exists": False,
+            "message": "Preview image not found.",
+            "deleted_indices": _preview_deleted_indices(state),
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    try:
+        _delete_preview_source_image(state, source_path)
+        deleted_indices = _mark_preview_item_deleted(tab_id, node_id, index)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except FileNotFoundError:
+        return web.json_response({"ok": True, "deleted": False, "exists": False, "message": "Preview image not found.", "deleted_indices": _preview_deleted_indices(state), "ckpt_name_str": relpath, "source_path": str(source_path)})
+    except Exception:
+        logger.exception("[CheckpointHandpickerSuite] failed to delete preview image")
+        return web.json_response({"ok": False, "error": "Failed to delete preview image."}, status=500)
+    return web.json_response({
+        "ok": True,
+        "deleted": True,
+        "exists": False,
+        "message": "Preview image deleted.",
+        "deleted_indices": deleted_indices,
+        "ckpt_name_str": relpath,
+        "source_path": str(source_path),
+    })
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/image_dir_preview/set_thumbnail")
+async def image_dir_preview_set_thumbnail(request):
+    data = await request.json()
+    node_id = str(data.get("node_id", ""))
+    tab_id = _clean_tab_id(data.get("tab_id", ""))
+    state, index, source_path, relpath = _get_preview_state_item(tab_id, node_id, data.get("item_index"), data.get("preview_session_id"))
+    if not state or index is None or source_path is None or not relpath:
+        return web.json_response({"ok": False, "error": "Preview item not found."}, status=404)
+    if _preview_item_deleted_for_state(state, index) or not _preview_item_exists_for_state(state, source_path):
+        return web.json_response({
+            "ok": True,
+            "exists": False,
+            "message": "Image deleted",
+            "ckpt_name_str": relpath,
+            "source_path": str(source_path),
+        })
+    try:
+        payload = _set_checkpoint_thumbnail_from_preview_item(relpath, source_path)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except Exception:
+        logger.exception("[CheckpointHandpickerSuite] failed to set checkpoint thumbnail")
+        return web.json_response({"ok": False, "error": "Failed to set checkpoint thumbnail."}, status=500)
+    payload.update({
+        "ok": True,
+        "exists": True,
+        "message": "Checkpoint thumbnail updated.",
+    })
+    return web.json_response(payload)
 
 
 @routes.get(f"/{EXTENSION_PREFIX}/list_checkpoints")
@@ -2137,7 +2522,8 @@ async def review_sync_checkpoint(request):
                 True,
                 max_preview_images,
             )
-            _store_preview_state(tab_id, node_id, relpath, status, node_class="ImageDirPreview")
+            state_extra = {k: v for k, v in extra.items() if k not in ("ckpt_name_str", "status")}
+            _store_preview_state(tab_id, node_id, relpath, status, **state_extra)
             _send_preview(node_id, _image_dir_title(relpath), sheet, extra, tab_id=tab_id)
             preview_count += 1
         except Exception:
