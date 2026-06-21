@@ -1,5 +1,4 @@
-```python
-markdown_content = """# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.2.0)
+# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.2.0)
 
 # 🖥️ 使用方法（How to Use）
 
