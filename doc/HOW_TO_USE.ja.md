@@ -67,7 +67,29 @@ git clone [https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git](htt
 
 ## 💪 本格的な使い方（ヘビーユーザー向け・祭りの本番！）
 
-### ① 画像出力フォルダ参照 Checkpoint 評価モード ★超推奨★
+### ① ジョブ中 Checkpoint 評価モード
+
+### ── 複雑な多段生成の「スキマ時間」をハックし、その場で格付けせよ！
+
+> **⚠️ 注意：**
+> これは画像生成を多段に組んでいる、高度なワークフロー（KSamplerの後にFaceDetailerで顔・指を修正したり、Upscale処理を挟んでいるなど）を構築している玄人向けの機能じゃ。
+> 生成の途中で「Checkpointの仮評価」が行えるのじゃが、シンプルな1段生成ワークフローの場合はプレビュー後すぐに次のジョブへ遷移してしまうため、この項目は読み飛ばして構わんぞ！
+
+1. 前述の通り、`Checkpoint Name Cycler` と `Checkpoint List Selector` を配置する。
+2. **`Ephemeral Preview`** を配置し、ワークフローの中間に存在する `VAE Decode` などの画像出力を受け取れるように繋ぐ。
+3. **`Checkpoint Status Tagger`（右手）** を配置する。
+4. Taggerの `ckpt_name` 入力を、`Checkpoint Name Cycler` の `ckpt_name` 出力へ接続する。
+
+**🏆 執行結果：**
+ジョブの実行中、中間プレビュー画像を確認しながら、**「今まさにこの画像を吐き出しているCheckpoint」に対して、お気に入りや削除予約などのタグをその場でダイレクトに打てるようになる！**
+打たれたタグ（ステータス）は即座にSelectorへ通知され、Cycler側で「💛や👍が付いたモデルだけを狙い撃ちで巡回する」といった高度なフィルタリング巡回が可能になるのじゃ！
+
+<img width="1440" height="1150" alt="image" src="https://github.com/user-attachments/assets/90b43e08-e759-4b56-ad6f-0be0c64e4afd" />
+*(※なぜこんな巡回ワークフローが組めるのか、深淵の秘密は Cycler の個別ドキュメントを読むが良いぞ！)*
+
+---
+
+### ② 画像出力フォルダ参照 Checkpoint 評価モード ★超推奨★
 
 ### ── メインの生成ラインを走らせたまま、別タブの特等席で優雅に目視検分（棚卸し）せよ！
 
@@ -87,6 +109,8 @@ git clone [https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git](htt
 裏の生成ラインの邪魔をすることなく、そのモデルが出力した画像だけがマッハで逆探知され、コンタクトシートとしてキャンバスに展開される！
 
 画像を見ながら Tagger でステータスを刻めば、情報は一瞬でグローバル同期され、全タブのフィルタへ即時反映されるのじゃ！
+<img width="1348" height="923" alt="image" src="https://github.com/user-attachments/assets/82ad36fe-1b04-457f-863c-6ca17b70ed8b" />
+*(※なぜ生成を止めずにこんな芸当ができるのか、深淵の秘密は Selector の個別ドキュメントを読むが良いぞ！)*
 
 #### ✨ 【神機能】ImageDir Previewのクリックアクション！
 
@@ -97,7 +121,7 @@ git clone [https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git](htt
 
 ---
 
-### ② タブレットで寝転がりレビュー！【DirectLink モード】
+### ③ タブレットで寝転がりレビュー！【DirectLink モード】
 
 ### ── 外部ビューアで画像を楽しみながら、手元でポチポチ格付けせよ！
 
