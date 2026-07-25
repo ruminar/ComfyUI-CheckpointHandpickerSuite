@@ -1441,8 +1441,12 @@ def _find_image_dir_candidates(relpath: str, search_directory=None, limit: int =
                     mtime = 0.0
                 found.append((mtime, p))
                 if len(found) >= limit:
-                    # Keep scanning bounded. Sort latest first below.
-                    pass
+                    # Bound the scan as well as the returned candidate list.
+                    # The sort below selects the newest images from this bounded
+                    # candidate set.
+                    break
+            if len(found) >= limit:
+                break
     except Exception:
         logger.exception("ImageDirPreview scan failed: %s", root)
     found.sort(key=lambda item: item[0], reverse=True)
