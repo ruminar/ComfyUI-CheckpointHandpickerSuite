@@ -1,4 +1,4 @@
-# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.2.0)
+# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.2.1)
 
 # 🖥️ 使用方法（How to Use）
 
@@ -78,7 +78,7 @@ git clone [https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git](htt
 1. 前述の通り、`Checkpoint Name Cycler` と `Checkpoint List Selector` を配置する。
 2. **`Ephemeral Preview`** を配置し、ワークフローの中間に存在する `VAE Decode` などの画像出力を受け取れるように繋ぐ。
 3. **`Checkpoint Status Tagger`（右手）** を配置する。
-4. Taggerの `ckpt_name` 入力を、`Checkpoint Name Cycler` の `ckpt_name` 出力へ接続する。
+4. Taggerの `ckpt_name_str` 入力を、`Checkpoint Name Cycler` の `ckpt_name_str` 出力へ接続する。
 
 **🏆 執行結果：**
 ジョブの実行中、中間プレビュー画像を確認しながら、**「今まさにこの画像を吐き出しているCheckpoint」に対して、お気に入りや削除予約などのタグをその場でダイレクトに打てるようになる！**

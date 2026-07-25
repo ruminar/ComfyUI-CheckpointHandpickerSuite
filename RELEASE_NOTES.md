@@ -1,3 +1,39 @@
+# ComfyUI-CheckpointHandpickerSuite 0.2.1
+
+ComfyUI-CheckpointHandpickerSuite 0.2.1 is a maintenance release focused on ImageDir Preview performance and documentation.
+
+## Changes
+
+### Bounded ImageDir Preview search
+
+ImageDir Preview now stops collecting matching image candidates when the internal candidate limit (currently 3,000 matching images) is reached.
+
+Previously, the candidate list was truncated only after the directory walk had finished, so a large output directory could still consume unnecessary time and memory. The scan now stops at the limit and sorts the bounded candidate set by modification time before selecting preview images.
+
+### Japanese documentation improvements
+
+The Japanese usage guide now includes a job-time checkpoint evaluation workflow using Ephemeral Preview and Checkpoint Status Tagger.
+
+Formatting and navigation in the Japanese documentation have also been corrected.
+
+## Compatibility
+
+There are no public node or socket changes in 0.2.1.
+
+The intentional socket roles remain:
+
+* `ckpt_name` for checkpoint-loader-compatible connections
+* `ckpt_name_str` for Checkpoint Status Tagger and ImageDir Preview
+* `ckpt_name_safe` for filesystem-safe labels
+
+Existing 0.2.0 workflows should continue to work without reconnecting nodes.
+
+## Upgrade notes
+
+Update the custom node and restart ComfyUI.
+
+---
+
 # ComfyUI-CheckpointHandpickerSuite 0.2.0
 
 ComfyUI-CheckpointHandpickerSuite 0.2.0 is a major workflow upgrade for checkpoint review, tagging, thumbnail setup, and generated-image cleanup.

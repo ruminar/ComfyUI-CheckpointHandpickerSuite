@@ -1,4 +1,4 @@
-# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.2.0)
+# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.2.1)
 
 > 「**ディスク容量が節約できる保証はありません。なぜなら、あなたが空いた容量に歓喜して、明日さらに多くのCheckpointをダウンロードしてしまうからです。**」 
 
