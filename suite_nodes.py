@@ -54,7 +54,7 @@ except Exception:
 DELETE_SCRIPT_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite" / "delete_scripts"
 DELETE_QUEUE_PATH = DELETE_SCRIPT_DIR / "checkpoint_delete_queue.jsonl"
 DELETE_SCRIPT_PATH = DELETE_SCRIPT_DIR / "delete_reserved_checkpoints.py"
-TAG_EXPORT_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite"
+DEFAULT_TAG_TRANSFER_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite"
 TAG_TRANSFER_FORMAT_VERSION = 1
 TAG_EXPORT_FILE_RE = re.compile(r"^checkpoint_tags_(\d{8}_\d{6})(?:_(\d+))?\.json$")
 TAG_TRANSFER_DETAIL_LIMIT = 20
@@ -207,11 +207,28 @@ def _tag_export_filename_key(path: Path):
     return match.group(1), int(match.group(2) or 0)
 
 
-def _latest_tag_export_path() -> Path | None:
-    if not TAG_EXPORT_DIR.exists():
+def _resolve_tag_transfer_directory(raw_value, *, create_default: bool) -> Path:
+    value = str(raw_value or "").strip()
+    if not value:
+        path = DEFAULT_TAG_TRANSFER_DIR
+        if create_default:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("Tag Transfer Directory must be a full path.")
+    if not path.exists():
+        raise ValueError(f"Tag Transfer Directory does not exist.\n\n{path}")
+    if not path.is_dir():
+        raise ValueError(f"Tag Transfer Directory is not a directory.\n\n{path}")
+    return path
+
+
+def _latest_tag_export_path(directory: Path) -> Path | None:
+    if not directory.exists() or not directory.is_dir():
         return None
     candidates = []
-    for path in TAG_EXPORT_DIR.iterdir():
+    for path in directory.iterdir():
         if not path.is_file():
             continue
         key = _tag_export_filename_key(path)
@@ -220,18 +237,51 @@ def _latest_tag_export_path() -> Path | None:
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
-def _next_tag_export_path() -> Path:
-    TAG_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+def _tag_export_candidate_path(directory: Path, stamp: str, suffix: int) -> Path:
+    filename = f"checkpoint_tags_{stamp}.json" if suffix == 0 else f"checkpoint_tags_{stamp}_{suffix}.json"
+    return directory / filename
+
+
+def _write_tag_export(directory: Path, data: dict) -> Path:
+    if not directory.exists() or not directory.is_dir():
+        raise ValueError(f"Tag Transfer Directory does not exist.\n\n{directory}")
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    base = TAG_EXPORT_DIR / f"checkpoint_tags_{stamp}.json"
-    if not base.exists() and not base.with_suffix(base.suffix + ".tmp").exists():
-        return base
-    suffix = 2
+    suffix = 0
     while True:
-        candidate = TAG_EXPORT_DIR / f"checkpoint_tags_{stamp}_{suffix}.json"
-        if not candidate.exists() and not candidate.with_suffix(candidate.suffix + ".tmp").exists():
+        candidate = _tag_export_candidate_path(directory, stamp, suffix)
+        reservation = directory / f".{candidate.name}.lock"
+        if candidate.exists():
+            suffix = 2 if suffix == 0 else suffix + 1
+            continue
+        try:
+            reservation_handle = reservation.open("x", encoding="utf-8")
+        except FileExistsError:
+            suffix = 2 if suffix == 0 else suffix + 1
+            continue
+        temporary = directory / f".{candidate.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            reservation_handle.write(f"pid={os.getpid()}\ncreated_at={_now_iso()}\n")
+            reservation_handle.close()
+            if candidate.exists():
+                suffix = 2 if suffix == 0 else suffix + 1
+                continue
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, candidate)
             return candidate
-        suffix += 1
+        finally:
+            if not reservation_handle.closed:
+                reservation_handle.close()
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove temporary tag export file: %s", temporary)
+            try:
+                reservation.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove tag export reservation: %s", reservation)
 
 
 def _checkpoint_candidates_for_relpath(relpath: str) -> list[Path]:
@@ -974,6 +1024,9 @@ def _format_tag_export_message(path: Path, payload: dict, diagnostics: dict) -> 
         "",
         "File:",
         path.name,
+        "",
+        "Directory:",
+        str(path.parent),
     ]
     _append_limited_detail(lines, "Ambiguous", ambiguous, lambda item: [
         f"- {item.get('file_name', '(unknown)')}",
@@ -999,6 +1052,9 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         "",
         "Source:",
         source.name,
+        "",
+        "Directory:",
+        str(source.parent),
         "",
         f"Imported:  {len(imported)}",
         f"Unchanged: {len(unchanged)}",
@@ -2439,14 +2495,18 @@ class CheckpointStatusTagger:
 class CheckpointTagExportImport:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {
+                "tag_transfer_directory": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
 
     RETURN_TYPES = ()
     FUNCTION = "noop"
     CATEGORY = "checkpoint/handpicker"
     OUTPUT_NODE = False
 
-    def noop(self):
+    def noop(self, tag_transfer_directory=""):
         return ()
 
 
@@ -2719,7 +2779,7 @@ async def list_checkpoints(_request):
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/tag_transfer/export")
-async def tag_transfer_export(_request):
+async def tag_transfer_export(request):
     if not _TAG_TRANSFER_OPERATION_LOCK.acquire(blocking=False):
         return web.json_response({
             "ok": False,
@@ -2727,12 +2787,23 @@ async def tag_transfer_export(_request):
             "message": "Another tag Export / Import operation is already running.",
         }, status=409)
     try:
+        try:
+            request_data = await request.json()
+        except Exception:
+            request_data = {}
+        try:
+            directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=True)
+        except ValueError as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "message": f"Export failed.\n\n{exc}",
+            }, status=400)
         # Snapshot the evaluation DB at operation start. Later Tagger changes are
         # intentionally not included in this export.
         snapshot = _load_status_db()
         payload, diagnostics = await asyncio.to_thread(_build_tag_export, snapshot)
-        path = _next_tag_export_path()
-        await asyncio.to_thread(_safe_json_write, path, payload)
+        path = await asyncio.to_thread(_write_tag_export, directory, payload)
         message = _format_tag_export_message(path, payload, diagnostics)
         logger.info(
             "[CheckpointHandpickerSuite] Tag export completed: exported=%s ambiguous=%s failed=%s file=%s",
@@ -2745,6 +2816,7 @@ async def tag_transfer_export(_request):
             "ok": True,
             "message": message,
             "file_name": path.name,
+            "directory": str(directory),
             "exported": len(payload["evaluations"]),
             "ambiguous": len(diagnostics["ambiguous"]),
             "failed": len(diagnostics["failed"]),
@@ -2761,7 +2833,7 @@ async def tag_transfer_export(_request):
 
 
 @routes.post(f"/{EXTENSION_PREFIX}/tag_transfer/import")
-async def tag_transfer_import(_request):
+async def tag_transfer_import(request):
     if not _TAG_TRANSFER_OPERATION_LOCK.acquire(blocking=False):
         return web.json_response({
             "ok": False,
@@ -2769,12 +2841,25 @@ async def tag_transfer_import(_request):
             "message": "Another tag Export / Import operation is already running.",
         }, status=409)
     try:
-        source = _latest_tag_export_path()
+        try:
+            request_data = await request.json()
+        except Exception:
+            request_data = {}
+        try:
+            directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=False)
+        except ValueError as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "message": f"Import failed.\n\n{exc}",
+            }, status=400)
+        source = _latest_tag_export_path(directory)
         if source is None:
             return web.json_response({
                 "ok": False,
                 "error": "No tag export file was found.",
-                "message": "Import failed.\n\nNo tag export file was found.",
+                "directory": str(directory),
+                "message": f"Import failed.\n\nNo tag export file was found.\n\nDirectory:\n{directory}",
             }, status=404)
         try:
             prepared = await asyncio.to_thread(_prepare_tag_import, source)
@@ -2795,6 +2880,7 @@ async def tag_transfer_import(_request):
             "ok": True,
             "message": message,
             "file_name": source.name,
+            "directory": str(directory),
             "changes": [
                 {
                     "ckpt_name_str": record["relpath"],

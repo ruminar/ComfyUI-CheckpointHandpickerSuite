@@ -10,6 +10,7 @@ The new standalone `Checkpoint Tag Export / Import` management node backs up eva
 
 - Export and Import run directly from the node and do not use the ComfyUI queue.
 - Export files are written atomically under `output/CheckpointHandpickerSuite/`.
+- An optional `Tag Transfer Directory` field accepts an existing full local or network path, allowing several PCs to share exports without manual copies. A blank field uses the default output location.
 - Portable matching uses checkpoint file name and file size, not directories, drives, or timestamps.
 - Import fills only currently untagged checkpoints. Existing equal tags are unchanged, and different tags are reported as conflicts without being overwritten.
 - Missing and ambiguous checkpoints are skipped safely.
@@ -19,13 +20,15 @@ The new standalone `Checkpoint Tag Export / Import` management node backs up eva
 
 Import automatically selects the greatest timestamp string in a matching export filename. Timestamp validity and future dates are intentionally not checked, so renaming a file to a future timestamp can explicitly prioritize it. If the selected latest JSON is invalid, Import stops instead of falling back to an older export.
 
+Custom transfer directories are never created automatically and never fall back silently to the default. Export uses unique temporary files and a same-directory reservation so simultaneous writers sharing a directory do not publish partial JSON files or overwrite the same timestamped export.
+
 ## Compatibility
 
 Existing workflows, nodes, and socket types are unchanged. The export document format starts at `format_version: 1` and is versioned independently from the package.
 
 ## Upgrade notes
 
-Update the custom node and restart ComfyUI. Add `Checkpoint Tag Export / Import` anywhere on the canvas; it has no inputs or outputs and does not participate in workflow execution.
+Update the custom node and restart ComfyUI. Add `Checkpoint Tag Export / Import` anywhere on the canvas; it has no connectable sockets and does not participate in workflow execution.
 
 ---
 

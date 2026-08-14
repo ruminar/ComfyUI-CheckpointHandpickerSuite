@@ -2,6 +2,12 @@
 
 `Checkpoint Tag Export / Import` is a standalone management node for backing up and restoring HandpickerSuite checkpoint evaluations.
 
+## Tag Transfer Directory
+
+The directory field is saved with the workflow. Its empty value displays `Default: output/CheckpointHandpickerSuite/` as a placeholder and uses that default directory.
+
+A custom value must be an existing full path. Local absolute paths and UNC/network paths are supported. A missing custom directory is reported as an error: it is not created, and the operation does not fall back to the default. Export and Import always use the same selected directory and search only its top level.
+
 ## Export
 
 Click `Export` to create:
@@ -24,6 +30,8 @@ Only evaluated checkpoints are exported. Each portable record contains:
 Paths and checkpoint file timestamps are intentionally omitted. A missing checkpoint is reported as Failed and skipped. Duplicate `file_name + file_size` identities with different evaluations are reported as Ambiguous and omitted; equal evaluations are deduplicated.
 
 The JSON is fully written to a temporary file before it is renamed to its final name.
+
+Temporary files are unique, and a short-lived reservation prevents simultaneous exports from different PCs sharing the directory from choosing the same final filename.
 
 ## Import
 

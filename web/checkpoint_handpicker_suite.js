@@ -17,6 +17,8 @@ const SELECTOR_CLASS = "CheckpointListSelector";
 const CYCLER_CLASS = "CheckpointNameCycler";
 const TAGGER_CLASS = "CheckpointStatusTagger";
 const TAG_TRANSFER_CLASS = "CheckpointTagExportImport";
+const TAG_TRANSFER_DIRECTORY_WIDGET = "tag_transfer_directory";
+const TAG_TRANSFER_DIRECTORY_PLACEHOLDER = "Default: output/CheckpointHandpickerSuite/";
 const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
 const HPS_TAB_ID = (globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -2151,15 +2153,112 @@ function setupSelectorNode(nodeType) {
 }
 
 // ---------- Tag Export / Import ----------
+function tagTransferDirectoryValue(node) {
+  const inputValue = node?.__hpsTagTransferDirectoryUI?.input?.value;
+  if (inputValue !== undefined) return String(inputValue);
+  return String(getWidget(node, TAG_TRANSFER_DIRECTORY_WIDGET)?.value ?? "");
+}
+
+function hideTagTransferDirectorySavedWidget(widget) {
+  if (!widget) return;
+  widget.type = "hidden";
+  widget.hidden = true;
+  widget.disabled = true;
+  widget.serialize = true;
+  widget.options = { ...(widget.options || {}), hidden: true };
+  widget.computeSize = () => [0, -4];
+  widget.draw = () => {};
+  for (const element of [widget.element, widget.inputEl, widget.domWidget?.element, widget.options?.element]) {
+    if (!(element instanceof HTMLElement)) continue;
+    element.hidden = true;
+    element.setAttribute("aria-hidden", "true");
+    element.style.setProperty("display", "none", "important");
+  }
+}
+
+function buildTagTransferDirectoryUI(node) {
+  const savedWidget = getWidget(node, TAG_TRANSFER_DIRECTORY_WIDGET);
+  if (!savedWidget) return;
+  if (node.__hpsTagTransferDirectoryUI) {
+    node.__hpsTagTransferDirectoryUI.input.value = String(savedWidget.value ?? "");
+    return;
+  }
+  savedWidget.label = "Tag Transfer Directory (full path only / network paths OK)";
+  savedWidget.options = { ...(savedWidget.options || {}), placeholder: TAG_TRANSFER_DIRECTORY_PLACEHOLDER };
+  if (typeof node.addDOMWidget !== "function") return;
+
+  const root = document.createElement("div");
+  root.style.display = "flex";
+  root.style.flexDirection = "column";
+  root.style.gap = "4px";
+  root.style.width = "100%";
+  root.style.height = "58px";
+  root.style.boxSizing = "border-box";
+  root.style.padding = "2px 0";
+
+  const label = document.createElement("label");
+  label.textContent = "Tag Transfer Directory (full path only / network paths OK)";
+  label.style.fontSize = "11px";
+  label.style.color = "rgba(230,230,230,0.88)";
+  label.style.userSelect = "none";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.spellcheck = false;
+  input.value = String(savedWidget.value ?? "");
+  input.placeholder = TAG_TRANSFER_DIRECTORY_PLACEHOLDER;
+  input.style.width = "100%";
+  input.style.height = "30px";
+  input.style.boxSizing = "border-box";
+  input.style.padding = "5px 8px";
+  input.style.border = "1px solid rgba(200,220,245,0.42)";
+  input.style.borderRadius = "4px";
+  input.style.background = "rgba(20,20,20,0.72)";
+  input.style.color = "inherit";
+  input.style.fontFamily = "monospace";
+  input.style.fontSize = "11px";
+  root.append(label, input);
+
+  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup"]) {
+    input.addEventListener(eventName, (event) => event.stopPropagation());
+  }
+  input.addEventListener("input", () => {
+    savedWidget.value = input.value;
+    savedWidget.callback?.(input.value);
+    node.graph?.change?.();
+    app.graph?.setDirtyCanvas?.(true, true);
+  });
+  input.addEventListener("change", () => {
+    savedWidget.value = input.value;
+  });
+
+  try {
+    const domWidget = node.addDOMWidget("tag_transfer_directory_editor", "hps-tag-transfer-directory", root, {
+      serialize: false,
+      hideOnZoom: false,
+      getValue: () => input.value,
+      setValue: (value) => {
+        input.value = String(value ?? "");
+        savedWidget.value = input.value;
+      },
+    });
+    domWidget.computeSize = (width) => [width, 62];
+    node.__hpsTagTransferDirectoryUI = { root, label, input, domWidget };
+    hideTagTransferDirectorySavedWidget(savedWidget);
+  } catch (error) {
+    console.warn("[CheckpointHandpickerSuite] failed to create Tag Transfer Directory editor", error);
+  }
+}
+
 function tagTransferRects(node) {
   const margin = 8;
   const gap = 8;
   const buttonW = 118;
   const buttonH = 28;
   return {
-    exportButton: { x: margin, y: 8, w: buttonW, h: buttonH },
-    importButton: { x: margin + buttonW + gap, y: 8, w: buttonW, h: buttonH },
-    result: { x: margin, y: 48, w: Math.max(1, node.size[0] - margin * 2), h: Math.max(1, node.size[1] - 58) },
+    exportButton: { x: margin, y: 76, w: buttonW, h: buttonH },
+    importButton: { x: margin + buttonW + gap, y: 76, w: buttonW, h: buttonH },
+    result: { x: margin, y: 116, w: Math.max(1, node.size[0] - margin * 2), h: Math.max(1, node.size[1] - 126) },
   };
 }
 
@@ -2201,7 +2300,11 @@ async function runTagTransfer(node, operation) {
   node.__hpsTagTransferResult = operation === "export" ? "Exporting..." : "Importing...";
   app.graph?.setDirtyCanvas?.(true, true);
   try {
-    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tag_transfer/${operation}`, { method: "POST" });
+    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tag_transfer/${operation}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directory: tagTransferDirectoryValue(node) }),
+    });
     let result = null;
     try {
       result = await response.json();
@@ -2227,15 +2330,22 @@ async function runTagTransfer(node, operation) {
 }
 
 function setupTagTransferNode(nodeType) {
-  installMinSize(nodeType, 420, 250);
+  installMinSize(nodeType, 420, 320);
   installCursorCapture();
   const origCreated = nodeType.prototype.onNodeCreated;
   nodeType.prototype.onNodeCreated = function () {
     const result = origCreated ? origCreated.apply(this, arguments) : undefined;
-    ensureSize(this, 420, 250);
+    ensureSize(this, 420, 320);
+    buildTagTransferDirectoryUI(this);
     this.__hpsTagTransferBusy = false;
     this.__hpsTagTransferResult = "Ready.";
     this.__hpsTagTransferScroll = 0;
+    return result;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const result = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    setTimeout(() => buildTagTransferDirectoryUI(this), 0);
     return result;
   };
   const origDraw = nodeType.prototype.onDrawBackground;

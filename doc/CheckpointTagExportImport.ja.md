@@ -2,7 +2,13 @@
 
 `Checkpoint Tag Export / Import`は、HandpickerSuiteで蓄積したCheckpoint評価をバックアップ・復元するための独立した管理ノードです。
 
-入力・出力はなく、ComfyUI Queueにも接続しません。キャンバス上へ単独で配置して使用します。
+接続用の入力・出力ソケットはなく、ComfyUI Queueにも接続しません。キャンバス上へ単独で配置して使用します。
+
+## Tag Transfer Directory
+
+ディレクトリ入力欄はWorkflowへ保存されます。空欄では`Default: output/CheckpointHandpickerSuite/`が薄いplaceholderとして表示され、そのデフォルト位置を使用します。
+
+カスタム値には、すでに存在するフルパスを指定します。ローカルの絶対パスとUNC／ネットワークパスを使用できます。指定したディレクトリが存在しない場合はエラーとなり、自動作成もデフォルト位置へのfallbackも行いません。ExportとImportは常に同じ指定先を使用し、その直下だけを検索します。
 
 ## Export
 
@@ -26,6 +32,8 @@ Exportされるのは評価済みCheckpointだけです。各recordには次の�
 ディレクトリ、ドライブ、Checkpointファイルの日時は保存しません。Checkpoint本体が見つからない評価はFailedとしてスキップします。同じ`file_name + file_size`に異なる評価がある場合はAmbiguousとして出力せず、評価が同じ場合は1recordへ統合します。
 
 JSONは一時ファイルへ完全に書き込んだ後、正式なファイル名へ変更します。
+
+一時ファイル名は毎回一意で、同じ共有ディレクトリへ複数PCから同時にExportしても同じ最終ファイル名を上書きしないよう短時間の予約ファイルを使用します。
 
 ## Import
 

@@ -31,6 +31,7 @@ In many cases, you can add `Checkpoint Name Cycler` in front of your checkpoint 
 Add the standalone `Checkpoint Tag Export / Import` node anywhere on the canvas. It has no inputs or outputs and never uses the ComfyUI queue.
 
 - Click `Export` to write the currently evaluated tags to `output/CheckpointHandpickerSuite/`.
+- Leave `Tag Transfer Directory` blank to use that default. Enter an existing full local path or UNC/network path to share exports between PCs; custom directories are never created automatically.
 - Copy an exported JSON file into the same directory on another ComfyUI installation, then click `Import`.
 - Import matches checkpoints by file name and file size. Directories, drives, and file timestamps may differ.
 - Existing tags are never overwritten. Untagged matches are imported, equal tags are unchanged, and different tags are reported as conflicts.
