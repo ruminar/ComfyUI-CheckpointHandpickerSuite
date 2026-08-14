@@ -149,7 +149,11 @@ Taggerで `delete（🗑）` を押したモデルは、その場では物理削
 本Suiteは **GPL-3.0（ComfyUI本体の掟に従っておるぞ！）** のもとで世界に公開されておる。陰の叡智を、良識の範囲で自由に使い倒すがよい！
 
 ---
-予告画像
+### 0.3.0宣伝画像
+<img width="1491" height="1055" alt="HandpickerSuite_030_宣伝画像" src="https://github.com/user-attachments/assets/da7f3f93-bbe3-462a-91ab-1637a81cf7fd" />
+タグのExport/Import機能がつきました。/output/CheckpointHandpickerSuite/ にJSONファイルが作成されます。
+
+### 予告画像
 <img width="1448" height="1086" alt="統合版予告" src="https://github.com/user-attachments/assets/53f6c2c0-4a2a-4497-9f34-0d26adcf9340" />
 
 構成要素画像別バージョン
