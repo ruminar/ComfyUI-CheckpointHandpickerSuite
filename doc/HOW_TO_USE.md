@@ -26,6 +26,21 @@ The suite helps you:
 You do not need to rebuild your entire workflow around this suite.  
 In many cases, you can add `Checkpoint Name Cycler` in front of your checkpoint loader, then build the review UI in another browser tab.
 
+## Back up or migrate checkpoint tags
+
+Add the standalone `Checkpoint Tag Export / Import` node anywhere on the canvas. It has no inputs or outputs and never uses the ComfyUI queue.
+
+- Click `Export` to write the currently evaluated tags to `output/CheckpointHandpickerSuite/`.
+- Copy an exported JSON file into the same directory on another ComfyUI installation, then click `Import`.
+- Import matches checkpoints by file name and file size. Directories, drives, and file timestamps may differ.
+- Existing tags are never overwritten. Untagged matches are imported, equal tags are unchanged, and different tags are reported as conflicts.
+- Missing or ambiguous matches are skipped. Import never moves or deletes checkpoint files.
+- The HandpickerSuite UI refreshes automatically when Import finishes.
+
+Imported `delete` tags are logical tags only and do not create deletion reservations. To reserve one of those checkpoints for deletion later, toggle its `delete` tag OFF and ON in `Checkpoint Status Tagger`.
+
+Import chooses the export whose matching filename has the greatest timestamp string. It does not validate whether the timestamp is a real or future date. The chosen latest file must be valid; Import does not silently fall back to an older JSON file.
+
 ## Recommended image saving setup
 
 The review tools work best when generated images include checkpoint-aware names or folders.

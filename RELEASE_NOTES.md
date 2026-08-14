@@ -1,3 +1,34 @@
+# ComfyUI-CheckpointHandpickerSuite 0.3.0
+
+ComfyUI-CheckpointHandpickerSuite 0.3.0 adds portable backup and restore for checkpoint evaluations.
+
+## Highlights
+
+### Checkpoint Tag Export / Import
+
+The new standalone `Checkpoint Tag Export / Import` management node backs up evaluated checkpoint tags to JSON and merges them into another ComfyUI environment without moving checkpoint files.
+
+- Export and Import run directly from the node and do not use the ComfyUI queue.
+- Export files are written atomically under `output/CheckpointHandpickerSuite/`.
+- Portable matching uses checkpoint file name and file size, not directories, drives, or timestamps.
+- Import fills only currently untagged checkpoints. Existing equal tags are unchanged, and different tags are reported as conflicts without being overwritten.
+- Missing and ambiguous checkpoints are skipped safely.
+- Imported `delete` tags do not create deletion reservations or touch checkpoint files.
+- `Refresh All` clears stale `delete` tags when their checkpoint files no longer exist, even if the original deletion reservation is unavailable.
+- A successful Import immediately refreshes HandpickerSuite tag state in every open browser tab.
+
+Import automatically selects the greatest timestamp string in a matching export filename. Timestamp validity and future dates are intentionally not checked, so renaming a file to a future timestamp can explicitly prioritize it. If the selected latest JSON is invalid, Import stops instead of falling back to an older export.
+
+## Compatibility
+
+Existing workflows, nodes, and socket types are unchanged. The export document format starts at `format_version: 1` and is versioned independently from the package.
+
+## Upgrade notes
+
+Update the custom node and restart ComfyUI. Add `Checkpoint Tag Export / Import` anywhere on the canvas; it has no inputs or outputs and does not participate in workflow execution.
+
+---
+
 # ComfyUI-CheckpointHandpickerSuite 0.2.1
 
 ComfyUI-CheckpointHandpickerSuite 0.2.1 is a maintenance release focused on ImageDir Preview performance and documentation.

@@ -1,4 +1,4 @@
-# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.2.1)
+# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.3.0)
 
 > 「**ディスク容量が節約できる保証はありません。なぜなら、あなたが空いた容量に歓喜して、明日さらに多くのCheckpointをダウンロードしてしまうからです。**」 
 
@@ -54,6 +54,7 @@ v0.2.0の特大アップデートで、ついに「失敗画像の直接削除�
 「自動巡回ラインをどう組むか？」「生成を1秒も止めずに、別タブの特等席で優雅に目視検分（棚卸し）する禁断のマルチタブ運用の秘訣とは？」など、実戦に即した詳細なステップバイステップは、以下の魔導書を開くが良いぞ！
 
 * 🏹 **[詳細な使用方法・ライフハックはこちら：HOW_TO_USE.ja.md](HOW_TO_USE.ja.md)**
+* 📤 **[Checkpoint評価のExport / Import](CheckpointTagExportImport.ja.md)**
 
 ---
 
