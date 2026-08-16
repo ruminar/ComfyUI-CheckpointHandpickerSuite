@@ -2354,8 +2354,8 @@ function setupTagTransferNode(nodeType) {
     if (hpsNodeCollapsed(this)) return;
     const r = tagTransferRects(this);
     const enabled = !this.__hpsTagTransferBusy;
-    drawButton(ctx, r.exportButton, "Export", enabled);
-    drawButton(ctx, r.importButton, "Import", enabled);
+    drawButton(ctx, r.exportButton, "📤 Export", enabled);
+    drawButton(ctx, r.importButton, "📥 Import", enabled);
 
     ctx.save();
     ctx.fillStyle = "rgba(12,12,12,0.72)";
