@@ -37,6 +37,7 @@ PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview"
 CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler"
 TAGGER_EVENT = "ruminar.checkpoint_handpicker_suite.tagger"
 STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed"
+TAG_TRANSFER_EVENT = "ruminar.checkpoint_handpicker_suite.tag_transfer"
 
 STATUS_VALUES = ["god", "favorite", "nice", "keep", "delete", "none"]
 STATUS_ICON = {"god": "👑", "favorite": "💛", "nice": "👍", "keep": "✔", "delete": "🗑", "none": "—"}
@@ -53,6 +54,10 @@ except Exception:
 DELETE_SCRIPT_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite" / "delete_scripts"
 DELETE_QUEUE_PATH = DELETE_SCRIPT_DIR / "checkpoint_delete_queue.jsonl"
 DELETE_SCRIPT_PATH = DELETE_SCRIPT_DIR / "delete_reserved_checkpoints.py"
+DEFAULT_TAG_TRANSFER_DIR = OUTPUT_DIR / "CheckpointHandpickerSuite"
+TAG_TRANSFER_FORMAT_VERSION = 1
+TAG_EXPORT_FILE_RE = re.compile(r"^checkpoint_tags_(\d{8}_\d{6})(?:_(\d+))?\.json$")
+TAG_TRANSFER_DETAIL_LIMIT = 20
 
 JPEG_QUALITY = 80
 JPEG_OPTIMIZE = False
@@ -71,6 +76,8 @@ _TAGGER_STATES: dict[str, dict] = {}
 _PREVIEW_STATES: dict[str, dict] = {}
 _TAB_EXECUTION_STATES: dict[str, dict] = {}
 _EXECUTION_REVISION = 0
+_TAG_TRANSFER_REVISION = 0
+_TAG_TRANSFER_OPERATION_LOCK = threading.Lock()
 
 
 def _clean_tab_id(value) -> str:
@@ -191,6 +198,313 @@ def _set_status(relpath: str, status: str):
             "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         }
     _save_status_db(db)
+
+
+def _tag_export_filename_key(path: Path):
+    match = TAG_EXPORT_FILE_RE.fullmatch(path.name)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2) or 0)
+
+
+def _resolve_tag_transfer_directory(raw_value, *, create_default: bool) -> Path:
+    value = str(raw_value or "").strip()
+    if not value:
+        path = DEFAULT_TAG_TRANSFER_DIR
+        if create_default:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("Tag Transfer Directory must be a full path.")
+    if not path.exists():
+        raise ValueError(f"Tag Transfer Directory does not exist.\n\n{path}")
+    if not path.is_dir():
+        raise ValueError(f"Tag Transfer Directory is not a directory.\n\n{path}")
+    return path
+
+
+def _latest_tag_export_path(directory: Path) -> Path | None:
+    if not directory.exists() or not directory.is_dir():
+        return None
+    candidates = []
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        key = _tag_export_filename_key(path)
+        if key is not None:
+            candidates.append((key, path))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _tag_export_candidate_path(directory: Path, stamp: str, suffix: int) -> Path:
+    filename = f"checkpoint_tags_{stamp}.json" if suffix == 0 else f"checkpoint_tags_{stamp}_{suffix}.json"
+    return directory / filename
+
+
+def _write_tag_export(directory: Path, data: dict) -> Path:
+    if not directory.exists() or not directory.is_dir():
+        raise ValueError(f"Tag Transfer Directory does not exist.\n\n{directory}")
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    suffix = 0
+    while True:
+        candidate = _tag_export_candidate_path(directory, stamp, suffix)
+        reservation = directory / f".{candidate.name}.lock"
+        if candidate.exists():
+            suffix = 2 if suffix == 0 else suffix + 1
+            continue
+        try:
+            reservation_handle = reservation.open("x", encoding="utf-8")
+        except FileExistsError:
+            suffix = 2 if suffix == 0 else suffix + 1
+            continue
+        temporary = directory / f".{candidate.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            reservation_handle.write(f"pid={os.getpid()}\ncreated_at={_now_iso()}\n")
+            reservation_handle.close()
+            if candidate.exists():
+                suffix = 2 if suffix == 0 else suffix + 1
+                continue
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, candidate)
+            return candidate
+        finally:
+            if not reservation_handle.closed:
+                reservation_handle.close()
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove temporary tag export file: %s", temporary)
+            try:
+                reservation.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove tag export reservation: %s", reservation)
+
+
+def _checkpoint_candidates_for_relpath(relpath: str) -> list[Path]:
+    candidates = []
+    seen = set()
+    for root in _checkpoint_roots():
+        path = (root / relpath).resolve()
+        try:
+            path.relative_to(root)
+        except Exception:
+            continue
+        key = os.path.normcase(str(path))
+        if key in seen or not path.exists() or not path.is_file():
+            continue
+        seen.add(key)
+        candidates.append(path)
+    return candidates
+
+
+def _build_tag_export(status_db: dict) -> tuple[dict, dict]:
+    by_identity: dict[tuple[str, int], list[dict]] = {}
+    failed = []
+    ambiguous = []
+    raw_statuses = status_db.get("statuses", {})
+    statuses = raw_statuses if isinstance(raw_statuses, dict) else {}
+
+    for raw_relpath, raw_entry in sorted(statuses.items(), key=lambda item: str(item[0]).lower()):
+        relpath = _normalize_relpath(raw_relpath)
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        tag = entry.get("status", "none")
+        if tag not in STATUS_VALUES or tag == "none" or not _is_valid_checkpoint_relpath(relpath):
+            continue
+        candidates = _checkpoint_candidates_for_relpath(relpath)
+        if not candidates:
+            failed.append({"file_name": PurePosixPath(relpath).name, "reason": "Checkpoint file not found."})
+            continue
+        identities: dict[tuple[str, int], list[Path]] = {}
+        try:
+            for path in candidates:
+                identity = (path.name, path.stat().st_size)
+                identities.setdefault(identity, []).append(path)
+        except OSError as exc:
+            failed.append({"file_name": PurePosixPath(relpath).name, "reason": str(exc)})
+            continue
+        if len(identities) != 1:
+            ambiguous.append({
+                "file_name": PurePosixPath(relpath).name,
+                "reason": "One evaluation resolves to multiple file sizes.",
+            })
+            continue
+        identity = next(iter(identities))
+        by_identity.setdefault(identity, []).append({"tag": tag, "relpath": relpath})
+
+    evaluations = []
+    for identity, sources in sorted(by_identity.items(), key=lambda item: (item[0][0].lower(), item[0][1])):
+        tags = {source["tag"] for source in sources}
+        if len(tags) != 1:
+            ambiguous.append({
+                "file_name": identity[0],
+                "file_size": identity[1],
+                "reason": "Multiple evaluations exist for the same identity.",
+            })
+            continue
+        evaluations.append({
+            "file_name": identity[0],
+            "file_size": identity[1],
+            "tag": next(iter(tags)),
+        })
+
+    payload = {
+        "format_version": TAG_TRANSFER_FORMAT_VERSION,
+        "exported_at": _now_iso(),
+        "evaluations": evaluations,
+    }
+    return payload, {"failed": failed, "ambiguous": ambiguous}
+
+
+def _build_current_checkpoint_identity_index() -> dict[tuple[str, int], list[dict]]:
+    index: dict[tuple[str, int], list[dict]] = {}
+    seen = set()
+    extensions = {ALLOWED_CHECKPOINT_SUFFIX}
+    for root in _checkpoint_roots():
+        try:
+            if not root.exists() or not root.is_dir():
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                parent = Path(dirpath)
+                for filename in filenames:
+                    if Path(filename).suffix.lower() not in extensions:
+                        continue
+                    path = (parent / filename).resolve()
+                    try:
+                        relpath = path.relative_to(root).as_posix()
+                        size = path.stat().st_size
+                    except (OSError, ValueError):
+                        continue
+                    physical_key = os.path.normcase(str(path))
+                    candidate_key = (physical_key, relpath)
+                    if candidate_key in seen:
+                        continue
+                    seen.add(candidate_key)
+                    identity = (path.name, size)
+                    index.setdefault(identity, []).append({"relpath": _normalize_relpath(relpath), "path": str(path)})
+        except Exception:
+            logger.exception("Failed to build checkpoint identity index from: %s", root)
+    return index
+
+
+def _validate_tag_import_document(document) -> tuple[list[dict], list[dict], list[dict]]:
+    if not isinstance(document, dict):
+        raise ValueError("JSON root must be an object.")
+    version = document.get("format_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != TAG_TRANSFER_FORMAT_VERSION:
+        raise ValueError(f"Unsupported format_version: {version!r}.")
+    raw_records = document.get("evaluations")
+    if not isinstance(raw_records, list):
+        raise ValueError("evaluations must be an array.")
+
+    failed = []
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    valid_tags = {status for status in STATUS_VALUES if status != "none"}
+    for index, raw in enumerate(raw_records, start=1):
+        label = f"Record #{index}"
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError("record must be an object")
+            file_name = raw.get("file_name")
+            file_size = raw.get("file_size")
+            tag = raw.get("tag")
+            if not isinstance(file_name, str) or not file_name or "/" in file_name or "\\" in file_name:
+                raise ValueError("invalid file_name")
+            label = file_name
+            if not file_name.lower().endswith(ALLOWED_CHECKPOINT_SUFFIX):
+                raise ValueError("unsupported checkpoint extension")
+            if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 0:
+                raise ValueError("file_size must be a non-negative integer")
+            if not isinstance(tag, str) or tag not in valid_tags:
+                raise ValueError("invalid tag")
+            record = {"file_name": file_name, "file_size": file_size, "tag": tag}
+            grouped.setdefault((file_name, file_size), []).append(record)
+        except ValueError as exc:
+            failed.append({"file_name": label, "reason": str(exc)})
+
+    records = []
+    ambiguous = []
+    for identity, duplicates in grouped.items():
+        tags = {record["tag"] for record in duplicates}
+        if len(tags) != 1:
+            ambiguous.append({
+                "file_name": identity[0],
+                "file_size": identity[1],
+                "reason": "Multiple evaluations exist for the same identity.",
+            })
+            continue
+        records.append(duplicates[0])
+    return records, failed, ambiguous
+
+
+def _prepare_tag_import(path: Path) -> dict:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON: {exc.msg}.") from exc
+    records, failed, ambiguous = _validate_tag_import_document(document)
+    identity_index = _build_current_checkpoint_identity_index()
+    matches = []
+    missing = []
+    for record in records:
+        identity = (record["file_name"], record["file_size"])
+        candidates = identity_index.get(identity, [])
+        if not candidates:
+            missing.append({"file_name": record["file_name"], "file_size": record["file_size"]})
+            continue
+        if len(candidates) != 1:
+            ambiguous.append({
+                "file_name": record["file_name"],
+                "file_size": record["file_size"],
+                "reason": "Multiple checkpoints match this identity.",
+            })
+            continue
+        matches.append({**record, "relpath": candidates[0]["relpath"]})
+    return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed}
+
+
+def _commit_tag_import(prepared: dict) -> dict:
+    # This is deliberately one synchronous read/merge/write section. No await or
+    # worker hand-off may be inserted here: a Tagger request completed before this
+    # read must win by being observed as current state, while a later Tagger request
+    # naturally wins by writing after this commit.
+    db = _load_status_db()
+    statuses = db.setdefault("statuses", {})
+    imported = []
+    unchanged = []
+    conflicts = []
+    updated_at = _now_iso()
+    for record in prepared["matches"]:
+        relpath = record["relpath"]
+        raw_current = statuses.get(relpath)
+        current_entry = raw_current if isinstance(raw_current, dict) else {}
+        current = current_entry.get("status", "none")
+        if current not in STATUS_VALUES:
+            current = "none"
+        if current == "none":
+            statuses[relpath] = {
+                "status": record["tag"],
+                "updated_at": updated_at,
+                "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+            }
+            imported.append(record)
+        elif current == record["tag"]:
+            unchanged.append(record)
+        else:
+            conflicts.append({**record, "current": current, "import": record["tag"]})
+    if imported:
+        _save_status_db(db)
+    return {
+        "imported_records": imported,
+        "unchanged_records": unchanged,
+        "conflict_records": conflicts,
+        "missing_records": prepared["missing"],
+        "ambiguous_records": prepared["ambiguous"],
+        "failed_records": prepared["failed"],
+    }
 
 
 def _get_supported_checkpoint_extensions() -> set[str]:
@@ -627,6 +941,154 @@ def _send_event(name: str, payload: dict, client_id=None):
             server.send_sync(name, payload)
     except Exception:
         logger.exception("[CheckpointHandpickerSuite] failed to send event: %s", name)
+
+
+def _broadcast_event(name: str, payload: dict):
+    try:
+        PromptServer.instance.send_sync(name, payload)
+    except Exception:
+        logger.exception("[CheckpointHandpickerSuite] failed to broadcast event: %s", name)
+
+
+def _sync_tag_status_changes(statuses_by_relpath: dict[str, str]) -> int:
+    global _TAG_TRANSFER_REVISION
+    if not statuses_by_relpath:
+        return _TAG_TRANSFER_REVISION
+    changes = {
+        _normalize_relpath(relpath): {
+            "ckpt_name_str": _normalize_relpath(relpath),
+            "status": status,
+            "status_icon": STATUS_ICON[status],
+        }
+        for relpath, status in statuses_by_relpath.items()
+        if status in STATUS_VALUES
+    }
+    if not changes:
+        return _TAG_TRANSFER_REVISION
+    cycler_updates = []
+    with _STATE_LOCK:
+        _TAG_TRANSFER_REVISION += 1
+        revision = _TAG_TRANSFER_REVISION
+        for state in _TAGGER_STATES.values():
+            change = changes.get(_normalize_relpath(state.get("ckpt_name_str", "")))
+            if change:
+                state.update({"status": change["status"], "status_icon": change["status_icon"], "updated_at": _now_iso()})
+        for state in _PREVIEW_STATES.values():
+            change = changes.get(_normalize_relpath(state.get("ckpt_name_str", "")))
+            if change:
+                state.update({"status": change["status"], "status_icon": change["status_icon"], "updated_at": _now_iso()})
+        for state in _TAB_EXECUTION_STATES.values():
+            change = changes.get(_normalize_relpath(state.get("ckpt_name_str", "")))
+            if change:
+                state.update({"status": change["status"], "status_icon": change["status_icon"], "updated_at": _now_iso()})
+        for key, state in _CYCLER_STATES.items():
+            tab_id, node_id = _split_state_key(key)
+            if node_id and node_id != "__none__":
+                cycler_updates.append((tab_id, node_id, state))
+
+    _broadcast_event(TAG_TRANSFER_EVENT, {
+        "scope": "global",
+        "revision": revision,
+        "changes": list(changes.values()),
+    })
+    for tab_id, node_id, state in cycler_updates:
+        _send_cycler_state_update(node_id, state, tab_id=tab_id)
+    return revision
+
+
+def _sync_imported_tag_states(imported_records: list[dict]) -> int:
+    return _sync_tag_status_changes({record["relpath"]: record["tag"] for record in imported_records})
+
+
+def _append_limited_detail(lines: list[str], title: str, records: list[dict], formatter):
+    if not records:
+        return
+    lines.extend(["", f"{title}:", ""])
+    for record in records[:TAG_TRANSFER_DETAIL_LIMIT]:
+        lines.extend(formatter(record))
+    remaining = len(records) - TAG_TRANSFER_DETAIL_LIMIT
+    if remaining > 0:
+        lines.append(f"... and {remaining} more.")
+
+
+def _format_tag_export_message(path: Path, payload: dict, diagnostics: dict) -> str:
+    evaluations = payload["evaluations"]
+    failed = diagnostics["failed"]
+    ambiguous = diagnostics["ambiguous"]
+    lines = [
+        "Export completed.",
+        "",
+        f"Exported:  {len(evaluations)}",
+        f"Ambiguous: {len(ambiguous)}",
+        f"Failed:    {len(failed)}",
+        "",
+        "File:",
+        path.name,
+        "",
+        "Directory:",
+        str(path.parent),
+    ]
+    _append_limited_detail(lines, "Ambiguous", ambiguous, lambda item: [
+        f"- {item.get('file_name', '(unknown)')}",
+        *([f"  Size: {item['file_size']}"] if "file_size" in item else []),
+        f"  {item.get('reason', '')}",
+    ])
+    _append_limited_detail(lines, "Failed", failed, lambda item: [
+        f"- {item.get('file_name', '(unknown)')}",
+        f"  {item.get('reason', '')}",
+    ])
+    return "\n".join(lines)
+
+
+def _format_tag_import_message(source: Path, result: dict) -> str:
+    imported = result["imported_records"]
+    unchanged = result["unchanged_records"]
+    conflicts = result["conflict_records"]
+    missing = result["missing_records"]
+    ambiguous = result["ambiguous_records"]
+    failed = result["failed_records"]
+    lines = [
+        "Import completed.",
+        "",
+        "Source:",
+        source.name,
+        "",
+        "Directory:",
+        str(source.parent),
+        "",
+        f"Imported:  {len(imported)}",
+        f"Unchanged: {len(unchanged)}",
+        f"Conflicts: {len(conflicts)}",
+        f"Missing:   {len(missing)}",
+        f"Ambiguous: {len(ambiguous)}",
+        f"Failed:    {len(failed)}",
+        "",
+        "HandpickerSuite UI refreshed.",
+    ]
+    _append_limited_detail(lines, "Conflicts", conflicts, lambda item: [
+        item["file_name"],
+        f"Current: {item['current']}",
+        f"Import: {item['import']}",
+        "",
+    ])
+    _append_limited_detail(lines, "Missing", missing, lambda item: [f"- {item['file_name']}"])
+    _append_limited_detail(lines, "Ambiguous", ambiguous, lambda item: [
+        f"- {item.get('file_name', '(unknown)')}",
+        *([f"  Size: {item['file_size']}"] if "file_size" in item else []),
+        f"  {item.get('reason', '')}",
+    ])
+    _append_limited_detail(lines, "Failed", failed, lambda item: [
+        f"- {item.get('file_name', '(unknown)')}",
+        f"  {item.get('reason', '')}",
+    ])
+    if any(record.get("tag") == "delete" for record in imported):
+        lines.extend([
+            "",
+            "Note:",
+            "Imported delete tags did not create deletion reservations.",
+            "Toggle delete OFF and ON to create a deletion reservation.",
+        ])
+    return "\n".join(lines).rstrip()
 
 
 def _send_status_changed(relpath: str, tab_id: str = "", node_id=None):
@@ -1139,12 +1601,10 @@ def _write_delete_script():
     return script_path, plan_path, len(targets)
 
 
-def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> int:
+def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> dict:
     active = _active_delete_records()
-    if not active:
-        return 0
     current_names = {_normalize_relpath(value) for value in (checkpoint_values if checkpoint_values is not None else _get_fresh_checkpoint_values())}
-    pruned = 0
+    pruned_reservations = 0
     for relpath, rec in list(active.items()):
         relpath = _normalize_relpath(relpath)
         rid = rec.get("id")
@@ -1165,15 +1625,38 @@ def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None
             "reason": "missing_on_refresh",
             "cancelled_at": _now_iso(),
         })
-        if _get_status(relpath) == "delete":
-            _set_status(relpath, "none")
-        pruned += 1
-    if pruned:
+        pruned_reservations += 1
+
+    # A delete tag can outlive its reservation (for example after importing a
+    # logical delete tag, deleting the queue manually, or deleting the checkpoint
+    # in Explorer). On Refresh All, a delete tag whose exact checkpoint relpath no
+    # longer resolves to a physical file is stale and should not remain as a
+    # permanent Failed export record. Other missing statuses are intentionally kept.
+    db = _load_status_db()
+    statuses = db.get("statuses", {}) if isinstance(db.get("statuses"), dict) else {}
+    cleared_relpaths = []
+    for raw_relpath, raw_entry in list(statuses.items()):
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        if entry.get("status") != "delete":
+            continue
+        relpath = _normalize_relpath(raw_relpath)
+        if relpath in current_names or _checkpoint_candidates_for_relpath(relpath):
+            continue
+        statuses.pop(raw_relpath, None)
+        cleared_relpaths.append(relpath)
+    if cleared_relpaths:
+        _save_status_db(db)
+
+    if pruned_reservations:
         try:
             _write_delete_script()
         except Exception:
             logger.exception("Failed to rewrite delete script after pruning missing delete reservations")
-    return pruned
+    return {
+        "pruned_delete_records": pruned_reservations,
+        "cleared_missing_delete_statuses": len(cleared_relpaths),
+        "cleared_relpaths": cleared_relpaths,
+    }
 
 
 def _patch_backend_checkpoint_classes(checkpoint_values: list[str]) -> list[str]:
@@ -2009,6 +2492,24 @@ class CheckpointStatusTagger:
         return ()
 
 
+class CheckpointTagExportImport:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tag_transfer_directory": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "noop"
+    CATEGORY = "checkpoint/handpicker"
+    OUTPUT_NODE = False
+
+    def noop(self, tag_transfer_directory=""):
+        return ()
+
+
 class EphemeralPreview:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2277,10 +2778,150 @@ async def list_checkpoints(_request):
     })
 
 
+@routes.post(f"/{EXTENSION_PREFIX}/tag_transfer/export")
+async def tag_transfer_export(request):
+    if not _TAG_TRANSFER_OPERATION_LOCK.acquire(blocking=False):
+        return web.json_response({
+            "ok": False,
+            "error": "BUSY",
+            "message": "Another tag Export / Import operation is already running.",
+        }, status=409)
+    try:
+        try:
+            request_data = await request.json()
+        except Exception:
+            request_data = {}
+        try:
+            directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=True)
+        except ValueError as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "message": f"Export failed.\n\n{exc}",
+            }, status=400)
+        # Snapshot the evaluation DB at operation start. Later Tagger changes are
+        # intentionally not included in this export.
+        snapshot = _load_status_db()
+        payload, diagnostics = await asyncio.to_thread(_build_tag_export, snapshot)
+        path = await asyncio.to_thread(_write_tag_export, directory, payload)
+        message = _format_tag_export_message(path, payload, diagnostics)
+        logger.info(
+            "[CheckpointHandpickerSuite] Tag export completed: exported=%s ambiguous=%s failed=%s file=%s",
+            len(payload["evaluations"]),
+            len(diagnostics["ambiguous"]),
+            len(diagnostics["failed"]),
+            path,
+        )
+        return web.json_response({
+            "ok": True,
+            "message": message,
+            "file_name": path.name,
+            "directory": str(directory),
+            "exported": len(payload["evaluations"]),
+            "ambiguous": len(diagnostics["ambiguous"]),
+            "failed": len(diagnostics["failed"]),
+        })
+    except Exception as exc:
+        logger.exception("[CheckpointHandpickerSuite] Tag export failed")
+        return web.json_response({
+            "ok": False,
+            "error": "Export failed.",
+            "message": f"Export failed.\n\n{exc}",
+        }, status=500)
+    finally:
+        _TAG_TRANSFER_OPERATION_LOCK.release()
+
+
+@routes.post(f"/{EXTENSION_PREFIX}/tag_transfer/import")
+async def tag_transfer_import(request):
+    if not _TAG_TRANSFER_OPERATION_LOCK.acquire(blocking=False):
+        return web.json_response({
+            "ok": False,
+            "error": "BUSY",
+            "message": "Another tag Export / Import operation is already running.",
+        }, status=409)
+    try:
+        try:
+            request_data = await request.json()
+        except Exception:
+            request_data = {}
+        try:
+            directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=False)
+        except ValueError as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "message": f"Import failed.\n\n{exc}",
+            }, status=400)
+        source = _latest_tag_export_path(directory)
+        if source is None:
+            return web.json_response({
+                "ok": False,
+                "error": "No tag export file was found.",
+                "directory": str(directory),
+                "message": f"Import failed.\n\nNo tag export file was found.\n\nDirectory:\n{directory}",
+            }, status=404)
+        try:
+            prepared = await asyncio.to_thread(_prepare_tag_import, source)
+        except ValueError as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "file_name": source.name,
+                "message": f"Latest export:\n{source.name}\n\nERROR:\n{exc}\n\nImport cancelled.",
+            }, status=400)
+
+        # Read the latest DB and commit synchronously only after all slow work is
+        # complete, so Tagger changes made before this point are never overwritten.
+        result = _commit_tag_import(prepared)
+        revision = _sync_imported_tag_states(result["imported_records"])
+        message = _format_tag_import_message(source, result)
+        response = {
+            "ok": True,
+            "message": message,
+            "file_name": source.name,
+            "directory": str(directory),
+            "changes": [
+                {
+                    "ckpt_name_str": record["relpath"],
+                    "status": record["tag"],
+                    "status_icon": STATUS_ICON[record["tag"]],
+                }
+                for record in result["imported_records"]
+            ],
+            "imported": len(result["imported_records"]),
+            "unchanged": len(result["unchanged_records"]),
+            "conflicts": len(result["conflict_records"]),
+            "missing": len(result["missing_records"]),
+            "ambiguous": len(result["ambiguous_records"]),
+            "failed": len(result["failed_records"]),
+            "revision": revision,
+        }
+        logger.info(
+            "[CheckpointHandpickerSuite] Tag import completed: imported=%s unchanged=%s conflicts=%s missing=%s ambiguous=%s failed=%s file=%s",
+            response["imported"], response["unchanged"], response["conflicts"],
+            response["missing"], response["ambiguous"], response["failed"], source,
+        )
+        return web.json_response(response)
+    except Exception as exc:
+        logger.exception("[CheckpointHandpickerSuite] Tag import failed")
+        return web.json_response({
+            "ok": False,
+            "error": "Import failed.",
+            "message": f"Import failed.\n\n{exc}",
+        }, status=500)
+    finally:
+        _TAG_TRANSFER_OPERATION_LOCK.release()
+
+
 @routes.post(f"/{EXTENSION_PREFIX}/refresh_all")
 async def refresh_all(_request):
     checkpoint_values = _get_fresh_checkpoint_values()
-    pruned_delete_records = _prune_missing_delete_records_on_refresh(checkpoint_values)
+    delete_cleanup = _prune_missing_delete_records_on_refresh(checkpoint_values)
+    pruned_delete_records = delete_cleanup["pruned_delete_records"]
+    cleared_missing_delete_statuses = delete_cleanup["cleared_missing_delete_statuses"]
+    if delete_cleanup["cleared_relpaths"]:
+        _sync_tag_status_changes({relpath: "none" for relpath in delete_cleanup["cleared_relpaths"]})
     patched_classes = _patch_backend_checkpoint_classes(checkpoint_values)
     items = _checkpoint_items()
     summary = _delete_status_summary()
@@ -2290,6 +2931,8 @@ async def refresh_all(_request):
     logger.info("[CheckpointHandpickerSuite] Backend checkpoint classes patched: %s", patched_classes)
     if pruned_delete_records:
         logger.info("[CheckpointHandpickerSuite] Pruned missing delete reservation(s): %s", pruned_delete_records)
+    if cleared_missing_delete_statuses:
+        logger.info("[CheckpointHandpickerSuite] Cleared stale missing delete status(es): %s", cleared_missing_delete_statuses)
     _log_widget_refresh(updated)
     return web.json_response({
         "ok": True,
@@ -2299,6 +2942,7 @@ async def refresh_all(_request):
         "checkpoint_values": checkpoint_values,
         "patched_classes": patched_classes,
         "pruned_delete_records": pruned_delete_records,
+        "cleared_missing_delete_statuses": cleared_missing_delete_statuses,
     })
 
 
@@ -2548,6 +3192,7 @@ NODE_CLASS_MAPPINGS = {
     "CheckpointListSelector": CheckpointListSelector,
     "CheckpointNameCycler": CheckpointNameCycler,
     "CheckpointStatusTagger": CheckpointStatusTagger,
+    "CheckpointTagExportImport": CheckpointTagExportImport,
     "EphemeralPreview": EphemeralPreview,
     "ImageDirPreview": ImageDirPreview,
 }
@@ -2556,6 +3201,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CheckpointListSelector": "Checkpoint List Selector",
     "CheckpointNameCycler": "Checkpoint Name Cycler",
     "CheckpointStatusTagger": "Checkpoint Status Tagger",
+    "CheckpointTagExportImport": "Checkpoint Tag Export / Import",
     "EphemeralPreview": "Ephemeral Preview",
     "ImageDirPreview": "ImageDir Preview",
 }

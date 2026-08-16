@@ -11,10 +11,14 @@ const PREVIEW_EVENT = "ruminar.checkpoint_handpicker_suite.preview";
 const CYCLER_EVENT = "ruminar.checkpoint_handpicker_suite.cycler";
 const TAGGER_EVENT = "ruminar.checkpoint_handpicker_suite.tagger";
 const STATUS_CHANGED_EVENT = "ruminar.checkpoint_handpicker_suite.status_changed";
+const TAG_TRANSFER_EVENT = "ruminar.checkpoint_handpicker_suite.tag_transfer";
 
 const SELECTOR_CLASS = "CheckpointListSelector";
 const CYCLER_CLASS = "CheckpointNameCycler";
 const TAGGER_CLASS = "CheckpointStatusTagger";
+const TAG_TRANSFER_CLASS = "CheckpointTagExportImport";
+const TAG_TRANSFER_DIRECTORY_WIDGET = "tag_transfer_directory";
+const TAG_TRANSFER_DIRECTORY_PLACEHOLDER = "Default: output/CheckpointHandpickerSuite/";
 const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
 const HPS_TAB_ID = (globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -719,6 +723,7 @@ function installCursorCapture() {
       let cursor = "";
       if (node.type === SELECTOR_CLASS || node.comfyClass === SELECTOR_CLASS) cursor = selectorCursorAt(node, graphEventToLocal(node, event));
       else if (node.type === TAGGER_CLASS || node.comfyClass === TAGGER_CLASS) cursor = taggerCursorAt(node, graphEventToLocal(node, event));
+      else if (node.type === TAG_TRANSFER_CLASS || node.comfyClass === TAG_TRANSFER_CLASS) cursor = tagTransferCursorAt(node, graphEventToLocal(node, event));
       else if (node.type === CYCLER_CLASS || node.comfyClass === CYCLER_CLASS) cursor = cyclerCursorAt(node, graphEventToLocal(node, event));
       if (cursor) {
         setCanvasCursor(cursor);
@@ -2147,6 +2152,274 @@ function setupSelectorNode(nodeType) {
   };
 }
 
+// ---------- Tag Export / Import ----------
+function tagTransferDirectoryValue(node) {
+  const inputValue = node?.__hpsTagTransferDirectoryUI?.input?.value;
+  if (inputValue !== undefined) return String(inputValue);
+  return String(getWidget(node, TAG_TRANSFER_DIRECTORY_WIDGET)?.value ?? "");
+}
+
+function hideTagTransferDirectorySavedWidget(widget) {
+  if (!widget) return;
+  widget.type = "hidden";
+  widget.hidden = true;
+  widget.disabled = true;
+  widget.serialize = true;
+  widget.options = { ...(widget.options || {}), hidden: true };
+  widget.computeSize = () => [0, -4];
+  widget.draw = () => {};
+  for (const element of [widget.element, widget.inputEl, widget.domWidget?.element, widget.options?.element]) {
+    if (!(element instanceof HTMLElement)) continue;
+    element.hidden = true;
+    element.setAttribute("aria-hidden", "true");
+    element.style.setProperty("display", "none", "important");
+  }
+}
+
+function buildTagTransferDirectoryUI(node) {
+  const savedWidget = getWidget(node, TAG_TRANSFER_DIRECTORY_WIDGET);
+  if (!savedWidget) return;
+  if (node.__hpsTagTransferDirectoryUI) {
+    node.__hpsTagTransferDirectoryUI.input.value = String(savedWidget.value ?? "");
+    return;
+  }
+  savedWidget.label = "Tag Transfer Directory (full path only / network paths OK)";
+  savedWidget.options = { ...(savedWidget.options || {}), placeholder: TAG_TRANSFER_DIRECTORY_PLACEHOLDER };
+  if (typeof node.addDOMWidget !== "function") return;
+
+  const root = document.createElement("div");
+  root.style.display = "flex";
+  root.style.flexDirection = "column";
+  root.style.gap = "4px";
+  root.style.width = "100%";
+  root.style.height = "58px";
+  root.style.boxSizing = "border-box";
+  root.style.padding = "2px 0";
+
+  const label = document.createElement("label");
+  label.textContent = "Tag Transfer Directory (full path only / network paths OK)";
+  label.style.fontSize = "11px";
+  label.style.color = "rgba(230,230,230,0.88)";
+  label.style.userSelect = "none";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.spellcheck = false;
+  input.value = String(savedWidget.value ?? "");
+  input.placeholder = TAG_TRANSFER_DIRECTORY_PLACEHOLDER;
+  input.style.width = "100%";
+  input.style.height = "30px";
+  input.style.boxSizing = "border-box";
+  input.style.padding = "5px 8px";
+  input.style.border = "1px solid rgba(200,220,245,0.42)";
+  input.style.borderRadius = "4px";
+  input.style.background = "rgba(20,20,20,0.72)";
+  input.style.color = "inherit";
+  input.style.fontFamily = "monospace";
+  input.style.fontSize = "11px";
+  root.append(label, input);
+
+  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup"]) {
+    input.addEventListener(eventName, (event) => event.stopPropagation());
+  }
+  input.addEventListener("input", () => {
+    savedWidget.value = input.value;
+    savedWidget.callback?.(input.value);
+    node.graph?.change?.();
+    app.graph?.setDirtyCanvas?.(true, true);
+  });
+  input.addEventListener("change", () => {
+    savedWidget.value = input.value;
+  });
+
+  try {
+    const domWidget = node.addDOMWidget("tag_transfer_directory_editor", "hps-tag-transfer-directory", root, {
+      serialize: false,
+      hideOnZoom: false,
+      getValue: () => input.value,
+      setValue: (value) => {
+        input.value = String(value ?? "");
+        savedWidget.value = input.value;
+      },
+    });
+    domWidget.computeSize = (width) => [width, 62];
+    node.__hpsTagTransferDirectoryUI = { root, label, input, domWidget };
+    hideTagTransferDirectorySavedWidget(savedWidget);
+  } catch (error) {
+    console.warn("[CheckpointHandpickerSuite] failed to create Tag Transfer Directory editor", error);
+  }
+}
+
+function tagTransferRects(node) {
+  const margin = 8;
+  const gap = 8;
+  const buttonW = 118;
+  const buttonH = 28;
+  return {
+    exportButton: { x: margin, y: 76, w: buttonW, h: buttonH },
+    importButton: { x: margin + buttonW + gap, y: 76, w: buttonW, h: buttonH },
+    result: { x: margin, y: 116, w: Math.max(1, node.size[0] - margin * 2), h: Math.max(1, node.size[1] - 126) },
+  };
+}
+
+function wrapTagTransferText(ctx, text, maxWidth) {
+  const lines = [];
+  for (const rawLine of String(text || "").split("\n")) {
+    if (!rawLine) {
+      lines.push("");
+      continue;
+    }
+    let current = "";
+    for (const char of rawLine) {
+      const candidate = current + char;
+      if (current && ctx.measureText(candidate).width > maxWidth) {
+        lines.push(current);
+        current = char;
+      } else {
+        current = candidate;
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
+function tagTransferCursorAt(node, local) {
+  if (!local) return "";
+  const r = tagTransferRects(node);
+  if (hit(local, r.exportButton) || hit(local, r.importButton)) {
+    return node.__hpsTagTransferBusy ? "not-allowed" : "pointer";
+  }
+  return "";
+}
+
+async function runTagTransfer(node, operation) {
+  if (!node || node.__hpsTagTransferBusy) return;
+  node.__hpsTagTransferBusy = true;
+  node.__hpsTagTransferScroll = 0;
+  node.__hpsTagTransferResult = operation === "export" ? "Exporting..." : "Importing...";
+  app.graph?.setDirtyCanvas?.(true, true);
+  try {
+    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tag_transfer/${operation}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directory: tagTransferDirectoryValue(node) }),
+    });
+    let result = null;
+    try {
+      result = await response.json();
+    } catch {
+      result = null;
+    }
+    if (operation === "import" && result?.ok && Array.isArray(result.changes)) {
+      applyTagTransferChanges({ scope: "global", changes: result.changes });
+    }
+    if (result?.message) {
+      node.__hpsTagTransferResult = result.message;
+    } else if (result?.error) {
+      node.__hpsTagTransferResult = `${operation === "export" ? "Export" : "Import"} failed.\n\n${result.error}`;
+    } else {
+      node.__hpsTagTransferResult = `${operation === "export" ? "Export" : "Import"} failed.\n\nHTTP ${response.status}`;
+    }
+  } catch (error) {
+    node.__hpsTagTransferResult = `${operation === "export" ? "Export" : "Import"} failed.\n\n${error}`;
+  } finally {
+    node.__hpsTagTransferBusy = false;
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+}
+
+function setupTagTransferNode(nodeType) {
+  installMinSize(nodeType, 420, 320);
+  installCursorCapture();
+  const origCreated = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function () {
+    const result = origCreated ? origCreated.apply(this, arguments) : undefined;
+    ensureSize(this, 420, 320);
+    buildTagTransferDirectoryUI(this);
+    this.__hpsTagTransferBusy = false;
+    this.__hpsTagTransferResult = "Ready.";
+    this.__hpsTagTransferScroll = 0;
+    return result;
+  };
+  const origConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const result = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    setTimeout(() => buildTagTransferDirectoryUI(this), 0);
+    return result;
+  };
+  const origDraw = nodeType.prototype.onDrawBackground;
+  nodeType.prototype.onDrawBackground = function (ctx) {
+    if (origDraw) origDraw.apply(this, arguments);
+    if (hpsNodeCollapsed(this)) return;
+    const r = tagTransferRects(this);
+    const enabled = !this.__hpsTagTransferBusy;
+    drawButton(ctx, r.exportButton, "📤 Export", enabled);
+    drawButton(ctx, r.importButton, "📥 Import", enabled);
+
+    ctx.save();
+    ctx.fillStyle = "rgba(12,12,12,0.72)";
+    ctx.strokeStyle = "rgba(210,210,210,0.28)";
+    ctx.lineWidth = 1;
+    drawRounded(ctx, r.result.x, r.result.y, r.result.w, r.result.h, 5);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.rect(r.result.x + 1, r.result.y + 1, r.result.w - 2, r.result.h - 2);
+    ctx.clip();
+    ctx.fillStyle = "#ddd";
+    ctx.font = "12px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const lineHeight = 16;
+    const lines = wrapTagTransferText(ctx, this.__hpsTagTransferResult || "Ready.", r.result.w - 18);
+    const visibleLines = Math.max(1, Math.floor((r.result.h - 12) / lineHeight));
+    const maxScroll = Math.max(0, lines.length - visibleLines);
+    this.__hpsTagTransferMaxScroll = maxScroll;
+    this.__hpsTagTransferScroll = Math.max(0, Math.min(maxScroll, this.__hpsTagTransferScroll || 0));
+    const start = this.__hpsTagTransferScroll;
+    lines.slice(start, start + visibleLines).forEach((line, index) => {
+      ctx.fillText(line, r.result.x + 7, r.result.y + 7 + index * lineHeight, r.result.w - 18);
+    });
+    if (maxScroll > 0) {
+      const trackH = r.result.h - 12;
+      const thumbH = Math.max(18, trackH * (visibleLines / lines.length));
+      const thumbY = r.result.y + 6 + (trackH - thumbH) * (start / maxScroll);
+      ctx.fillStyle = "rgba(220,220,220,0.35)";
+      ctx.fillRect(r.result.x + r.result.w - 7, thumbY, 3, thumbH);
+    }
+    ctx.restore();
+  };
+  const origMouseDown = nodeType.prototype.onMouseDown;
+  nodeType.prototype.onMouseDown = function (event, pos) {
+    if (hpsNodeCollapsed(this)) return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+    const r = tagTransferRects(this);
+    if (hitAny(this, pos, r.exportButton)) {
+      if (!this.__hpsTagTransferBusy) runTagTransfer(this, "export");
+      return true;
+    }
+    if (hitAny(this, pos, r.importButton)) {
+      if (!this.__hpsTagTransferBusy) runTagTransfer(this, "import");
+      return true;
+    }
+    return origMouseDown ? origMouseDown.apply(this, arguments) : false;
+  };
+  const origMouseWheel = nodeType.prototype.onMouseWheel;
+  nodeType.prototype.onMouseWheel = function (event) {
+    if (hpsNodeCollapsed(this)) return origMouseWheel ? origMouseWheel.apply(this, arguments) : false;
+    const local = graphEventToLocal(this, event);
+    if (hit(local, tagTransferRects(this).result) && (this.__hpsTagTransferMaxScroll || 0) > 0) {
+      const direction = event.deltaY > 0 ? 3 : -3;
+      this.__hpsTagTransferScroll = Math.max(0, Math.min(this.__hpsTagTransferMaxScroll, (this.__hpsTagTransferScroll || 0) + direction));
+      app.graph?.setDirtyCanvas?.(true, true);
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      return true;
+    }
+    return origMouseWheel ? origMouseWheel.apply(this, arguments) : false;
+  };
+}
+
 // ---------- Tagger ----------
 function linkedCheckpointInputSource(node, inputName) {
   const index = node.inputs?.findIndex((input) => input.name === inputName) ?? -1;
@@ -2390,6 +2663,56 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
   app.graph.setDirtyCanvas(true, true);
 });
 
+function applyTagTransferChanges(detail) {
+  if (!isForThisTab(detail) || !Array.isArray(detail?.changes)) return;
+  const changes = new Map(detail.changes.map((change) => [change.ckpt_name_str, change]));
+  const execution = getExecutionState();
+  if (execution && changes.has(execution.ckpt_name_str)) {
+    const change = changes.get(execution.ckpt_name_str);
+    execution.status = change.status || "none";
+    execution.status_icon = change.status_icon || STATUS_ICON[execution.status] || "";
+  }
+  for (const node of app.graph?._nodes || []) {
+    if (isNodeClass(node, SELECTOR_CLASS)) {
+      for (const item of selectorItems(node)) {
+        const change = changes.get(item.ckpt_name_str);
+        if (change) item.status = change.status || "none";
+      }
+      const selected = selectorSelected(node);
+      if (selected && changes.has(selected)) {
+        node.title = selectorTitleText(node, selected);
+        if (selectorDirectLinkEnabled(node)) updateDirectLinkTaggers(node);
+      }
+    }
+    if (PREVIEW_CLASSES.has(node.type || node.comfyClass)) {
+      const change = changes.get(node.__hpsPreviewCkptName);
+      if (change) {
+        node.__hpsPreviewStatus = change.status || "none";
+        setPreviewTitleFromCheckpoint(node, change.ckpt_name_str, node.__hpsPreviewStatus);
+      }
+    }
+    if (isNodeClass(node, TAGGER_CLASS)) {
+      const path = currentTaggerPath(node);
+      const change = changes.get(path);
+      if (change) {
+        node.__hpsTaggerStatus = change.status || "none";
+        node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
+        patchCheckpointTitle(node, "Tagger", path, node.__hpsTaggerStatus);
+      }
+    }
+    if (isNodeClass(node, CYCLER_CLASS)) {
+      const change = changes.get(node.__hpsCyclerCkptName);
+      if (change) node.__hpsCyclerStatusValue = change.status || "none";
+    }
+  }
+  scheduleSelectorGlobalRefresh();
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+api.addEventListener(TAG_TRANSFER_EVENT, ({ detail }) => {
+  applyTagTransferChanges(detail);
+});
+
 // ---------- Cycler ----------
 function cyclerRects(node) {
   const filterY = 35;
@@ -2605,6 +2928,7 @@ app.registerExtension({
     if (PREVIEW_CLASSES.has(nodeData.name)) return setupPreviewNode(nodeType);
     if (nodeData.name === SELECTOR_CLASS) return setupSelectorNode(nodeType);
     if (nodeData.name === TAGGER_CLASS) return setupTaggerNode(nodeType);
+    if (nodeData.name === TAG_TRANSFER_CLASS) return setupTagTransferNode(nodeType);
     if (nodeData.name === CYCLER_CLASS) return setupCyclerNode(nodeType);
   },
 });

@@ -1,4 +1,4 @@
-# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.2.1)
+# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.3.0)
 
 # 🖥️ 使用方法（How to Use）
 

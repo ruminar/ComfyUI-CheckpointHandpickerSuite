@@ -32,6 +32,8 @@ Restart ComfyUI.
 ## Documentation
 
 - [How to use](doc/HOW_TO_USE.md)
+- [Checkpoint Tag Export / Import](doc/CheckpointTagExportImport.md)
+- [Checkpoint Tag Export / Import（日本語）](doc/CheckpointTagExportImport.ja.md)
 - [日本語ドキュメント](doc/README.ja.md)
 
 ## Nodes
@@ -39,6 +41,7 @@ Restart ComfyUI.
 - Checkpoint Name Cycler
 - Checkpoint List Selector
 - Checkpoint Status Tagger
+- Checkpoint Tag Export / Import
 - Ephemeral Preview
 - ImageDir Preview
 
