@@ -2136,7 +2136,7 @@ class CheckpointListSelector:
     RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "select"
-    CATEGORY = "checkpoint/handpicker"
+    CATEGORY = "HandpickerSuite"
 
     def select(self, checkpoint="", unique_id=None):
         rel = _normalize_relpath(checkpoint)
@@ -2168,7 +2168,7 @@ class CheckpointNameCycler:
     RETURN_TYPES = (_get_checkpoint_list() or [""], "STRING", "STRING")
     RETURN_NAMES = ("ckpt_name", "ckpt_name_str", "ckpt_name_safe")
     FUNCTION = "cycle"
-    CATEGORY = "checkpoint/handpicker"
+    CATEGORY = "HandpickerSuite"
 
     @classmethod
     def IS_CHANGED(cls, start_checkpoint, mode="increment", change_every=1, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
@@ -2467,7 +2467,7 @@ class CheckpointStatusTagger:
 
     RETURN_TYPES = ()
     FUNCTION = "tag"
-    CATEGORY = "checkpoint/handpicker"
+    CATEGORY = "HandpickerSuite"
     OUTPUT_NODE = True
 
     @classmethod
@@ -2503,7 +2503,7 @@ class CheckpointTagExportImport:
 
     RETURN_TYPES = ()
     FUNCTION = "noop"
-    CATEGORY = "checkpoint/handpicker"
+    CATEGORY = "HandpickerSuite"
     OUTPUT_NODE = False
 
     def noop(self, tag_transfer_directory=""):
@@ -2521,7 +2521,7 @@ class EphemeralPreview:
 
     RETURN_TYPES = ()
     FUNCTION = "preview"
-    CATEGORY = "checkpoint/handpicker/preview"
+    CATEGORY = "HandpickerSuite/Preview"
     OUTPUT_NODE = True
 
     @classmethod
@@ -2569,7 +2569,7 @@ class ImageDirPreview:
 
     RETURN_TYPES = ()
     FUNCTION = "preview"
-    CATEGORY = "checkpoint/handpicker/preview"
+    CATEGORY = "HandpickerSuite/Preview"
     OUTPUT_NODE = True
 
     @classmethod

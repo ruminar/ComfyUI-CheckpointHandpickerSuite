@@ -11,6 +11,21 @@
 | `EphemeralPreview` | Ephemeral Preview | `image` | なし |
 | `ImageDirPreview` | ImageDir Preview | `ckpt_name_str`, `search_directory`, `max_preview_images` | なし |
 
+## メニュー階層
+
+通常ノードは`HandpickerSuite`直下、Preview系だけは`HandpickerSuite/Preview`へ登録する。
+
+```text
+HandpickerSuite
+├─ Checkpoint List Selector
+├─ Checkpoint Name Cycler
+├─ Checkpoint Status Tagger
+├─ Checkpoint Tag Export / Import
+└─ Preview
+   ├─ Ephemeral Preview
+   └─ ImageDir Preview
+```
+
 ## Checkpoint名の3出力
 
 SelectorとCyclerは、同じ相対Checkpointパスを用途別に3形式で公開する。
