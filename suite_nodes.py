@@ -2230,7 +2230,15 @@ class CheckpointNameCycler:
         global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter)
         local_items = _valid_local_list(state.get("local_list", []))
         use_local_source = use_local_list and bool(local_items)
-        candidates = local_items if use_local_source else global_candidates
+        # fixed mode is a normal checkpoint selector and deliberately ignores
+        # status filters. Local List remains the only source allowed to override
+        # its selected start checkpoint.
+        if use_local_source:
+            candidates = local_items
+        elif mode == "fixed":
+            candidates = all_checkpoints
+        else:
+            candidates = global_candidates
         if not candidates:
             candidates = all_checkpoints
             fallback_all = True

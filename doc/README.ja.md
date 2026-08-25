@@ -1,4 +1,4 @@
-# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.3.0)
+# 🧬 ComfyUI-CheckpointHandpickerSuite (日本語版聖典 v0.3.1)
 
 > 「**ディスク容量が節約できる保証はありません。なぜなら、あなたが空いた容量に歓喜して、明日さらに多くのCheckpointをダウンロードしてしまうからです。**」 
 
@@ -61,6 +61,8 @@ v0.2.0の特大アップデートで、ついに「失敗画像の直接削除�
 ## 🗂 構成要素の説明（The Four Sisters）
 
 我がリポジトリを支える、シャドウガーデンの序列（4人の看板娘たちと5つの魔導具）を紹介しよう。それぞれが固有の役割を持ち、おぬしのComfyUI（肉体）と脳内で非同期にリンクしておるのじゃ！
+
+通常の4ノードは`HandpickerSuite`直下、Preview系2ノードは`HandpickerSuite / Preview`から追加できる。
 
 ### 1. 🤎 [Checkpoint Name Cycler（心臓）](CheckpointNameCycler.md)
 

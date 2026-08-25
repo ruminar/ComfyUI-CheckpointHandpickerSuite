@@ -17,4 +17,4 @@
 4. 公開ノード名、ソケット、保存済みWorkflowとの互換性に影響する変更はREADMEとRELEASE_NOTESにも記載する。
 5. `.spec`には仕様文書だけを置き、`suite_nodes.py`や`web/checkpoint_handpicker_suite.js`を複製しない。
 
-現在の対象バージョンは `0.3.0`。
+現在の対象バージョンは `0.3.1`。

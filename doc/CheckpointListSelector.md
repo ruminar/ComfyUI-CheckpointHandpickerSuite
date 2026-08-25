@@ -1,4 +1,4 @@
-# 💜 Checkpoint List Selector (頭脳 v0.2.0)
+# 💜 Checkpoint List Selector (頭脳 v0.3.1)
 
 `Checkpoint List Selector` は、リポジトリ内に存在するすべてのCheckpointを一手に統括し、状況に応じてその役割を **「3変化（サントランスフォーム）」** させる、我がシャドウガーデンの超絶進化した司令塔じゃ！
 
@@ -14,14 +14,18 @@ v0.2.0の特大アップデートにより、視覚的な格付け機能や、iP
 
 ### 📥 入力（Inputs）
 
-* **`checkpoint` (必須 / COMBO):**
+* **`checkpoint` (必須 / STRING・カスタム一覧UI):**
 管理・検分対象とするCheckpointをリストから選択する。
 * *※v0.2.0のデラックス強化により、マウスホイールでの爆速スクロール、上下の矢印ボタン、そしてスクロールバーのダイレクトドラッグ掴みまで、狂おしいほど快適なUI操作をフルサポートしておるぞ！*
 
 ### 📤 出力（Outputs）
 
+* **`ckpt_name` (COMBO互換):**
+Checkpoint Loaderへ接続するための相対Checkpointパス。
 * **`ckpt_name_str` (STRING):**
-現在選択されているCheckpointのファイルパス文字列。
+TaggerやImageDir Previewへ接続するための同じ相対Checkpointパス。
+* **`ckpt_name_safe` (STRING):**
+画像保存時のlabelなどに使える、ファイル名として安全化した文字列。
 * *※この出力をどこへ「繋ぐか・繋がないか」によって、この司令塔のアビリティが3つの姿へと動的に変身（トグル）する仕様じゃ！*
 
 ---

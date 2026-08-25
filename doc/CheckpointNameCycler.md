@@ -1,4 +1,4 @@
-# 🤎 Checkpoint Name Cycler (心臓 v0.2.0)
+# 🤎 Checkpoint Name Cycler (心臓 v0.3.1)
 
 `Checkpoint Name Cycler` は、本Suiteの「動力を司る心臓」じゃ。
 大量の生成ジョブをバックグラウンドで走らせながら、Checkpoint（.safetensors）を指定したルールに基づいて全自動で切り替え、KSamplerへインジェクション（注入）し続ける役割を担っておる。

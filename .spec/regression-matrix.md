@@ -4,25 +4,29 @@
 
 ```powershell
 $py = "C:\path\to\python.exe"
-& $py -B -c "import ast, pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('suite_nodes.py', '__init__.py')]"
+& $py -B -m unittest discover -s tests
+& $py -B -c "import ast, pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('suite_nodes.py', '__init__.py', 'tests/test_suite_nodes.py')]"
 node --check web/checkpoint_handpicker_suite.js
 git diff --check
 ```
 
-現時点では専用の自動テストsuiteを持たない。ロジック変更時はComfyUI依存部を分離して自動テストを追加し、この表へ対応を記載する。
+`tests/test_suite_nodes.py`はComfyUI依存をstubし、Cyclerの候補選択と公開ノード契約を単体で検証する。今後のロジック変更でも、可能な部分は同じように自動テストを追加する。
+
+GitHub Actionsでは`.github/workflows/regression-tests.yml`がunit test、Python構文、JavaScript構文を同様に検証する。
 
 ## 仕様と回帰確認の対応
 
 | 保護対象 | 主な確認 |
 |---|---|
-| 6ノードの登録と表示名 | ComfyUI再起動後に全ノードがカテゴリへ表示される |
-| 3出力の互換性 | Selector/CyclerからLoader、Tagger、ImageDirPreviewへ既存Workflowのまま接続できる |
+| 6ノードの登録と表示名 | `test_public_node_mappings_are_stable`とComfyUI再起動後のメニュー表示で確認する |
+| メニュー階層 | `test_node_menu_categories`で通常4ノードとPreview 2ノードのcategoryを固定する |
+| 3出力と終端ノードの互換性 | `test_documented_output_contracts`と既存Workflowの接続確認で保護する |
 | JS読み込み契約 | custom UIが表示され、hidden widgetが通常widgetとして露出しない |
 | Selector 3モード | 接続先ごとにPush、Sync、DirectLinkの正確なボタンへ切り替わる |
 | DirectLink安全性 | OFFではTaggerが追従せず、ON確認はページ内1回、ONはボタンだけactiveになる |
 | Cycler runtime state | 保存・再読込・タブ移動後もmode、change_every、filter、Local List設定を維持する |
-| 4つのCycler mode | fixed、increment、randomize、shuffle_onceが実行時の候補規則に従う |
-| Local List | 重複を保持し、1実行で1件消費し、Clear/ON/OFFでCurrent Jobを変えない |
+| 4つのCycler mode | `test_suite_nodes.py`でfixedのFilter無視、increment、randomize、shuffle_onceの候補規則を検証する |
+| Local List | `test_local_list_overrides_fixed_and_ignores_filter`に加え、重複・Clear/ON/OFFはComfyUI上で確認する |
 | status順序とdelete制約 | `👑 💛 👍 ✔ 🗑 —`を全UIで揃え、正評価から直接deleteへ変更できない |
 | 削除script安全性 | `[y/N]`を維持し、対象Checkpoint群以外の画像を削除候補にしない |
 | Refresh All cleanup | Explorer/scriptで消えたCheckpointの予約と`delete`評価を除き、正評価は保持する |
