@@ -1,3 +1,38 @@
+# ComfyUI-CheckpointHandpickerSuite 0.3.1
+
+ComfyUI-CheckpointHandpickerSuite 0.3.1 is a maintenance release for Cycler correctness, node-menu organization, and documentation accuracy.
+
+## Changes
+
+### Fixed mode now ignores status filters
+
+`Checkpoint Name Cycler` in `fixed` mode now always uses its selected `start_checkpoint`, regardless of the active status Filter. `Local List` remains the only intentional temporary override of fixed mode.
+
+This restores the documented normal-checkpoint-selector behavior and prevents an unrelated Filter from silently selecting another checkpoint.
+
+### Shallower node menu
+
+The four main nodes now appear directly under `HandpickerSuite`. `Ephemeral Preview` and `ImageDir Preview` appear under `HandpickerSuite / Preview`.
+
+Node registration names and sockets are unchanged, so existing workflows continue to load without reconnecting nodes.
+
+### Documentation and regression coverage
+
+- Corrected the documented outputs of `Checkpoint Status Tagger` and `Ephemeral Preview`; both are terminal nodes without output sockets.
+- Corrected the documented three-output interface of `Checkpoint List Selector`.
+- Added executable regression tests and GitHub Actions coverage for all four Cycler modes, the Local List override contract, public node registration, menu categories, and output contracts.
+- Added the current behavior specifications under `.spec/` to version control.
+
+## Compatibility
+
+Existing workflow node IDs, registration names, inputs, and outputs are unchanged. Only node-menu placement has changed.
+
+## Upgrade notes
+
+Update the custom node and restart ComfyUI. Existing workflow nodes do not need to be recreated.
+
+---
+
 # ComfyUI-CheckpointHandpickerSuite 0.3.0
 
 ComfyUI-CheckpointHandpickerSuite 0.3.0 adds portable backup and restore for checkpoint evaluations.

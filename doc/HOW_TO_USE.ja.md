@@ -1,4 +1,4 @@
-# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.3.0)
+# 📖 HOW_TO_USE.ja.md (大祭囃子・のじゃのじゃ確定版 v0.3.1)
 
 # 🖥️ 使用方法（How to Use）
 
@@ -13,11 +13,13 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone [https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git](https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git)
+git clone https://github.com/ruminar/ComfyUI-CheckpointHandpickerSuite.git
 
 ```
 
 クローンが完了したら、ComfyUIを再起動して祭りの準備を整えられよ！
+
+通常の4ノードはノードメニューの`HandpickerSuite`直下、`Ephemeral Preview`と`ImageDir Preview`は`HandpickerSuite / Preview`に表示されるぞ。
 
 ---
 

@@ -45,6 +45,8 @@ Restart ComfyUI.
 - Ephemeral Preview
 - ImageDir Preview
 
+The first four nodes are under `HandpickerSuite` in the node menu. Preview nodes are under `HandpickerSuite / Preview`.
+
 ## Basic review workflows
 
 ### 1. Batch-generation review
@@ -210,7 +212,7 @@ The generated script asks for confirmation before deleting files.
 
 ## Ephemeral Preview
 
-`Ephemeral Preview` shows all images from the incoming `IMAGE` batch. It does not drop batch items.
+`Ephemeral Preview` shows every image in the incoming `IMAGE` batch. It is a terminal preview node and has no output socket; branch the source `IMAGE` connection if the images must also continue to another node.
 
 When it receives images after a `Checkpoint Name Cycler` execution, it can display the checkpoint name from the tab-local execution state as:
 
