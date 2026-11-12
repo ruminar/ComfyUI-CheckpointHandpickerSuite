@@ -75,6 +75,28 @@ function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
 }
 
+function stopHpsWidgetEventPropagation(element) {
+  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup", "wheel"]) {
+    element.addEventListener(eventName, (event) => event.stopPropagation());
+  }
+}
+
+function addVueOnlyDomWidget(node, name, type, element, height) {
+  if (!node || typeof node.addDOMWidget !== "function" || node.widgets?.some((widget) => widget.name === name)) return null;
+  try {
+    const widget = node.addDOMWidget(name, type, element, {
+      serialize: false,
+      hideOnZoom: false,
+      surfaces: { canvas: "never", vueNode: "shown", panel: "shown" },
+    });
+    widget.computeSize = (width) => [width, typeof height === "function" ? height(width) : height];
+    return widget;
+  } catch (error) {
+    console.warn(`[CheckpointHandpickerSuite] failed to create Nodes 2.0 widget: ${name}`, error);
+    return null;
+  }
+}
+
 let lastCheckpointValues = null;
 
 function getNodeTypeName(node) {
@@ -1143,12 +1165,14 @@ function setupPreviewNode(nodeType) {
   nodeType.prototype.onNodeCreated = function () {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 340, 300);
+    buildVuePreviewUI(this);
     if (isNodeClass(this, "EphemeralPreview")) setTimeout(() => restoreNodeStateFromBackend(this, "EphemeralPreview"), 0);
     return r;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+    buildVuePreviewUI(this);
     if (isNodeClass(this, "EphemeralPreview")) setTimeout(() => restoreNodeStateFromBackend(this, "EphemeralPreview"), 0);
     return r;
   };
@@ -1255,6 +1279,49 @@ function setupPreviewNode(nodeType) {
   };
 }
 
+function syncVuePreviewUI(node, detail = null) {
+  const ui = node?.__hpsVuePreviewUI;
+  if (!ui) return;
+  const state = detail || node.__hpsPreviewState || {};
+  ui.caption.textContent = node.__hpsPreviewCaption || state.progress_message || state.message || "no preview";
+  if (state.image) {
+    ui.image.src = `data:image/${state.format || "jpeg"};base64,${state.image}`;
+    ui.image.hidden = false;
+  } else if (!state.progress) {
+    ui.image.removeAttribute("src");
+    ui.image.hidden = true;
+  }
+}
+function buildVuePreviewUI(node) {
+  if (node.__hpsVuePreviewUI) return;
+  const root = document.createElement("div");
+  root.style.display = "flex";
+  root.style.flexDirection = "column";
+  root.style.gap = "6px";
+  root.style.padding = "2px 0";
+  root.style.width = "100%";
+  root.style.height = "100%";
+  root.style.minWidth = "0";
+  const image = document.createElement("img");
+  image.style.display = "block";
+  image.style.width = "100%";
+  image.style.height = "100%";
+  image.style.minHeight = "0";
+  image.style.flex = "1 1 auto";
+  image.style.objectFit = "contain";
+  image.hidden = true;
+  const caption = document.createElement("small");
+  caption.style.order = "-1";
+  caption.style.whiteSpace = "pre-wrap";
+  caption.style.minHeight = "16px";
+  caption.style.color = "#FFD28A";
+  root.append(image, caption);
+  stopHpsWidgetEventPropagation(root);
+  if (!addVueOnlyDomWidget(node, "hps_preview", "hps-preview", root, () => Math.max(220, (node.size?.[1] || 300) - 74))) return;
+  node.__hpsVuePreviewUI = { root, image, caption };
+  syncVuePreviewUI(node);
+}
+
 api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   if (!isForThisTab(detail)) return;
   const node = app.graph?.getNodeById(Number(detail?.node));
@@ -1284,6 +1351,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   node.__hpsPreviewCaption = caption;
   if (!detail.image) {
     if (!detail.progress) node.__hpsPreview = null;
+    syncVuePreviewUI(node, detail);
     app.graph.setDirtyCanvas(true, true);
     return;
   }
@@ -1294,6 +1362,7 @@ api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
     app.graph.setDirtyCanvas(true, true);
   };
   img.src = `data:image/${detail.format};base64,${detail.image}`;
+  syncVuePreviewUI(node, detail);
 });
 
 // ---------- Selector ----------
@@ -1475,6 +1544,89 @@ function hideSelectorWidget(node) {
     w.type = "hidden";
     w.computeSize = () => [0, -4];
   }
+}
+function syncVueSelectorUI(node) {
+  const ui = node?.__hpsVueSelectorUI;
+  if (!ui) return;
+  const selected = selectorSelected(node);
+  ui.list.replaceChildren();
+  for (const item of selectorItems(node)) {
+    const row = document.createElement("button");
+    const value = item.ckpt_name_str || "";
+    row.type = "button";
+    row.textContent = `${STATUS_ICON[item.status || "none"] || ""} ${value}`.trim();
+    row.dataset.active = String(value === selected);
+    row.setAttribute("aria-pressed", String(value === selected));
+    row.style.display = "block";
+    row.style.width = "100%";
+    row.style.minHeight = "22px";
+    row.style.padding = "2px 7px";
+    row.style.textAlign = "left";
+    row.style.border = value === selected ? "1px solid rgba(176,216,255,0.9)" : "1px solid transparent";
+    row.style.borderRadius = "3px";
+    row.style.background = value === selected ? "rgba(78,121,177,0.82)" : "transparent";
+    row.addEventListener("click", () => {
+      setSelectorSelected(node, value);
+      syncVueSelectorUI(node);
+    });
+    ui.list.append(row);
+  }
+  ui.refresh.disabled = !!node.__hpsLoading;
+  ui.action.disabled = !!node.__hpsLoading || !selected;
+  ui.action.textContent = selectorActionLabel(node);
+  ui.status.textContent = node.__hpsStatus || "not loaded";
+}
+function buildVueSelectorUI(node) {
+  if (node.__hpsVueSelectorUI) return;
+  const root = document.createElement("div");
+  root.style.display = "grid";
+  root.style.gap = "6px";
+  root.style.padding = "2px 0";
+  root.style.width = "100%";
+  const list = document.createElement("div");
+  list.style.maxHeight = "360px";
+  list.style.overflowY = "auto";
+  list.style.border = "1px solid rgba(210,220,240,0.34)";
+  list.style.borderRadius = "4px";
+  list.style.padding = "2px";
+  list.style.background = "rgba(0,0,0,0.16)";
+  const buttons = document.createElement("div");
+  buttons.style.display = "flex";
+  buttons.style.gap = "6px";
+  const refresh = document.createElement("button");
+  refresh.textContent = "🔄 Refresh All";
+  const action = document.createElement("button");
+  const up = document.createElement("button");
+  up.type = "button";
+  up.textContent = "▲";
+  up.title = "Scroll up";
+  const down = document.createElement("button");
+  down.type = "button";
+  down.textContent = "▼";
+  down.title = "Scroll down";
+  const status = document.createElement("small");
+  status.style.whiteSpace = "pre-wrap";
+  buttons.append(refresh, action, up, down);
+  root.append(buttons, status, list);
+  stopHpsWidgetEventPropagation(root);
+  refresh.addEventListener("click", () => void refreshSelector(node, true).finally(() => syncVueSelectorUI(node)));
+  up.addEventListener("click", () => uiScrollByRows(node, -SELECTOR_VISIBLE_ROWS));
+  down.addEventListener("click", () => uiScrollByRows(node, SELECTOR_VISIBLE_ROWS));
+  action.addEventListener("click", () => {
+    const mode = selectorActionMode(node);
+    if (mode === "sync") void syncSelectedCheckpoint(node);
+    else if (mode === "directlink") toggleSelectorDirectLink(node);
+    else void pushSelectedToLocalList(node);
+    syncVueSelectorUI(node);
+  });
+  if (!addVueOnlyDomWidget(node, "hps_selector_controls", "hps-selector-controls", root, 430)) return;
+  node.__hpsVueSelectorUI = { root, list, refresh, action, up, down, status };
+  syncVueSelectorUI(node);
+}
+function uiScrollByRows(node, rows) {
+  const list = node?.__hpsVueSelectorUI?.list;
+  if (!list) return;
+  list.scrollBy({ top: rows * ROW_H, behavior: "smooth" });
 }
 function selectorRects(node) {
   const margin = 8;
@@ -1768,6 +1920,7 @@ async function refreshSelector(node, all = false) {
     node.__hpsStatus = String(e);
   } finally {
     node.__hpsLoading = false;
+    syncVueSelectorUI(node);
     app.graph.setDirtyCanvas(true, true);
   }
 }
@@ -1977,6 +2130,7 @@ function setupSelectorNode(nodeType) {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 520, 540);
     hideSelectorWidget(this);
+    buildVueSelectorUI(this);
     setTimeout(() => refreshSelector(this, false), 0);
     return r;
   };
@@ -1984,6 +2138,7 @@ function setupSelectorNode(nodeType) {
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     hideSelectorWidget(this);
+    buildVueSelectorUI(this);
     return r;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
@@ -2325,8 +2480,42 @@ async function runTagTransfer(node, operation) {
     node.__hpsTagTransferResult = `${operation === "export" ? "Export" : "Import"} failed.\n\n${error}`;
   } finally {
     node.__hpsTagTransferBusy = false;
+    syncVueTagTransferUI(node);
     app.graph?.setDirtyCanvas?.(true, true);
   }
+}
+
+function syncVueTagTransferUI(node) {
+  const ui = node?.__hpsVueTagTransferUI;
+  if (!ui) return;
+  const busy = !!node.__hpsTagTransferBusy;
+  ui.exportButton.disabled = busy;
+  ui.importButton.disabled = busy;
+  ui.result.textContent = node.__hpsTagTransferResult || "Ready.";
+}
+function buildVueTagTransferUI(node) {
+  if (node.__hpsVueTagTransferUI) return;
+  const root = document.createElement("div");
+  root.style.display = "grid";
+  root.style.gap = "6px";
+  root.style.padding = "2px 0";
+  const buttons = document.createElement("div");
+  buttons.style.display = "flex";
+  buttons.style.gap = "8px";
+  const exportButton = document.createElement("button");
+  exportButton.textContent = "📤 Export";
+  const importButton = document.createElement("button");
+  importButton.textContent = "📥 Import";
+  const result = document.createElement("small");
+  result.style.whiteSpace = "pre-wrap";
+  buttons.append(exportButton, importButton);
+  root.append(buttons, result);
+  stopHpsWidgetEventPropagation(root);
+  exportButton.addEventListener("click", () => void runTagTransfer(node, "export"));
+  importButton.addEventListener("click", () => void runTagTransfer(node, "import"));
+  if (!addVueOnlyDomWidget(node, "hps_tag_transfer_actions", "hps-tag-transfer-actions", root, 76)) return;
+  node.__hpsVueTagTransferUI = { root, exportButton, importButton, result };
+  syncVueTagTransferUI(node);
 }
 
 function setupTagTransferNode(nodeType) {
@@ -2337,6 +2526,7 @@ function setupTagTransferNode(nodeType) {
     const result = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 420, 320);
     buildTagTransferDirectoryUI(this);
+    buildVueTagTransferUI(this);
     this.__hpsTagTransferBusy = false;
     this.__hpsTagTransferResult = "Ready.";
     this.__hpsTagTransferScroll = 0;
@@ -2346,6 +2536,7 @@ function setupTagTransferNode(nodeType) {
   nodeType.prototype.onConfigure = function () {
     const result = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     setTimeout(() => buildTagTransferDirectoryUI(this), 0);
+    buildVueTagTransferUI(this);
     return result;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
@@ -2517,7 +2708,50 @@ async function setTaggerStatus(node, status) {
   } else {
     node.__hpsTaggerMessage = result.error || "Failed";
   }
+  syncVueTaggerUI(node);
   app.graph.setDirtyCanvas(true, true);
+}
+function syncVueTaggerUI(node) {
+  const ui = node?.__hpsVueTaggerUI;
+  if (!ui) return;
+  const path = currentTaggerPath(node);
+  const status = node.__hpsTaggerStatus || "none";
+  for (const [name, button] of Object.entries(ui.buttons)) {
+    const active = !!path && status === name;
+    button.disabled = !taggerButtonsEnabled(node, name);
+    button.dataset.active = String(active);
+    button.setAttribute("aria-pressed", String(active));
+    button.style.background = active ? "rgba(74,151,105,0.94)" : "";
+    button.style.borderColor = active ? "rgba(218,255,227,0.95)" : "";
+    button.style.boxShadow = active ? "0 0 0 1px rgba(28,90,48,0.7) inset" : "";
+  }
+  ui.message.textContent = path ? `${path}\n${node.__hpsTaggerMessage || taggerCurrentMessage(status)}` : taggerCurrentMessage("none");
+}
+function buildVueTaggerUI(node) {
+  if (node.__hpsVueTaggerUI) return;
+  const root = document.createElement("div");
+  root.style.display = "grid";
+  root.style.gap = "6px";
+  root.style.padding = "2px 0";
+  const buttonsRow = document.createElement("div");
+  buttonsRow.style.display = "flex";
+  buttonsRow.style.flexWrap = "wrap";
+  buttonsRow.style.gap = "5px";
+  const buttons = {};
+  for (const status of TAGGER_STATUS_ORDER) {
+    const button = document.createElement("button");
+    button.textContent = `${STATUS_ICON[status]} ${STATUS_LABEL[status]}`;
+    button.addEventListener("click", () => void setTaggerStatus(node, status));
+    buttons[status] = button;
+    buttonsRow.append(button);
+  }
+  const message = document.createElement("small");
+  message.style.whiteSpace = "pre-wrap";
+  root.append(buttonsRow, message);
+  stopHpsWidgetEventPropagation(root);
+  if (!addVueOnlyDomWidget(node, "hps_tagger_controls", "hps-tagger-controls", root, 92)) return;
+  node.__hpsVueTaggerUI = { root, buttons, message };
+  syncVueTaggerUI(node);
 }
 function taggerCursorAt(node, local) {
   if (!local) return "";
@@ -2545,6 +2779,7 @@ function setupTaggerNode(nodeType) {
     const r = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 450, 107);
     normalizeTaggerHeight(this);
+    buildVueTaggerUI(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -2552,6 +2787,7 @@ function setupTaggerNode(nodeType) {
   nodeType.prototype.onConfigure = function () {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     normalizeTaggerHeight(this);
+    buildVueTaggerUI(this);
     setTimeout(() => restoreNodeStateFromBackend(this, TAGGER_CLASS), 0);
     return r;
   };
@@ -2622,6 +2858,7 @@ api.addEventListener(TAGGER_EVENT, ({ detail }) => {
   node.__hpsTaggerStatus = detail.status;
   node.__hpsTaggerMessage = taggerCurrentMessage(detail.status || "none");
   if (detail.title) node.title = detail.title;
+  syncVueTaggerUI(node);
   app.graph.setDirtyCanvas(true, true);
 });
 
@@ -2824,6 +3061,74 @@ function cyclerCursorAt(node, local) {
   return "";
 }
 
+function syncVueCyclerUI(node) {
+  const ui = node?.__hpsVueCyclerUI;
+  if (!ui) return;
+  const active = cyclerActiveFilter(node);
+  ui.localList.textContent = node.__hpsUseLocalList === false ? "☐ Use Local List" : "☑ Use Local List";
+  for (const [status, button] of Object.entries(ui.filters)) {
+    const selected = status === "all" ? active.length === 0 : active.includes(status);
+    button.dataset.active = String(selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.style.background = selected ? "rgba(74,121,177,0.9)" : "";
+    button.style.borderColor = selected ? "rgba(206,230,255,0.95)" : "";
+  }
+  ui.status.textContent = node.__hpsCyclerStatus || "Current: (not executed yet)";
+}
+function buildVueCyclerUI(node) {
+  if (node.__hpsVueCyclerUI) return;
+  const root = document.createElement("div");
+  root.style.display = "grid";
+  root.style.gap = "6px";
+  root.style.padding = "2px 0";
+  const actions = document.createElement("div");
+  actions.style.display = "flex";
+  actions.style.flexWrap = "wrap";
+  actions.style.gap = "5px";
+  const localList = document.createElement("button");
+  const clear = document.createElement("button");
+  clear.textContent = "Clear Local List";
+  actions.append(localList, clear);
+  const filtersRow = document.createElement("div");
+  filtersRow.style.display = "flex";
+  filtersRow.style.flexWrap = "wrap";
+  filtersRow.style.gap = "5px";
+  const filters = {};
+  for (const status of ["all", ...CYCLER_FILTER_STATUSES]) {
+    const button = document.createElement("button");
+    button.textContent = status === "all" ? "all" : STATUS_ICON[status];
+    filters[status] = button;
+    filtersRow.append(button);
+    button.addEventListener("click", () => {
+      if (status === "all") node.__hpsFilterStatuses = [];
+      else {
+        const set = new Set(node.__hpsFilterStatuses || []);
+        if (set.has(status)) set.delete(status); else set.add(status);
+        node.__hpsFilterStatuses = CYCLER_FILTER_STATUSES.filter((entry) => set.has(entry));
+      }
+      bumpCyclerSettingsRevision(node);
+      syncCyclerSettingsWidgets(node);
+      void pushCyclerFilter(node).finally(() => syncVueCyclerUI(node));
+      syncVueCyclerUI(node);
+    });
+  }
+  const status = document.createElement("small");
+  status.style.whiteSpace = "pre-wrap";
+  root.append(actions, filtersRow, status);
+  stopHpsWidgetEventPropagation(root);
+  localList.addEventListener("click", () => {
+    node.__hpsUseLocalList = !node.__hpsUseLocalList;
+    bumpCyclerSettingsRevision(node);
+    syncCyclerSettingsWidgets(node);
+    void pushCyclerFlags(node).finally(() => syncVueCyclerUI(node));
+    syncVueCyclerUI(node);
+  });
+  clear.addEventListener("click", () => void clearLocalList(node).finally(() => syncVueCyclerUI(node)));
+  if (!addVueOnlyDomWidget(node, "hps_cycler_controls", "hps-cycler-controls", root, 126)) return;
+  node.__hpsVueCyclerUI = { root, localList, clear, filters, status };
+  syncVueCyclerUI(node);
+}
+
 function setupCyclerNode(nodeType) {
   installMinSize(nodeType, 560, 260);
   installTabIdSupport(nodeType);
@@ -2834,6 +3139,7 @@ function setupCyclerNode(nodeType) {
     ensureSize(this, 560, 260);
     restoreCyclerSettingsFromWidgets(this);
     installCyclerRuntimeControlHooks(this);
+    buildVueCyclerUI(this);
     setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
@@ -2842,6 +3148,7 @@ function setupCyclerNode(nodeType) {
     const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
     restoreCyclerSettingsFromWidgets(this);
     installCyclerRuntimeControlHooks(this);
+    buildVueCyclerUI(this);
     setTimeout(() => restoreNodeStateFromBackend(this, CYCLER_CLASS), 0);
     return r;
   };
@@ -2918,6 +3225,7 @@ api.addEventListener(CYCLER_EVENT, ({ detail }) => {
   const node = nodeFromEvent(detail, CYCLER_CLASS);
   if (!node) return;
   applyCyclerStatePayload(node, detail);
+  syncVueCyclerUI(node);
   app.graph.setDirtyCanvas(true, true);
 });
 
