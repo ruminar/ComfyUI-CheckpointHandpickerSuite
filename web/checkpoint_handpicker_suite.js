@@ -21,7 +21,79 @@ const TAG_TRANSFER_DIRECTORY_WIDGET = "tag_transfer_directory";
 const TAG_TRANSFER_DIRECTORY_PLACEHOLDER = "Default: output/CheckpointHandpickerSuite/";
 const PREVIEW_CLASSES = new Set(["EphemeralPreview", "ImageDirPreview"]);
 
-const HPS_TAB_ID = (globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+const HPS_TAB_STORAGE_KEY = `${EXT}.tab_id`;
+const HPS_TAB_ALIASES_STORAGE_KEY = `${EXT}.tab_id_aliases`;
+
+function createHpsTabId() {
+  return globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function loadHpsTabId() {
+  try {
+    const saved = sessionStorage.getItem(HPS_TAB_STORAGE_KEY);
+    if (saved && /^[0-9A-Za-z_.:-]{1,128}$/.test(saved)) return { value: saved, restored: true };
+    const created = createHpsTabId();
+    return { value: created, restored: false };
+  } catch {
+    return { value: createHpsTabId(), restored: false };
+  }
+}
+
+function persistHpsTabId() {
+  try { sessionStorage.setItem(HPS_TAB_STORAGE_KEY, HPS_TAB_ID); } catch {}
+}
+
+function loadHpsTabAliases() {
+  try {
+    const values = JSON.parse(sessionStorage.getItem(HPS_TAB_ALIASES_STORAGE_KEY) || "[]");
+    return Array.isArray(values)
+      ? values.filter((value) => /^[0-9A-Za-z_.:-]{1,128}$/.test(String(value || "")))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistHpsTabAliases() {
+  try {
+    const aliases = [...HPS_ACCEPTED_TAB_IDS].filter((value) => value !== HPS_TAB_ID).slice(-16);
+    sessionStorage.setItem(HPS_TAB_ALIASES_STORAGE_KEY, JSON.stringify(aliases));
+  } catch {}
+}
+
+// sessionStorage belongs to one browser tab and survives a page reload.
+// This keeps events from a prompt that continues running after reload
+// associated with that same tab, without making another browser tab share it.
+const hpsLoadedTabId = loadHpsTabId();
+let HPS_TAB_ID = hpsLoadedTabId.value;
+let hpsTabIdRestoredFromSession = hpsLoadedTabId.restored;
+const HPS_ACCEPTED_TAB_IDS = new Set([HPS_TAB_ID, ...loadHpsTabAliases()]);
+if (!hpsTabIdRestoredFromSession) persistHpsTabId();
+
+function adoptWorkflowTabId(value) {
+  if (hpsTabIdRestoredFromSession || !value || !/^[0-9A-Za-z_.:-]{1,128}$/.test(value)) return;
+  // On the first load after upgrading, prefer the ID that is already
+  // serialized in this workflow. Every prompt already in its queue carries
+  // that ID, so making it this tab's persistent ID preserves the whole queue.
+  HPS_ACCEPTED_TAB_IDS.delete(HPS_TAB_ID);
+  HPS_TAB_ID = value;
+  HPS_ACCEPTED_TAB_IDS.add(value);
+  hpsTabIdRestoredFromSession = true;
+  persistHpsTabId();
+  persistHpsTabAliases();
+}
+
+function rememberWorkflowTabId(node) {
+  const value = String(getWidget(node, "hps_tab_id")?.value ?? "").trim();
+  if (!value || !/^[0-9A-Za-z_.:-]{1,128}$/.test(value)) return;
+  adoptWorkflowTabId(value);
+  if (value === HPS_TAB_ID) return;
+  // A prompt queued before this script gained session persistence still
+  // carries the workflow's previous hidden ID. Accept only IDs present in
+  // this loaded workflow; never accept arbitrary events from another tab.
+  HPS_ACCEPTED_TAB_IDS.add(value);
+  persistHpsTabAliases();
+}
 
 function hpsExecutionStore() {
   globalThis.__hpsExecutionState = globalThis.__hpsExecutionState || {};
@@ -638,7 +710,7 @@ function tabPayload(payload = {}) {
 }
 
 function isForThisTab(detail) {
-  return detail?.scope === "global" || detail?.tab_id === HPS_TAB_ID;
+  return detail?.scope === "global" || HPS_ACCEPTED_TAB_IDS.has(String(detail?.tab_id || ""));
 }
 
 function nodeFromEvent(detail, className) {
@@ -857,6 +929,10 @@ function syncCyclerSettingsWidgets(node) {
 }
 
 function scheduleHideTabIdWidget(node) {
+  // Capture the value restored with this workflow before replacing it with
+  // the stable ID for future prompts. It lets a just-reloaded page receive
+  // the remaining events of an already queued prompt.
+  rememberWorkflowTabId(node);
   ensureHiddenTabIdWidget(node);
   setTimeout(() => {
     if (ensureHiddenTabIdWidget(node)) app.graph?.setDirtyCanvas?.(true, true);
@@ -1029,13 +1105,31 @@ function installCursorCapture() {
 }
 
 // ---------- Backend state restore ----------
+function nodeStateHasData(result, nodeClass) {
+  if (!result?.ok) return false;
+  if (nodeClass === CYCLER_CLASS) {
+    return !!result.runtime_controls_initialized
+      || !!result.ckpt_name_str
+      || !!result.last_execution_snapshot?.ckpt_name;
+  }
+  return !!result.ckpt_name_str;
+}
+
 async function restoreNodeStateFromBackend(node, nodeClass) {
   if (!node || !nodeClass) return;
   try {
-    const query = new URLSearchParams({ node_id: String(node.id), node_class: nodeClass, tab_id: HPS_TAB_ID });
-    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/node_state?${query.toString()}`, { cache: "no-store" });
-    if (!response.ok) return;
-    const result = await response.json();
+    let result = null;
+    for (const tabId of HPS_ACCEPTED_TAB_IDS) {
+      const query = new URLSearchParams({ node_id: String(node.id), node_class: nodeClass, tab_id: tabId });
+      const response = await api.fetchApi(`/${EXTENSION_PREFIX}/node_state?${query.toString()}`, { cache: "no-store" });
+      if (!response.ok) continue;
+      const candidate = await response.json();
+      if (!result) result = candidate;
+      if (nodeStateHasData(candidate, nodeClass)) {
+        result = candidate;
+        break;
+      }
+    }
     if (!result?.ok) return;
 
     if (nodeClass === "EphemeralPreview") {
