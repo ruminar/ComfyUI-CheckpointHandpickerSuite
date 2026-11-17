@@ -181,12 +181,13 @@ function stopHpsWidgetEventPropagation(element) {
   }
 }
 
-function keepWheelForNativeScroll(element) {
+function keepWheelForNativeScroll(element, consumeAtEdge = false) {
   // For genuinely scrollable DOM areas (Selector list, long status
   // text): mark the element so the wheel forwarder leaves events over
   // it alone while it can still scroll in that direction, and stop
   // propagation so the graph canvas does not also react.
   element.dataset.hpsNativeScroll = "true";
+  if (consumeAtEdge) element.dataset.hpsConsumeWheelAtEdge = "true";
   element.addEventListener("wheel", (event) => event.stopPropagation());
 }
 
@@ -238,8 +239,8 @@ function handleHpsWheelCapture(event) {
   }
   if (!insideRoot) return;
   // A marked scrollable area keeps the wheel while it can still
-  // scroll in the wheeled direction; at its edge the wheel falls
-  // through to the canvas, matching normal scroll chaining.
+  // scroll in the wheeled direction. Individual controls may also
+  // consume it at their edge instead of chaining to the canvas.
   const scrollEl = target.closest?.("[data-hps-native-scroll]");
   if (scrollEl && scrollEl.dataset?.hpsNativeScroll === "true") {
     const maxScrollTop = scrollEl.scrollHeight - scrollEl.clientHeight;
@@ -258,6 +259,14 @@ function handleHpsWheelCapture(event) {
       event.preventDefault();
       event.stopImmediatePropagation();
       scrollEl.scrollTop += delta;
+      return;
+    }
+    if (scrollEl.dataset?.hpsConsumeWheelAtEdge === "true") {
+      // The Selector list owns the wheel for its entire hit area. At an
+      // edge there is simply no further list movement; zoom stays available
+      // by moving the cursor outside the list.
+      event.preventDefault();
+      event.stopImmediatePropagation();
       return;
     }
   }
@@ -2222,7 +2231,7 @@ function buildVueSelectorUI(node) {
   // A fixed-height scrolling list (388 = the 452 widget height
   // minus the toolbar, status line and gaps) stays stable.
   list.style.maxHeight = "388px";
-  keepWheelForNativeScroll(list);
+  keepWheelForNativeScroll(list, true);
   const buttons = document.createElement("div");
   buttons.style.display = "flex";
   buttons.style.gap = "6px";
