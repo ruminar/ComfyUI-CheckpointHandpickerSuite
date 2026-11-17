@@ -75,14 +75,129 @@ function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
 }
 
+function findGraphNodeById(id) {
+  if (id == null || id === "") return null;
+  const graph = app.graph;
+  if (!graph?.getNodeById) return null;
+  // Nodes 2.0 / recent frontends treat node ids as branded strings inside
+  // the frontend, while serialized workflows and API payloads may still
+  // carry numbers. Try the raw id first, then the string/number forms,
+  // instead of forcing every id through Number(), which fails outright
+  // when the graph keys nodes by string id.
+  for (const candidate of [id, String(id), Number(id)]) {
+    try {
+      const node = graph.getNodeById(candidate);
+      if (node) return node;
+    } catch {}
+  }
+  return null;
+}
+
 function stopHpsWidgetEventPropagation(element) {
-  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup", "wheel"]) {
+  // "wheel" is deliberately not stopped here: over a Vue node the wheel
+  // must still reach the graph canvas so zooming keeps working, which is
+  // what wheel over the Cycler/Tagger/Preview area relied on. Elements
+  // that scroll themselves opt in via keepWheelForNativeScroll() below.
+  // Keyboard events are not stopped either: after clicking a widget
+  // button the button keeps focus, and stopping keydown there breaks
+  // the frontend's own shortcuts (Ctrl+S stopped saving the workflow
+  // and fell through to the browser's save-page dialog). The frontend
+  // itself ignores shortcuts that come from text inputs, so only
+  // pointer events need to be contained here.
+  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) {
     element.addEventListener(eventName, (event) => event.stopPropagation());
   }
 }
 
-function addVueOnlyDomWidget(node, name, type, element, height) {
+function keepWheelForNativeScroll(element) {
+  // For genuinely scrollable DOM areas (Selector list, long status
+  // text): mark the element so the wheel forwarder leaves events over
+  // it alone while it can still scroll in that direction, and stop
+  // propagation so the graph canvas does not also react.
+  element.dataset.hpsNativeScroll = "true";
+  element.addEventListener("wheel", (event) => event.stopPropagation());
+}
+
+function forwardWheelToGraphCanvas(event) {
+  if (event.__hpsWheelForwarded) return;
+  const graphCanvas = app.canvas;
+  const canvasEl = graphCanvas?.canvas;
+  if (!canvasEl && typeof graphCanvas?.processMouseWheel !== "function") return;
+  try { event.__hpsWheelForwarded = true; } catch { /* read-only event */ }
+  event.preventDefault();
+  event.stopPropagation();
+  // The frontend's own Vue widgets forward wheel by calling
+  // processMouseWheel directly (see the frontend's multilineTextarea
+  // helper), which works no matter how the canvas element's own wheel
+  // listener is registered in this frontend version. Fall back to a
+  // synthetic event on the canvas element if the method is missing.
+  if (typeof graphCanvas?.processMouseWheel === "function") {
+    graphCanvas.processMouseWheel(event);
+    return;
+  }
+  const forwarded = new WheelEvent("wheel", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+    deltaMode: event.deltaMode,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+  });
+  Object.defineProperty(forwarded, "__hpsWheelForwarded", { value: true });
+  canvasEl.dispatchEvent(forwarded);
+}
+
+const hpsWheelForwardRoots = new Set();
+let hpsWindowWheelInstalled = false;
+
+function handleHpsWheelCapture(event) {
+  if (event.__hpsWheelForwarded) return;
+  const target = event.target;
+  if (!target || target.nodeType !== 1) return;
+  let insideRoot = false;
+  for (const root of hpsWheelForwardRoots) {
+    if (root === target || root.contains?.(target)) { insideRoot = true; break; }
+  }
+  if (!insideRoot) return;
+  // A marked scrollable area keeps the wheel while it can still
+  // scroll in the wheeled direction; at its edge the wheel falls
+  // through to the canvas, matching normal scroll chaining.
+  const scrollEl = target.closest?.("[data-hps-native-scroll]");
+  if (scrollEl && scrollEl.dataset?.hpsNativeScroll === "true") {
+    const maxScrollTop = scrollEl.scrollHeight - scrollEl.clientHeight;
+    const canScroll = (event.deltaY < 0 && scrollEl.scrollTop > 0)
+      || (event.deltaY > 0 && scrollEl.scrollTop < maxScrollTop);
+    if (canScroll) return;
+  }
+  forwardWheelToGraphCanvas(event);
+}
+
+function installWheelForwarding(element) {
+  if (!element || element.__hpsWheelForwarderInstalled) return;
+  element.__hpsWheelForwarderInstalled = true;
+  hpsWheelForwardRoots.add(element);
+  // Capture phase is required: in Nodes 2.0 the wheel is intercepted
+  // around the DOM widget before a bubble-phase listener on the widget
+  // root ever runs (a bubble-phase forwarder on the root did not work
+  // in practice). A window-level capture listener runs before every
+  // element handler, and the root-level capture listener below is a
+  // fallback for the same widget.
+  element.addEventListener("wheel", handleHpsWheelCapture, { passive: false, capture: true });
+  if (!hpsWindowWheelInstalled) {
+    hpsWindowWheelInstalled = true;
+    window.addEventListener("wheel", handleHpsWheelCapture, { passive: false, capture: true });
+  }
+}
+
+function addVueOnlyDomWidget(node, name, type, element, height, reclaimMode = "") {
   if (!node || typeof node.addDOMWidget !== "function" || node.widgets?.some((widget) => widget.name === name)) return null;
+  installWheelForwarding(element);
   try {
     const widget = node.addDOMWidget(name, type, element, {
       serialize: false,
@@ -90,10 +205,146 @@ function addVueOnlyDomWidget(node, name, type, element, height) {
       surfaces: { canvas: "never", vueNode: "shown", panel: "shown" },
     });
     widget.computeSize = (width) => [width, typeof height === "function" ? height(width) : height];
+    const mode = reclaimMode === true ? "both" : String(reclaimMode || "");
+    if (mode) scheduleVueLayoutReclaim(node, element, mode);
     return widget;
   } catch (error) {
     console.warn(`[CheckpointHandpickerSuite] failed to create Nodes 2.0 widget: ${name}`, error);
     return null;
+  }
+}
+
+function moveVueWidgetToFront(node, name) {
+  const widgets = node?.widgets;
+  if (!Array.isArray(widgets)) return;
+  const index = widgets.findIndex((widget) => widget.name === name);
+  if (index > 0) {
+    const [widget] = widgets.splice(index, 1);
+    widgets.unshift(widget);
+  }
+}
+
+// In the canvas renderer the custom UI starts right below the title,
+// using the free space beside the input/output pins (see
+// selectorRects: the buttons sit at the top and "the right edge
+// belongs to ComfyUI output pins"). The Vue renderer instead stacks a
+// slots block (one row per pin) above the widget stack, which pushes
+// the whole UI down by that height and shrinks the list, and a node
+// taller than its content leaves dead space under the widget. Shift
+// the Vue-only widget up over the slots band and stretch it over the
+// bottom dead space so both renderers show the same layout. All
+// measurements use offset* (layout pixels), which the canvas zoom
+// transform does not affect. Best-effort: any mismatch in the
+// frontend's DOM structure leaves the default layout untouched.
+function reclaimVueWidgetLayout(node, element, mode = "both") {
+  try {
+    const nodeEl = element.closest?.("[data-node-id]");
+    if (!nodeEl) return;
+    const bodyEl = nodeEl.querySelector?.('[data-testid^="node-body-"]');
+    if (!bodyEl) return;
+    const host = element.parentElement;
+    if (!host || host === bodyEl) return;
+    const relTop = (el) => {
+      let y = 0;
+      let n = el;
+      while (n && n !== nodeEl) { y += n.offsetTop || 0; n = n.offsetParent; }
+      return n === nodeEl ? y : null;
+    };
+    const hostTop = relTop(host);
+    const bodyTop = relTop(bodyEl);
+    if (hostTop == null || bodyTop == null) return;
+    const slotsEl = bodyEl.firstElementChild;
+    const slotsH = slotsEl ? slotsEl.offsetHeight || 0 : 0;
+    // "shift" is only safe when this widget is the first in the stack
+    // (nothing visible above it except the slots band). The shift is
+    // capped at the slots band height plus the body gap.
+    let shift = 0;
+    if (mode === "shift" || mode === "both") {
+      shift = (hostTop - bodyTop) - 8;
+      if (shift < 0) shift = 0;
+      const maxShift = slotsH + 12;
+      if (shift > maxShift) shift = maxShift;
+    }
+    let extra = 0;
+    if (mode === "fill" || mode === "both") {
+      const hostBottom = hostTop + (host.offsetHeight || 0);
+      const bodyBottom = bodyTop + (bodyEl.offsetHeight || 0);
+      extra = bodyBottom - hostBottom - 12; // body bottom padding
+      if (extra < 0) extra = 0;
+      if (extra > 600) extra = 600;
+    }
+    element.style.marginTop = shift ? `-${shift}px` : "";
+    // The Vue host stretches DOM widget elements with flex: 1, which
+    // would ignore an explicit height; opt out so the calc() height
+    // (host height + reclaimed space) is honoured.
+    element.style.flex = (shift || extra) ? "0 0 auto" : "";
+    element.style.height = (shift || extra) ? `calc(100% + ${shift + extra}px)` : "";
+    // A shifted-up band overlaps the slots area: let clicks fall
+    // through the root's empty parts to the pins underneath, and only
+    // capture events on the actual content sections.
+    if (shift) {
+      element.style.pointerEvents = "none";
+      for (const child of element.children) child.style.pointerEvents = "auto";
+      // The shifted content leaves a gap before the following
+      // framework widgets (Cycler: start_checkpoint and everything
+      // after it sat too low by roughly the shift amount). The Vue
+      // widget stack is a CSS grid, so following widgets do not flow
+      // up on their own: translate their grid rows up by the measured
+      // gap instead. Transforms do not affect offsetTop, so repeated
+      // measurements stay stable, and the freed space lands under the
+      // last row, where a fill-mode widget (Cycler status) absorbs it.
+      const gridEl = host.closest?.('[data-testid="node-widgets"]');
+      const rowEl = host.closest?.("[data-widget-name]");
+      const lastChild = element.lastElementChild;
+      if (gridEl && rowEl && lastChild) {
+        const contentBottom = relTop(lastChild) + (lastChild.offsetHeight || 0);
+        const rows = [...gridEl.querySelectorAll("[data-widget-name]")];
+        const index = rows.indexOf(rowEl);
+        if (index >= 0 && index < rows.length - 1) {
+          const nextTop = relTop(rows[index + 1]);
+          if (contentBottom != null && nextTop != null) {
+            let pull = nextTop - contentBottom - 6;
+            if (pull < 4) pull = 0;
+            if (pull > 64) pull = 64;
+            for (let i = index + 1; i < rows.length; i++) {
+              rows[i].style.transform = pull ? `translateY(${-pull}px)` : "";
+            }
+          }
+        }
+      }
+    } else {
+      element.style.pointerEvents = "";
+      for (const child of element.children) child.style.pointerEvents = "";
+    }
+  } catch { /* layout reclaim is best-effort */ }
+}
+
+function refreshVueLayoutReclaim(node) {
+  // Vue re-renders widget rows on state changes, which drops the
+  // inline styles the reclaim applied; re-run it after UI syncs.
+  if (!Array.isArray(node?.__hpsLayoutReclaimers) || !node.__hpsLayoutReclaimers.length) return;
+  requestAnimationFrame(() => {
+    for (const reclaim of node.__hpsLayoutReclaimers || []) reclaim();
+  });
+}
+
+function scheduleVueLayoutReclaim(node, element, mode = "both") {
+  const run = () => reclaimVueWidgetLayout(node, element, mode);
+  requestAnimationFrame(() => requestAnimationFrame(run));
+  setTimeout(run, 150);
+  setTimeout(run, 500);
+  setTimeout(run, 1200);
+  if (!Array.isArray(node.__hpsLayoutReclaimers)) node.__hpsLayoutReclaimers = [];
+  node.__hpsLayoutReclaimers.push(run);
+  if (!node.__hpsLayoutReclaimHooked) {
+    node.__hpsLayoutReclaimHooked = true;
+    const prevOnResize = node.onResize;
+    node.onResize = function (size) {
+      prevOnResize?.call(this, size);
+      setTimeout(() => {
+        for (const reclaim of node.__hpsLayoutReclaimers || []) reclaim();
+      }, 50);
+    };
   }
 }
 
@@ -378,7 +629,7 @@ function isForThisTab(detail) {
 
 function nodeFromEvent(detail, className) {
   if (!isForThisTab(detail)) return null;
-  const node = app.graph?.getNodeById(Number(detail?.node));
+  const node = findGraphNodeById(detail?.node);
   if (!isNodeClass(node, className)) return null;
   return node;
 }
@@ -513,6 +764,7 @@ function applyCyclerStatePayload(node, detail) {
     node.title = detail.title;
   }
   syncCyclerSettingsWidgets(node);
+  syncVueCyclerUI(node);
 }
 
 function parseSavedBool(value, fallback) {
@@ -799,6 +1051,11 @@ async function restoreNodeStateFromBackend(node, nodeClass) {
         applyCyclerStatePayload(node, result);
       }
     }
+    // Canvas redraws pick state up on the next frame, but the Nodes 2.0
+    // DOM widgets only change when they are explicitly synced.
+    syncVuePreviewUI(node);
+    syncVueTaggerUI(node);
+    syncVueCyclerUI(node);
     app.graph?.setDirtyCanvas?.(true, true);
   } catch (error) {
     // Older Python side versions did not expose node_state. Ignore quietly.
@@ -917,6 +1174,15 @@ function previewLocalFromEventOrPos(node, event, pos) {
 
 function imageDirPreviewItemAtLocal(node, local) {
   if (!node || !isNodeClass(node, "ImageDirPreview") || !local) return null;
+  const box = previewDrawBox(node);
+  if (!box || !hit(local, box)) return null;
+  const sx = (local[0] - box.x) * (box.imageW / box.w);
+  const sy = (local[1] - box.y) * (box.imageH / box.h);
+  return imageDirPreviewItemAtImagePoint(node, sx, sy);
+}
+
+function imageDirPreviewItemAtImagePoint(node, sx, sy) {
+  if (!node || !isNodeClass(node, "ImageDirPreview")) return null;
   const st = node.__hpsPreviewState || {};
   const sourcePaths = Array.isArray(st.source_paths) ? st.source_paths : [];
   const count = Number(st.count || sourcePaths.length || 0);
@@ -926,10 +1192,6 @@ function imageDirPreviewItemAtLocal(node, local) {
   const tileH = Number(st.tile_height || 0);
   const gap = Number(st.gap || 0);
   if (!count || !cols || !rows || !tileW || !tileH || !sourcePaths.length) return null;
-  const box = previewDrawBox(node);
-  if (!box || !hit(local, box)) return null;
-  const sx = (local[0] - box.x) * (box.imageW / box.w);
-  const sy = (local[1] - box.y) * (box.imageH / box.h);
   const stepX = tileW + gap;
   const stepY = tileH + gap;
   if (stepX <= 0 || stepY <= 0) return null;
@@ -1099,6 +1361,8 @@ async function setImageDirCheckpointThumbnail(node, itemIndex) {
     node.__hpsPreviewContextMessage = result?.error || "Failed to set checkpoint thumbnail.";
     node.__hpsPreviewContextMessageAt = Date.now();
   }
+  syncVuePreviewUI(node);
+  setTimeout(() => syncVuePreviewUI(node), 5100);
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
@@ -1119,6 +1383,8 @@ async function deleteImageDirPreviewImage(node, itemIndex) {
     node.__hpsPreviewContextMessage = result?.error || "Failed to delete preview image.";
     node.__hpsPreviewContextMessageAt = Date.now();
   }
+  syncVuePreviewUI(node);
+  setTimeout(() => syncVuePreviewUI(node), 5100);
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
@@ -1283,14 +1549,109 @@ function syncVuePreviewUI(node, detail = null) {
   const ui = node?.__hpsVuePreviewUI;
   if (!ui) return;
   const state = detail || node.__hpsPreviewState || {};
-  ui.caption.textContent = node.__hpsPreviewCaption || state.progress_message || state.message || "no preview";
+  const contextMsg = node.__hpsPreviewContextMessage || "";
+  const contextFresh = !!contextMsg && (Date.now() - Number(node.__hpsPreviewContextMessageAt || 0) < 5000);
+  ui.caption.textContent = contextFresh
+    ? contextMsg
+    : (node.__hpsPreviewCaption || state.progress_message || state.message || "no preview");
   if (state.image) {
-    ui.image.src = `data:image/${state.format || "jpeg"};base64,${state.image}`;
+    const src = `data:image/${state.format || "jpeg"};base64,${state.image}`;
+    // Only assign a changed src: re-assigning the same data URL reloads
+    // the image and would retrigger the load handler that syncs again.
+    if (ui.image.getAttribute("src") !== src) ui.image.src = src;
     ui.image.hidden = false;
+    // The element carries inline display:block, which overrides the
+    // [hidden] rule, so visibility must be driven through style as well.
+    ui.image.style.display = "block";
   } else if (!state.progress) {
     ui.image.removeAttribute("src");
     ui.image.hidden = true;
+    ui.image.style.display = "none";
   }
+  // The canvas draws a placeholder over deleted tiles; mirror that with
+  // overlay cells positioned over the letterboxed image content.
+  if (ui.deletedOverlay) {
+    ui.deletedOverlay.replaceChildren();
+    if (isNodeClass(node, "ImageDirPreview")) {
+      for (const index of deletedImageDirIndexSet(node) || []) {
+        const rect = vuePreviewTileRect(node, index);
+        if (!rect) continue;
+        const cell = document.createElement("div");
+        cell.style.position = "absolute";
+        cell.style.left = `${rect.x}px`;
+        cell.style.top = `${rect.y}px`;
+        cell.style.width = `${rect.w}px`;
+        cell.style.height = `${rect.h}px`;
+        cell.style.background = "rgba(20,20,20,0.92)";
+        cell.style.color = "rgba(255,255,255,0.88)";
+        cell.style.display = "flex";
+        cell.style.alignItems = "center";
+        cell.style.justifyContent = "center";
+        cell.style.font = "bold 10px sans-serif";
+        cell.textContent = "NO IMAGE";
+        ui.deletedOverlay.append(cell);
+      }
+    }
+  }
+}
+
+function vuePreviewContentBox(node) {
+  const ui = node?.__hpsVuePreviewUI;
+  if (!ui?.image) return null;
+  const rect = ui.image.getBoundingClientRect();
+  const naturalW = ui.image.naturalWidth || 0;
+  const naturalH = ui.image.naturalHeight || 0;
+  // clientWidth/clientHeight are layout pixels. getBoundingClientRect()
+  // is post-transform: the Vue node layer is CSS-scaled by the canvas
+  // zoom, so measuring with the rect and then positioning in layout
+  // pixels double-applies the zoom and the overlay drifts (about 0.87x
+  // and up-left in the reported screenshot). Keep all geometry in
+  // layout pixels and carry the zoom factor separately for events.
+  const layoutW = ui.image.clientWidth || rect.width;
+  const layoutH = ui.image.clientHeight || rect.height;
+  if (!layoutW || !layoutH || !naturalW || !naturalH) return null;
+  const scale = Math.min(layoutW / naturalW, layoutH / naturalH);
+  if (!(scale > 0)) return null;
+  return {
+    rect,
+    scale,
+    zoom: layoutW ? rect.width / layoutW : 1,
+    offsetX: (layoutW - naturalW * scale) / 2,
+    offsetY: (layoutH - naturalH * scale) / 2,
+  };
+}
+
+function vuePreviewTileRect(node, index) {
+  const st = node?.__hpsPreviewState || {};
+  const cols = Number(st.columns || 0);
+  const tileW = Number(st.tile_width || 0);
+  const tileH = Number(st.tile_height || 0);
+  const gap = Number(st.gap || 0);
+  if (!cols || !tileW || !tileH || index == null || index < 0) return null;
+  const box = vuePreviewContentBox(node);
+  if (!box) return null;
+  const row = Math.floor(index / cols);
+  const col = index % cols;
+  return {
+    x: box.offsetX + col * (tileW + gap) * box.scale,
+    y: box.offsetY + row * (tileH + gap) * box.scale,
+    w: tileW * box.scale,
+    h: tileH * box.scale,
+  };
+}
+
+function vuePreviewItemFromEvent(node, event) {
+  const box = vuePreviewContentBox(node);
+  if (!box || !event) return null;
+  // Client coordinates are post-transform; convert back to layout
+  // pixels before comparing with the layout-pixel content box.
+  const zoom = box.zoom || 1;
+  const px = (event.clientX - box.rect.left) / zoom;
+  const py = (event.clientY - box.rect.top) / zoom;
+  const contentW = (node.__hpsVuePreviewUI?.image?.naturalWidth || 0) * box.scale;
+  const contentH = (node.__hpsVuePreviewUI?.image?.naturalHeight || 0) * box.scale;
+  if (px < box.offsetX || py < box.offsetY || px > box.offsetX + contentW || py > box.offsetY + contentH) return null;
+  return imageDirPreviewItemAtImagePoint(node, (px - box.offsetX) / box.scale, (py - box.offsetY) / box.scale);
 }
 function buildVuePreviewUI(node) {
   if (node.__hpsVuePreviewUI) return;
@@ -1302,29 +1663,80 @@ function buildVuePreviewUI(node) {
   root.style.width = "100%";
   root.style.height = "100%";
   root.style.minWidth = "0";
+  const stage = document.createElement("div");
+  stage.style.position = "relative";
+  stage.style.flex = "1 1 auto";
+  stage.style.minHeight = "0";
+  stage.style.width = "100%";
   const image = document.createElement("img");
   image.style.display = "block";
   image.style.width = "100%";
   image.style.height = "100%";
   image.style.minHeight = "0";
-  image.style.flex = "1 1 auto";
   image.style.objectFit = "contain";
   image.hidden = true;
+  const deletedOverlay = document.createElement("div");
+  deletedOverlay.style.position = "absolute";
+  deletedOverlay.style.inset = "0";
+  deletedOverlay.style.pointerEvents = "none";
+  const hoverBox = document.createElement("div");
+  hoverBox.style.position = "absolute";
+  hoverBox.style.display = "none";
+  hoverBox.style.border = "2px solid rgba(255,255,255,0.95)";
+  hoverBox.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,0.75)";
+  hoverBox.style.pointerEvents = "none";
+  stage.append(image, deletedOverlay, hoverBox);
   const caption = document.createElement("small");
   caption.style.order = "-1";
   caption.style.whiteSpace = "pre-wrap";
   caption.style.minHeight = "16px";
   caption.style.color = "#FFD28A";
-  root.append(image, caption);
+  root.append(stage, caption);
   stopHpsWidgetEventPropagation(root);
-  if (!addVueOnlyDomWidget(node, "hps_preview", "hps-preview", root, () => Math.max(220, (node.size?.[1] || 300) - 74))) return;
-  node.__hpsVuePreviewUI = { root, image, caption };
+  // In the Vue renderer the LiteGraph onMouseDown never fires for this
+  // node, so the click menu (delete image / set checkpoint thumbnail)
+  // must be opened from the DOM image itself, mapping the click through
+  // the object-fit: contain letterbox into composite-image coordinates.
+  image.addEventListener("click", (event) => {
+    if (!isNodeClass(node, "ImageDirPreview")) return;
+    const item = vuePreviewItemFromEvent(node, event);
+    if (item) {
+      setImageDirHover(node, item);
+      void openImageDirContextMenu(node, item, event);
+    } else {
+      hideHpsContextMenu();
+    }
+  });
+  image.addEventListener("mousemove", (event) => {
+    if (!isNodeClass(node, "ImageDirPreview")) return;
+    const item = vuePreviewItemFromEvent(node, event);
+    image.style.cursor = item ? "pointer" : "";
+    const rect = item ? vuePreviewTileRect(node, item.index) : null;
+    if (rect) {
+      hoverBox.style.display = "block";
+      hoverBox.style.left = `${rect.x}px`;
+      hoverBox.style.top = `${rect.y}px`;
+      hoverBox.style.width = `${rect.w}px`;
+      hoverBox.style.height = `${rect.h}px`;
+    } else {
+      hoverBox.style.display = "none";
+    }
+  });
+  image.addEventListener("mouseleave", () => {
+    hoverBox.style.display = "none";
+    image.style.cursor = "";
+  });
+  image.addEventListener("load", () => syncVuePreviewUI(node));
+  // Fixed height: deriving the widget height from node.size is circular
+  // in the Vue renderer, where the node height is the sum of its widgets.
+  if (!addVueOnlyDomWidget(node, "hps_preview", "hps-preview", root, 260, "fill")) return;
+  node.__hpsVuePreviewUI = { root, stage, image, caption, deletedOverlay, hoverBox };
   syncVuePreviewUI(node);
 }
 
 api.addEventListener(PREVIEW_EVENT, ({ detail }) => {
   if (!isForThisTab(detail)) return;
-  const node = app.graph?.getNodeById(Number(detail?.node));
+  const node = findGraphNodeById(detail?.node);
   if (!node || !PREVIEW_CLASSES.has(node.type || node.comfyClass)) return;
   if (detail.node_class && !isNodeClass(node, detail.node_class)) return;
 
@@ -1541,14 +1953,20 @@ function selectorWidget(node) {
 function hideSelectorWidget(node) {
   const w = selectorWidget(node);
   if (w) {
+    // Mirror the file's other hiding helpers: in the store-backed Vue
+    // widget system, changing type alone may not suppress the widget.
     w.type = "hidden";
+    w.hidden = true;
+    w.options = { ...(w.options || {}), hidden: true };
     w.computeSize = () => [0, -4];
+    w.draw = () => {};
   }
 }
 function syncVueSelectorUI(node) {
   const ui = node?.__hpsVueSelectorUI;
   if (!ui) return;
   const selected = selectorSelected(node);
+  const listScrollTop = ui.list.scrollTop;
   ui.list.replaceChildren();
   for (const item of selectorItems(node)) {
     const row = document.createElement("button");
@@ -1571,10 +1989,14 @@ function syncVueSelectorUI(node) {
     });
     ui.list.append(row);
   }
+  // Rebuilding the rows collapses the scroll height and would otherwise
+  // clamp scrollTop back toward the top on every selection.
+  ui.list.scrollTop = listScrollTop;
   ui.refresh.disabled = !!node.__hpsLoading;
   ui.action.disabled = !!node.__hpsLoading || !selected;
   ui.action.textContent = selectorActionLabel(node);
   ui.status.textContent = node.__hpsStatus || "not loaded";
+  refreshVueLayoutReclaim(node);
 }
 function buildVueSelectorUI(node) {
   if (node.__hpsVueSelectorUI) return;
@@ -1583,13 +2005,20 @@ function buildVueSelectorUI(node) {
   root.style.gap = "6px";
   root.style.padding = "2px 0";
   root.style.width = "100%";
+  root.style.gridTemplateRows = "auto auto 1fr";
   const list = document.createElement("div");
-  list.style.maxHeight = "360px";
   list.style.overflowY = "auto";
   list.style.border = "1px solid rgba(210,220,240,0.34)";
   list.style.borderRadius = "4px";
   list.style.padding = "2px";
   list.style.background = "rgba(0,0,0,0.16)";
+  // The list height is fixed on purpose: sizing it from the node
+  // body makes the frontend treat the list height as required
+  // content, which blocks shrinking and slowly stretches the node.
+  // A fixed-height scrolling list (388 = the 452 widget height
+  // minus the toolbar, status line and gaps) stays stable.
+  list.style.maxHeight = "388px";
+  keepWheelForNativeScroll(list);
   const buttons = document.createElement("div");
   buttons.style.display = "flex";
   buttons.style.gap = "6px";
@@ -1614,19 +2043,21 @@ function buildVueSelectorUI(node) {
   down.addEventListener("click", () => uiScrollByRows(node, SELECTOR_VISIBLE_ROWS));
   action.addEventListener("click", () => {
     const mode = selectorActionMode(node);
-    if (mode === "sync") void syncSelectedCheckpoint(node);
+    if (mode === "sync") void syncSelectedCheckpoint(node).finally(() => syncVueSelectorUI(node));
     else if (mode === "directlink") toggleSelectorDirectLink(node);
-    else void pushSelectedToLocalList(node);
+    else void pushSelectedToLocalList(node).finally(() => syncVueSelectorUI(node));
     syncVueSelectorUI(node);
   });
-  if (!addVueOnlyDomWidget(node, "hps_selector_controls", "hps-selector-controls", root, 430)) return;
+  if (!addVueOnlyDomWidget(node, "hps_selector_controls", "hps-selector-controls", root, 452, "shift")) return;
   node.__hpsVueSelectorUI = { root, list, refresh, action, up, down, status };
   syncVueSelectorUI(node);
 }
 function uiScrollByRows(node, rows) {
   const list = node?.__hpsVueSelectorUI?.list;
   if (!list) return;
-  list.scrollBy({ top: rows * ROW_H, behavior: "smooth" });
+  // Vue rows render about 28px tall (min-height, padding, border), not
+  // the 20px canvas ROW_H, so page scrolling must use the DOM row height.
+  list.scrollBy({ top: rows * 28, behavior: "smooth" });
 }
 function selectorRects(node) {
   const margin = 8;
@@ -1665,6 +2096,7 @@ function selectorTitleText(node, ckptName) {
 function setSelectorSelected(node, value) {
   const w = selectorWidget(node); if (w) w.value = value;
   node.__hpsSelected = value;
+  node.graph?.change?.();
   node.title = selectorTitleText(node, value);
   updateDirectLinkTaggers(node);
 }
@@ -1790,6 +2222,7 @@ function markImageDirPreviewLoading(node, ckptName) {
     max_preview_images: maxPreviewImages,
   };
   node.__hpsPreviewCaption = message;
+  syncVuePreviewUI(node);
 }
 
 function nextAnimationFrame() {
@@ -1828,6 +2261,7 @@ function clearTaggerTarget(node) {
   node.__hpsTaggerStatus = "none";
   node.__hpsTaggerMessage = "";
   if (isNodeClass(node, TAGGER_CLASS)) node.title = "Tagger";
+  syncVueTaggerUI(node);
 }
 
 function setTaggerTargetSnapshot(node, ckptName, status = "none") {
@@ -1838,6 +2272,7 @@ function setTaggerTargetSnapshot(node, ckptName, status = "none") {
   node.title = node.__hpsTaggerStatus === "none"
     ? `Tagger : ${ckptName}`
     : `Tagger : ${STATUS_ICON[node.__hpsTaggerStatus]} ${ckptName}`;
+  syncVueTaggerUI(node);
 }
 
 function updateDirectLinkTaggers(node) {
@@ -1874,6 +2309,7 @@ function toggleSelectorDirectLink(node) {
   node.__hpsStatus = selectorDirectLinkEnabled(node)
     ? "DirectLink ON: Tagger follows selected checkpoint."
     : "DirectLink OFF: connect ImageDirPreview for Sync mode, or enable DirectLink for external review.";
+  syncVueSelectorUI(node);
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
@@ -1940,7 +2376,7 @@ async function pushSelectedToLocalList(node) {
   const result = await response.json();
   if (result.ok && Array.isArray(result.states)) {
     for (const state of result.states) {
-      const cycler = app.graph?.getNodeById?.(Number(state.node_id));
+      const cycler = findGraphNodeById(state.node_id);
       if (cycler && isNodeClass(cycler, CYCLER_CLASS)) applyCyclerStatePayload(cycler, state);
     }
   }
@@ -1948,6 +2384,7 @@ async function pushSelectedToLocalList(node) {
   node.__hpsStatus = result.ok
     ? `pushed : ${selected} (${result.updated} Cycler)`
     : (result.error || "Push failed");
+  syncVueSelectorUI(node);
   app.graph.setDirtyCanvas(true, true);
 }
 
@@ -1980,6 +2417,7 @@ async function syncSelectedCheckpoint(node) {
   node.__hpsStatus = result.ok
     ? `synced : ${selected} (${targets.taggers.length} tagger, ${targets.previews.length} preview)`
     : (result.error || "Sync failed");
+  syncVueSelectorUI(node);
   app.graph.setDirtyCanvas(true, true);
 }
 
@@ -2387,6 +2825,7 @@ function buildTagTransferDirectoryUI(node) {
     savedWidget.value = input.value;
   });
 
+  installWheelForwarding(root);
   try {
     const domWidget = node.addDOMWidget("tag_transfer_directory_editor", "hps-tag-transfer-directory", root, {
       serialize: false,
@@ -2499,6 +2938,11 @@ function buildVueTagTransferUI(node) {
   root.style.display = "grid";
   root.style.gap = "6px";
   root.style.padding = "2px 0";
+  // Without explicit rows the grid stretches both rows to fill the
+  // widget height, which made the buttons tall squares and left the
+  // result as plain text; the canvas has normal-height buttons and
+  // a dark result box filling the rest of the node.
+  root.style.gridTemplateRows = "auto 1fr";
   const buttons = document.createElement("div");
   buttons.style.display = "flex";
   buttons.style.gap = "8px";
@@ -2506,14 +2950,31 @@ function buildVueTagTransferUI(node) {
   exportButton.textContent = "📤 Export";
   const importButton = document.createElement("button");
   importButton.textContent = "📥 Import";
-  const result = document.createElement("small");
+  for (const button of [exportButton, importButton]) {
+    button.style.flex = "1";
+    button.style.padding = "5px 0";
+    button.style.background = "rgba(80,120,180,0.65)";
+    button.style.border = "1px solid rgba(220,235,255,0.35)";
+    button.style.borderRadius = "4px";
+    button.style.color = "#fff";
+  }
+  const result = document.createElement("div");
   result.style.whiteSpace = "pre-wrap";
+  result.style.wordBreak = "break-word";
+  result.style.overflowY = "auto";
+  result.style.minHeight = "0";
+  result.style.background = "rgba(12,12,12,0.72)";
+  result.style.border = "1px solid rgba(255,255,255,0.16)";
+  result.style.borderRadius = "5px";
+  result.style.padding = "6px 8px";
+  result.style.fontSize = "12px";
+  keepWheelForNativeScroll(result);
   buttons.append(exportButton, importButton);
   root.append(buttons, result);
   stopHpsWidgetEventPropagation(root);
   exportButton.addEventListener("click", () => void runTagTransfer(node, "export"));
   importButton.addEventListener("click", () => void runTagTransfer(node, "import"));
-  if (!addVueOnlyDomWidget(node, "hps_tag_transfer_actions", "hps-tag-transfer-actions", root, 76)) return;
+  if (!addVueOnlyDomWidget(node, "hps_tag_transfer_actions", "hps-tag-transfer-actions", root, 118, "fill")) return;
   node.__hpsVueTagTransferUI = { root, exportButton, importButton, result };
   syncVueTagTransferUI(node);
 }
@@ -2525,18 +2986,22 @@ function setupTagTransferNode(nodeType) {
   nodeType.prototype.onNodeCreated = function () {
     const result = origCreated ? origCreated.apply(this, arguments) : undefined;
     ensureSize(this, 420, 320);
-    buildTagTransferDirectoryUI(this);
-    buildVueTagTransferUI(this);
     this.__hpsTagTransferBusy = false;
     this.__hpsTagTransferResult = "Ready.";
     this.__hpsTagTransferScroll = 0;
+    buildTagTransferDirectoryUI(this);
+    buildVueTagTransferUI(this);
     return result;
   };
   const origConfigure = nodeType.prototype.onConfigure;
   nodeType.prototype.onConfigure = function () {
     const result = origConfigure ? origConfigure.apply(this, arguments) : undefined;
-    setTimeout(() => buildTagTransferDirectoryUI(this), 0);
-    buildVueTagTransferUI(this);
+    // Defer both builders together so a loaded node keeps the same
+    // widget order as a fresh one: directory editor first, actions next.
+    setTimeout(() => {
+      buildTagTransferDirectoryUI(this);
+      buildVueTagTransferUI(this);
+    }, 0);
     return result;
   };
   const origDraw = nodeType.prototype.onDrawBackground;
@@ -2733,10 +3198,15 @@ function buildVueTaggerUI(node) {
   root.style.display = "grid";
   root.style.gap = "6px";
   root.style.padding = "2px 0";
+  root.style.gridTemplateRows = "auto 1fr";
   const buttonsRow = document.createElement("div");
   buttonsRow.style.display = "flex";
   buttonsRow.style.flexWrap = "wrap";
   buttonsRow.style.gap = "5px";
+  // Match the canvas layout, where the status buttons sit on the
+  // right side of the node (and wrap onto a second right-aligned
+  // row when the node is narrow).
+  buttonsRow.style.justifyContent = "flex-end";
   const buttons = {};
   for (const status of TAGGER_STATUS_ORDER) {
     const button = document.createElement("button");
@@ -2749,7 +3219,7 @@ function buildVueTaggerUI(node) {
   message.style.whiteSpace = "pre-wrap";
   root.append(buttonsRow, message);
   stopHpsWidgetEventPropagation(root);
-  if (!addVueOnlyDomWidget(node, "hps_tagger_controls", "hps-tagger-controls", root, 92)) return;
+  if (!addVueOnlyDomWidget(node, "hps_tagger_controls", "hps-tagger-controls", root, 124, "both")) return;
   node.__hpsVueTaggerUI = { root, buttons, message };
   syncVueTaggerUI(node);
 }
@@ -2883,6 +3353,7 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
         node.title = selectorTitleText(node, detail.ckpt_name_str);
         if (selectorDirectLinkEnabled(node)) updateDirectLinkTaggers(node);
       }
+      syncVueSelectorUI(node);
     }
     if (PREVIEW_CLASSES.has(node.type || node.comfyClass) && node.__hpsPreviewCkptName === detail.ckpt_name_str) {
       node.__hpsPreviewStatus = detail.status || "none";
@@ -2892,6 +3363,7 @@ api.addEventListener(STATUS_CHANGED_EVENT, ({ detail }) => {
       node.__hpsTaggerStatus = detail.status || "none";
       node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
       patchCheckpointTitle(node, "Tagger", detail.ckpt_name_str, node.__hpsTaggerStatus);
+      syncVueTaggerUI(node);
     }
     // Cycler title/status are rebuilt from backend state via CYCLER_EVENT.
     // Do not patch the existing Cycler title here; stale status icons can accumulate.
@@ -2920,6 +3392,7 @@ function applyTagTransferChanges(detail) {
         node.title = selectorTitleText(node, selected);
         if (selectorDirectLinkEnabled(node)) updateDirectLinkTaggers(node);
       }
+      syncVueSelectorUI(node);
     }
     if (PREVIEW_CLASSES.has(node.type || node.comfyClass)) {
       const change = changes.get(node.__hpsPreviewCkptName);
@@ -2935,6 +3408,7 @@ function applyTagTransferChanges(detail) {
         node.__hpsTaggerStatus = change.status || "none";
         node.__hpsTaggerMessage = taggerCurrentMessage(node.__hpsTaggerStatus);
         patchCheckpointTitle(node, "Tagger", path, node.__hpsTaggerStatus);
+        syncVueTaggerUI(node);
       }
     }
     if (isNodeClass(node, CYCLER_CLASS)) {
@@ -3066,14 +3540,19 @@ function syncVueCyclerUI(node) {
   if (!ui) return;
   const active = cyclerActiveFilter(node);
   ui.localList.textContent = node.__hpsUseLocalList === false ? "☐ Use Local List" : "☑ Use Local List";
+  // Match the canvas toggle colours: active is green, not blue.
+  const localListActive = node.__hpsUseLocalList !== false;
+  ui.localList.style.background = localListActive ? "rgba(70,140,110,0.82)" : "";
+  ui.localList.style.borderColor = localListActive ? "rgba(235,255,245,0.95)" : "";
   for (const [status, button] of Object.entries(ui.filters)) {
     const selected = status === "all" ? active.length === 0 : active.includes(status);
     button.dataset.active = String(selected);
     button.setAttribute("aria-pressed", String(selected));
-    button.style.background = selected ? "rgba(74,121,177,0.9)" : "";
-    button.style.borderColor = selected ? "rgba(206,230,255,0.95)" : "";
+    button.style.background = selected ? "rgba(70,140,110,0.82)" : "";
+    button.style.borderColor = selected ? "rgba(235,255,245,0.95)" : "";
   }
   ui.status.textContent = node.__hpsCyclerStatus || "Current: (not executed yet)";
+  refreshVueLayoutReclaim(node);
 }
 function buildVueCyclerUI(node) {
   if (node.__hpsVueCyclerUI) return;
@@ -3081,6 +3560,8 @@ function buildVueCyclerUI(node) {
   root.style.display = "grid";
   root.style.gap = "6px";
   root.style.padding = "2px 0";
+  root.style.gridTemplateRows = "auto auto";
+  root.style.alignContent = "start";
   const actions = document.createElement("div");
   actions.style.display = "flex";
   actions.style.flexWrap = "wrap";
@@ -3112,9 +3593,7 @@ function buildVueCyclerUI(node) {
       syncVueCyclerUI(node);
     });
   }
-  const status = document.createElement("small");
-  status.style.whiteSpace = "pre-wrap";
-  root.append(actions, filtersRow, status);
+  root.append(actions, filtersRow);
   stopHpsWidgetEventPropagation(root);
   localList.addEventListener("click", () => {
     node.__hpsUseLocalList = !node.__hpsUseLocalList;
@@ -3124,8 +3603,32 @@ function buildVueCyclerUI(node) {
     syncVueCyclerUI(node);
   });
   clear.addEventListener("click", () => void clearLocalList(node).finally(() => syncVueCyclerUI(node)));
-  if (!addVueOnlyDomWidget(node, "hps_cycler_controls", "hps-cycler-controls", root, 126)) return;
-  node.__hpsVueCyclerUI = { root, localList, clear, filters, status };
+  // The canvas layout interleaves framework widgets: the custom
+  // toggle/filter rows sit at the top (over the slots band), the
+  // start_checkpoint/mode/change_every widgets follow, and the status
+  // box comes last (cyclerRects: statusBox y=140). A single DOM
+  // widget cannot interleave, so the Vue UI is split in two: this
+  // top widget is moved before the framework widgets, and a separate
+  // status widget stays at the end.
+  if (!addVueOnlyDomWidget(node, "hps_cycler_controls", "hps-cycler-controls", root, 68, "shift")) return;
+  moveVueWidgetToFront(node, "hps_cycler_controls");
+  const statusRoot = document.createElement("div");
+  statusRoot.style.display = "flex";
+  statusRoot.style.padding = "2px 0";
+  const status = document.createElement("small");
+  status.style.whiteSpace = "pre-wrap";
+  status.style.flex = "1 1 auto";
+  status.style.minHeight = "0";
+  status.style.overflowY = "auto";
+  status.style.background = "rgba(12,12,12,0.72)";
+  status.style.border = "1px solid rgba(210,210,210,0.28)";
+  status.style.borderRadius = "5px";
+  status.style.padding = "6px 7px";
+  keepWheelForNativeScroll(status);
+  statusRoot.append(status);
+  stopHpsWidgetEventPropagation(statusRoot);
+  addVueOnlyDomWidget(node, "hps_cycler_status", "hps-cycler-status", statusRoot, 80, "fill");
+  node.__hpsVueCyclerUI = { root, statusRoot, localList, clear, filters, status };
   syncVueCyclerUI(node);
 }
 
