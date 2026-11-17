@@ -1858,6 +1858,7 @@ async function requestSelectorThumbnail(node, ckptName) {
     const result = await response.json();
     if (!result?.ok || !result.found || !result.image) {
       selectorThumbnailCache.set(key, { status: "missing" });
+      syncVueSelectorThumbnailUI(node);
       app.graph?.setDirtyCanvas?.(true, true);
       return;
     }
@@ -1870,15 +1871,18 @@ async function requestSelectorThumbnail(node, ckptName) {
         height: result.height || img.height,
         thumbnail_path: result.thumbnail_path || "",
       });
+      syncVueSelectorThumbnailUI(node);
       app.graph?.setDirtyCanvas?.(true, true);
     };
     img.onerror = () => {
       selectorThumbnailCache.set(key, { status: "missing" });
+      syncVueSelectorThumbnailUI(node);
       app.graph?.setDirtyCanvas?.(true, true);
     };
     img.src = `data:image/${result.format || "jpeg"};base64,${result.image}`;
   } catch (error) {
     selectorThumbnailCache.set(key, { status: "missing", error: String(error) });
+    syncVueSelectorThumbnailUI(node);
     app.graph?.setDirtyCanvas?.(true, true);
   }
 }
@@ -1976,6 +1980,90 @@ function hideSelectorWidget(node) {
     w.draw = () => {};
   }
 }
+
+let vueSelectorThumbnailPopup = null;
+let vueSelectorThumbnailOwner = null;
+
+function ensureVueSelectorThumbnailPopup() {
+  if (vueSelectorThumbnailPopup) return vueSelectorThumbnailPopup;
+  const root = document.createElement("div");
+  root.style.position = "fixed";
+  root.style.zIndex = "10000";
+  root.style.display = "none";
+  root.style.width = `${SELECTOR_THUMBNAIL_POPUP_W}px`;
+  root.style.padding = "8px";
+  root.style.boxSizing = "border-box";
+  root.style.border = "1px solid rgba(215,225,245,0.5)";
+  root.style.borderRadius = "6px";
+  root.style.background = "rgba(26,26,31,0.97)";
+  root.style.boxShadow = "0 8px 22px rgba(0,0,0,0.55)";
+  root.style.pointerEvents = "none";
+  const title = document.createElement("div");
+  title.style.marginBottom = "6px";
+  title.style.color = "#ddd";
+  title.style.fontSize = "12px";
+  title.style.overflow = "hidden";
+  title.style.textOverflow = "ellipsis";
+  title.style.whiteSpace = "nowrap";
+  const image = document.createElement("img");
+  image.style.display = "none";
+  image.style.width = "100%";
+  image.style.height = `${SELECTOR_THUMBNAIL_POPUP_H - 36}px`;
+  image.style.objectFit = "contain";
+  const message = document.createElement("div");
+  message.style.height = `${SELECTOR_THUMBNAIL_POPUP_H - 36}px`;
+  message.style.display = "grid";
+  message.style.placeItems = "center";
+  message.style.color = "#bbb";
+  message.style.fontSize = "12px";
+  root.append(title, image, message);
+  document.body.append(root);
+  vueSelectorThumbnailPopup = { root, title, image, message };
+  return vueSelectorThumbnailPopup;
+}
+
+function hideVueSelectorThumbnail(node = null) {
+  if (node && vueSelectorThumbnailOwner !== node) return;
+  if (vueSelectorThumbnailPopup) vueSelectorThumbnailPopup.root.style.display = "none";
+  vueSelectorThumbnailOwner = null;
+  if (node) node.__hpsVueThumbnailCkptName = "";
+}
+
+function syncVueSelectorThumbnailUI(node) {
+  const ckptName = node?.__hpsVueThumbnailCkptName || "";
+  if (!ckptName || vueSelectorThumbnailOwner !== node) return;
+  const popup = ensureVueSelectorThumbnailPopup();
+  const cached = selectorThumbnailCache.get(selectorThumbnailCacheKey(ckptName)) || { status: "loading" };
+  popup.title.textContent = ckptName;
+  if (cached.status === "ready" && cached.image?.src) {
+    popup.image.src = cached.image.src;
+    popup.image.style.display = "block";
+    popup.message.style.display = "none";
+  } else {
+    popup.image.removeAttribute("src");
+    popup.image.style.display = "none";
+    popup.message.style.display = "grid";
+    popup.message.textContent = cached.status === "missing" ? "No sidecar thumbnail" : "Loading thumbnail...";
+  }
+}
+
+function showVueSelectorThumbnail(node, ckptName, anchor) {
+  if (!node || !ckptName || !anchor) return;
+  vueSelectorThumbnailOwner = node;
+  node.__hpsVueThumbnailCkptName = ckptName;
+  setSelectorThumbnailHover(node, ckptName, null, "vue-list");
+  const popup = ensureVueSelectorThumbnailPopup();
+  const rect = anchor.getBoundingClientRect();
+  const width = SELECTOR_THUMBNAIL_POPUP_W;
+  const height = SELECTOR_THUMBNAIL_POPUP_H;
+  const left = rect.right + width + 12 <= window.innerWidth ? rect.right + 12 : Math.max(8, rect.left - width - 12);
+  const top = Math.max(8, Math.min(window.innerHeight - height - 8, rect.top - 8));
+  popup.root.style.left = `${left}px`;
+  popup.root.style.top = `${top}px`;
+  popup.root.style.display = "block";
+  syncVueSelectorThumbnailUI(node);
+}
+
 function syncVueSelectorUI(node) {
   const ui = node?.__hpsVueSelectorUI;
   if (!ui) return;
@@ -2001,6 +2089,8 @@ function syncVueSelectorUI(node) {
       setSelectorSelected(node, value);
       syncVueSelectorUI(node);
     });
+    row.addEventListener("pointerenter", () => showVueSelectorThumbnail(node, value, row));
+    row.addEventListener("focus", () => showVueSelectorThumbnail(node, value, row));
     ui.list.append(row);
   }
   // Rebuilding the rows collapses the scroll height and would otherwise
@@ -2058,6 +2148,7 @@ function buildVueSelectorUI(node) {
   buttons.append(refresh, action, up, down);
   root.append(buttons, status, list);
   stopHpsWidgetEventPropagation(root);
+  root.addEventListener("pointerleave", () => hideVueSelectorThumbnail(node));
   refresh.addEventListener("click", () => void refreshSelector(node, true).finally(() => syncVueSelectorUI(node)));
   up.addEventListener("click", () => uiScrollByRows(node, -SELECTOR_VISIBLE_ROWS));
   down.addEventListener("click", () => uiScrollByRows(node, SELECTOR_VISIBLE_ROWS));
