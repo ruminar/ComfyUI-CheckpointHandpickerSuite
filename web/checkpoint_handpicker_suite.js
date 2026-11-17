@@ -173,7 +173,21 @@ function handleHpsWheelCapture(event) {
     const maxScrollTop = scrollEl.scrollHeight - scrollEl.clientHeight;
     const canScroll = (event.deltaY < 0 && scrollEl.scrollTop > 0)
       || (event.deltaY > 0 && scrollEl.scrollTop < maxScrollTop);
-    if (canScroll) return;
+    if (canScroll) {
+      // Nodes 2.0 consumes wheel events after this window capture phase,
+      // before the browser performs the element's native scrolling. Apply
+      // the scroll here and consume the event so the list always moves.
+      const lineHeight = 16;
+      const delta = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? event.deltaY * lineHeight
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? event.deltaY * scrollEl.clientHeight
+          : event.deltaY;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      scrollEl.scrollTop += delta;
+      return;
+    }
   }
   forwardWheelToGraphCanvas(event);
 }
