@@ -2009,6 +2009,12 @@ function syncVueSelectorUI(node) {
   ui.refresh.disabled = !!node.__hpsLoading;
   ui.action.disabled = !!node.__hpsLoading || !selected;
   ui.action.textContent = selectorActionLabel(node);
+  const directLinkOn = selectorDirectLinkEnabled(node);
+  ui.action.dataset.active = String(directLinkOn);
+  ui.action.setAttribute("aria-pressed", String(directLinkOn));
+  ui.action.style.background = directLinkOn ? "rgba(74,151,105,0.94)" : "";
+  ui.action.style.borderColor = directLinkOn ? "rgba(218,255,227,0.95)" : "";
+  ui.action.style.boxShadow = directLinkOn ? "0 0 0 1px rgba(28,90,48,0.7) inset" : "";
   ui.status.textContent = node.__hpsStatus || "not loaded";
   refreshVueLayoutReclaim(node);
 }
