@@ -41,16 +41,18 @@ JSONは一時ファイルへ完全に書き込んだ後、正式なファイル�
 
 Import対象は、規定形式に一致するファイル名のうち日時文字列が最大のものです。日時が実在するか、未来日付かは検証しません。同一秒のファイルは数値suffixで比較します。選択された最新JSONが壊れていた場合、古いJSONへ自動fallbackせずImportを中止します。
 
+Studioで書き出した `Anima_20261125_153000.json` のようなファイルは、同じディレクトリの直下へコピーし、**Import File…** でファイル名を指定します。規定のファイル名へ変更する必要はありません。この操作では既存評価が変わる場合に件数を示して確認します。確認を取り消した場合は変更を保存しません。
+
 Import先では、Checkpointをファイル名とファイルサイズの完全一致で照合します。
 
 - 一致なし：Missing
-- 複数一致：Ambiguous
+- 複数一致、または一致先の相対パスが別のCheckpointと同じ評価キーになる：Ambiguous
 - 現在の評価が`none`：Imported
 - 現在の評価とImport評価が同じ：Unchanged
-- 現在の評価とImport評価が異なる：Conflict（現在の評価を維持）
+- 現在の評価とImport評価が異なる：自動ImportではConflict。**Import File…** で上書きを確認した場合はImported
 
 有効な変更はまとめて保存され、Import完了後に開いている全ブラウザタブのHandpickerSuite表示へ自動反映されます。
 
-`delete`評価をImportしても、削除予約キューは作成されず、Checkpoint本体も削除されません。後から通常の削除予約を作成したい場合は、`Checkpoint Status Tagger`で`delete`を一度OFFにしてからONにしてください。
+`delete`評価をImportしても、削除予約は新規作成されず、Checkpoint本体も削除されません。`delete`を別の評価で上書きすると、そのCheckpointに残っていた削除予約は取り消します。後から通常の削除予約を作成したい場合は、`Checkpoint Status Tagger`で`delete`を一度OFFにしてからONにしてください。
 
 Checkpoint本体が存在しなくなった`delete`評価は、削除予約が残っていない場合でも`Refresh All`で自動的に評価DBから除去されます。存在しない`god`、`favorite`、`nice`、`keep`評価はバックアップ用途のため保持されます。

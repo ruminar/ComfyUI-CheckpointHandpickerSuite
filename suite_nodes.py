@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import threading
 import time
 import uuid
+from collections import Counter
 from contextvars import ContextVar
 from functools import wraps
 from dataclasses import dataclass
@@ -312,6 +314,16 @@ def _latest_tag_export_path(directory: Path) -> Path | None:
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
+def _named_tag_import_path(directory: Path, file_name: str) -> Path:
+    if (not file_name or any(char in file_name for char in ("/", "\\", ":", "\0"))
+            or not file_name.lower().endswith(".json")):
+        raise ValueError("Specify a JSON file name in Tag Transfer Directory.")
+    candidate = directory / file_name
+    if not candidate.is_file() or candidate.resolve().parent != directory.resolve():
+        raise ValueError("The specified JSON was not found in Tag Transfer Directory.")
+    return candidate
+
+
 def _tag_export_candidate_path(directory: Path, stamp: str, suffix: int) -> Path:
     filename = f"checkpoint_tags_{stamp}.json" if suffix == 0 else f"checkpoint_tags_{stamp}_{suffix}.json"
     return directory / filename
@@ -522,6 +534,11 @@ def _prepare_tag_import(path: Path) -> dict:
         raise ValueError(f"Invalid JSON: {exc.msg}.") from exc
     records, failed, ambiguous = _validate_tag_import_document(document)
     identity_index = _build_current_checkpoint_identity_index()
+    key_counts = Counter(
+        os.path.normcase(candidate["relpath"])
+        for candidates in identity_index.values()
+        for candidate in candidates
+    )
     matches = []
     missing = []
     for record in records:
@@ -537,21 +554,23 @@ def _prepare_tag_import(path: Path) -> dict:
                 "reason": "Multiple checkpoints match this identity.",
             })
             continue
+        if key_counts[os.path.normcase(candidates[0]["relpath"])] > 1:
+            ambiguous.append({**record, "reason": "Multiple checkpoints share this evaluation key."})
+            continue
         matches.append({**record, "relpath": candidates[0]["relpath"]})
     return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed}
 
 
 @_with_evaluation_lock
-def _commit_tag_import(prepared: dict) -> dict:
-    # This is deliberately one synchronous read/merge/write section. No await or
-    # worker hand-off may be inserted here: a Tagger request completed before this
-    # read must win by being observed as current state, while a later Tagger request
-    # naturally wins by writing after this commit.
+def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmation: str = "") -> dict:
+    # Recalculate against the DB under the write lock. Automatic import preserves
+    # existing ratings; explicit import must confirm the current overwrite plan.
     db = _load_status_db(for_write=True)
     statuses = db.setdefault("statuses", {})
     imported = []
     unchanged = []
     conflicts = []
+    applicable = []
     updated_at = _now_iso()
     busy = studio.busy_keys(STATUS_DB_PATH)
     for record in prepared["matches"]:
@@ -564,24 +583,39 @@ def _commit_tag_import(prepared: dict) -> dict:
         if os.path.normcase(relpath) in busy or any(
             key != relpath and os.path.normcase(key) == os.path.normcase(relpath) for key in statuses
         ):
-            conflicts.append({**record, "current": current, "reason": "studio_disposal_or_key_casing"})
+            conflicts.append({**record, "current": current, "import": record["tag"],
+                              "reason": "Checkpoint is being disposed of or its evaluation key uses different casing."})
             continue
-        if current == "none":
-            _cancel_reservation(relpath, "status_imported")
-            statuses[relpath] = {
-                "status": record["tag"],
-                "updated_at": updated_at,
-                "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-            }
-            imported.append(record)
-        elif current == record["tag"]:
+        if current == record["tag"]:
             unchanged.append(record)
+        elif current == "none" or explicit_source:
+            applicable.append((record, current))
         else:
             conflicts.append({**record, "current": current, "import": record["tag"]})
+
+    overwrite_count = sum(current != "none" for _record, current in applicable)
+    if overwrite_count:
+        # Changes to the applicable plan require a new confirmation before any write.
+        signature = json.dumps([explicit_source, applicable], ensure_ascii=True, sort_keys=True)
+        token = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        if confirmation != token:
+            return {"confirmation_required": True, "confirmation": token, "overwrite_count": overwrite_count,
+                    "new_count": len(applicable) - overwrite_count}
+
+    for record, _current in applicable:
+        relpath = record["relpath"]
+        _cancel_reservation(relpath, "status_imported")
+        statuses[relpath] = {
+            "status": record["tag"],
+            "updated_at": updated_at,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+        }
+        imported.append(record)
     if imported:
         _save_status_db(db)
     return {
         "imported_records": imported,
+        "overwrite_count": overwrite_count,
         "unchanged_records": unchanged,
         "conflict_records": conflicts,
         "missing_records": prepared["missing"],
@@ -1140,6 +1174,7 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         str(source.parent),
         "",
         f"Imported:  {len(imported)}",
+        f"  Overwritten: {result['overwrite_count']}",
         f"Unchanged: {len(unchanged)}",
         f"Conflicts: {len(conflicts)}",
         f"Missing:   {len(missing)}",
@@ -1152,6 +1187,7 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         item["file_name"],
         f"Current: {item['current']}",
         f"Import: {item['import']}",
+        *([item["reason"]] if item.get("reason") else []),
         "",
     ])
     _append_limited_detail(lines, "Missing", missing, lambda item: [f"- {item['file_name']}"])
@@ -2956,13 +2992,14 @@ async def tag_transfer_import(request):
             request_data = {}
         try:
             directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=False)
+            file_name = str(request_data.get("file_name") or "").strip()
+            source = _named_tag_import_path(directory, file_name) if file_name else _latest_tag_export_path(directory)
         except ValueError as exc:
             return web.json_response({
                 "ok": False,
                 "error": str(exc),
                 "message": f"Import failed.\n\n{exc}",
             }, status=400)
-        source = _latest_tag_export_path(directory)
         if source is None:
             return web.json_response({
                 "ok": False,
@@ -2977,12 +3014,17 @@ async def tag_transfer_import(request):
                 "ok": False,
                 "error": str(exc),
                 "file_name": source.name,
-                "message": f"Latest export:\n{source.name}\n\nERROR:\n{exc}\n\nImport cancelled.",
+                "message": f"Import file:\n{source.name}\n\nERROR:\n{exc}\n\nImport cancelled.",
             }, status=400)
 
-        # Read the latest DB and commit synchronously only after all slow work is
-        # complete, so Tagger changes made before this point are never overwritten.
-        result = _commit_tag_import(prepared)
+        # Read and confirm against the latest DB while its write lock is held.
+        if file_name:
+            result = _commit_tag_import(prepared, explicit_source=str(source.resolve()),
+                                        confirmation=str(request_data.get("confirmation") or ""))
+        else:
+            result = _commit_tag_import(prepared)
+        if result.get("confirmation_required"):
+            return web.json_response(result)
         revision = _sync_imported_tag_states(result["imported_records"])
         message = _format_tag_import_message(source, result)
         response = {
@@ -2999,6 +3041,7 @@ async def tag_transfer_import(request):
                 for record in result["imported_records"]
             ],
             "imported": len(result["imported_records"]),
+            "overwritten": result["overwrite_count"],
             "unchanged": len(result["unchanged_records"]),
             "conflicts": len(result["conflict_records"]),
             "missing": len(result["missing_records"]),

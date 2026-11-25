@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sys
@@ -175,6 +176,108 @@ class NodeContractTests(unittest.TestCase):
         )
         self.assertEqual((), self.suite.CheckpointStatusTagger.RETURN_TYPES)
         self.assertEqual((), self.suite.EphemeralPreview.RETURN_TYPES)
+
+
+class TagTransferFileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.suite = _load_suite_nodes()
+
+    def test_explicit_file_confirms_again_if_existing_evaluation_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            chosen = directory / "Anima_20261125_153000.json"
+            status = directory / "checkpoint_statuses.json"
+            chosen.write_text(json.dumps({"format_version": 1, "evaluations": [
+                {"file_name": "a.safetensors", "file_size": 7, "tag": "delete"},
+            ]}), encoding="utf-8")
+            status.write_text(json.dumps({"version": 1, "statuses": {"nested/a.safetensors": {"status": "keep"}}}),
+                              encoding="utf-8")
+            checkpoint_index = {("a.safetensors", 7): [{"relpath": "nested/a.safetensors"}]}
+            queue = directory / "checkpoint_delete_queue.jsonl"
+
+            class Request:
+                def __init__(self, **values):
+                    self.values = values
+
+                async def json(self):
+                    return {"directory": str(directory), **self.values}
+
+            with (
+                patch.object(self.suite, "STATUS_DB_PATH", status),
+                patch.object(self.suite, "FAVORITES_COMPAT_PATH", directory / "checkpoint_favorites.json"),
+                patch.object(self.suite, "DELETE_QUEUE_PATH", queue),
+                patch.object(self.suite, "_build_current_checkpoint_identity_index", return_value=checkpoint_index),
+                patch.object(self.suite, "_sync_imported_tag_states", return_value=1),
+            ):
+                auto = asyncio.run(self.suite.tag_transfer_import(Request()))
+                self.assertEqual(404, auto["status"])
+                standard = directory / "checkpoint_tags_20261125_153000.json"
+                standard.write_bytes(chosen.read_bytes())
+                auto = asyncio.run(self.suite.tag_transfer_import(Request()))["payload"]
+                self.assertEqual(1, auto["conflicts"])
+                preview = asyncio.run(self.suite.tag_transfer_import(Request(file_name=chosen.name)))["payload"]
+                self.assertEqual(1, preview["overwrite_count"])
+                self.assertIn('"keep"', status.read_text(encoding="utf-8"))
+
+                status.write_text(json.dumps({"version": 1, "statuses": {"nested/a.safetensors": {"status": "nice"}}}),
+                                  encoding="utf-8")
+                renewed = asyncio.run(self.suite.tag_transfer_import(
+                    Request(file_name=chosen.name, confirmation=preview["confirmation"])))["payload"]
+                self.assertTrue(renewed["confirmation_required"])
+                self.assertNotEqual(preview["confirmation"], renewed["confirmation"])
+                self.assertIn('"nice"', status.read_text(encoding="utf-8"))
+
+                result = asyncio.run(self.suite.tag_transfer_import(
+                    Request(file_name=chosen.name, confirmation=renewed["confirmation"])))["payload"]
+                self.assertEqual(1, result["imported"])
+                self.assertEqual(1, result["overwritten"])
+                self.assertIn('"delete"', status.read_text(encoding="utf-8"))
+                self.assertFalse(queue.exists())
+
+    def test_import_rejects_unique_identity_with_shared_evaluation_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            chosen = Path(temporary) / "Anima_20261125_153000.json"
+            chosen.write_text(json.dumps({"format_version": 1, "evaluations": [
+                {"file_name": "a.safetensors", "file_size": 7, "tag": "keep"},
+            ]}), encoding="utf-8")
+            index = {
+                ("a.safetensors", 7): [{"relpath": "a.safetensors", "path": "first/a.safetensors"}],
+                ("a.safetensors", 8): [{"relpath": "a.safetensors", "path": "second/a.safetensors"}],
+            }
+            with patch.object(self.suite, "_build_current_checkpoint_identity_index", return_value=index):
+                result = self.suite._prepare_tag_import(chosen)
+            self.assertFalse(result["matches"])
+            self.assertEqual(1, len(result["ambiguous"]))
+
+    def test_confirmed_overwrite_cancels_old_delete_reservation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            status = directory / "checkpoint_statuses.json"
+            queue = directory / "checkpoint_delete_queue.jsonl"
+            status.write_text(json.dumps({"version": 1, "statuses": {"a.safetensors": {"status": "delete"}}}),
+                              encoding="utf-8")
+            self.suite.studio.append_reservation(queue, {"type": "reserve", "id": "old", "ckpt_name_str": "a.safetensors"})
+            prepared = {"matches": [{"file_name": "a.safetensors", "file_size": 7, "tag": "keep",
+                                     "relpath": "a.safetensors"}], "missing": [], "ambiguous": [], "failed": []}
+            with (
+                patch.object(self.suite, "STATUS_DB_PATH", status),
+                patch.object(self.suite, "DELETE_QUEUE_PATH", queue),
+                patch.object(self.suite, "FAVORITES_COMPAT_PATH", directory / "checkpoint_favorites.json"),
+            ):
+                source = str(directory / "Anima.json")
+                preview = self.suite._commit_tag_import(prepared, explicit_source=source)
+                self.assertIn("a.safetensors", self.suite.studio.active_reservations(queue))
+                result = self.suite._commit_tag_import(prepared, explicit_source=source, confirmation=preview["confirmation"])
+                self.assertEqual(1, result["overwrite_count"])
+                self.assertEqual("keep", self.suite._get_status("a.safetensors"))
+                self.assertEqual({}, self.suite.studio.active_reservations(queue))
+
+    def test_named_import_rejects_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("../outside.json", "folder\\outside.json", "C:outside.json", "Anima.txt"):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    self.suite._named_tag_import_path(Path(temporary), name)
 
 
 class StudioIntegrationTests(unittest.TestCase):
