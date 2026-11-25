@@ -193,7 +193,9 @@ class TagTransferFileTests(unittest.TestCase):
             ]}), encoding="utf-8")
             status.write_text(json.dumps({"version": 1, "statuses": {"nested/a.safetensors": {"status": "keep"}}}),
                               encoding="utf-8")
-            checkpoint_index = {("a.safetensors", 7): [{"relpath": "nested/a.safetensors"}]}
+            models = directory / "models"
+            (models / "nested").mkdir(parents=True)
+            (models / "nested/a.safetensors").write_bytes(b"1234567")
             queue = directory / "checkpoint_delete_queue.jsonl"
 
             class Request:
@@ -207,7 +209,7 @@ class TagTransferFileTests(unittest.TestCase):
                 patch.object(self.suite, "STATUS_DB_PATH", status),
                 patch.object(self.suite, "FAVORITES_COMPAT_PATH", directory / "checkpoint_favorites.json"),
                 patch.object(self.suite, "DELETE_QUEUE_PATH", queue),
-                patch.object(self.suite, "_build_current_checkpoint_identity_index", return_value=checkpoint_index),
+                patch.object(self.suite, "_checkpoint_roots", return_value=[models]),
                 patch.object(self.suite, "_sync_imported_tag_states", return_value=1),
             ):
                 auto = asyncio.run(self.suite.tag_transfer_import(Request()))
@@ -258,8 +260,11 @@ class TagTransferFileTests(unittest.TestCase):
             status.write_text(json.dumps({"version": 1, "statuses": {"a.safetensors": {"status": "delete"}}}),
                               encoding="utf-8")
             self.suite.studio.append_reservation(queue, {"type": "reserve", "id": "old", "ckpt_name_str": "a.safetensors"})
+            model = directory / "a.safetensors"
+            model.write_bytes(b"1234567")
             prepared = {"matches": [{"file_name": "a.safetensors", "file_size": 7, "tag": "keep",
-                                     "relpath": "a.safetensors"}], "missing": [], "ambiguous": [], "failed": []}
+                                     "relpath": model.name, "path": str(model.resolve())}],
+                        "missing": [], "ambiguous": [], "failed": [], "source_digest": "test-digest"}
             with (
                 patch.object(self.suite, "STATUS_DB_PATH", status),
                 patch.object(self.suite, "DELETE_QUEUE_PATH", queue),
@@ -272,6 +277,99 @@ class TagTransferFileTests(unittest.TestCase):
                 self.assertEqual(1, result["overwrite_count"])
                 self.assertEqual("keep", self.suite._get_status("a.safetensors"))
                 self.assertEqual({}, self.suite.studio.active_reservations(queue))
+
+    def test_import_failure_and_confirmation_regressions(self):
+        for case in ("changed_json", "same_plan_new_json", "changed_checkpoint", "save_failure",
+                     "cancel_failure", "stale_reservation"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary).resolve()
+                root = directory / "models"
+                root.mkdir()
+                model = root / "a.safetensors"
+                other = root / "b.safetensors"
+                model.write_bytes(b"123")
+                other.write_bytes(b"1234")
+                chosen = directory / "Anima.json"
+                status = directory / "checkpoint_statuses.json"
+                queue = directory / "checkpoint_delete_queue.jsonl"
+
+                def write_export(path, size, tag):
+                    chosen.write_text(json.dumps({"format_version": 1, "evaluations": [
+                        {"file_name": path.name, "file_size": size, "tag": tag},
+                    ]}), encoding="utf-8")
+
+                class Request:
+                    def __init__(self, **values):
+                        self.values = values
+
+                    async def json(self):
+                        return {"directory": str(directory), "file_name": chosen.name, **self.values}
+
+                def run(**values):
+                    return asyncio.run(self.suite.tag_transfer_import(Request(**values)))
+
+                current = "none" if case == "stale_reservation" else "delete"
+                status.write_text(json.dumps({"version": 1, "statuses": {model.name: {"status": current}}}),
+                                  encoding="utf-8")
+                self.suite.studio.append_reservation(queue, {"type": "reserve", "id": "old", "ckpt_name_str": model.name})
+                old_status = status.read_bytes()
+                old_queue = queue.read_bytes()
+                with patch.multiple(self.suite, STATUS_DB_PATH=status, DELETE_QUEUE_PATH=queue,
+                                    FAVORITES_COMPAT_PATH=directory / "favorites.json",
+                                    _checkpoint_roots=lambda: [root]):
+                    if case == "stale_reservation":
+                        write_export(model, 3, "delete")
+                        self.assertEqual(1, run()["payload"]["conflicts"])
+                    else:
+                        write_export(model, 3, "keep")
+                        preview = run()["payload"]
+                        confirmed = {"confirmation": preview["confirmation"]}
+                        if case == "changed_json":
+                            write_export(other, 4, "nice")
+                            result = run(**confirmed)["payload"]
+                            self.assertTrue(result["confirmation_required"])
+                            self.assertTrue(result["plan_changed"])
+                            self.assertEqual((0, 1), (result["overwrite_count"], result["new_count"]))
+                            self.assertEqual(old_status, status.read_bytes())
+                            applied = run(confirmation=result["confirmation"])["payload"]
+                            self.assertEqual(1, applied["imported"])
+                            self.assertEqual("nice", self.suite._get_status(other.name))
+                            self.assertEqual("delete", self.suite._get_status(model.name))
+                        elif case == "same_plan_new_json":
+                            document = json.loads(chosen.read_text(encoding="utf-8"))
+                            document["exported_at"] = "2026-11-26T20:00:00+09:00"
+                            chosen.write_text(json.dumps(document), encoding="utf-8")
+                            result = run(**confirmed)["payload"]
+                            self.assertTrue(result["confirmation_required"])
+                            self.assertNotEqual(preview["confirmation"], result["confirmation"])
+                        elif case == "changed_checkpoint":
+                            prepare = self.suite._prepare_tag_import
+
+                            def prepare_then_replace(path):
+                                prepared = prepare(path)
+                                replacement = root / "replacement.tmp"
+                                replacement.write_bytes(b"changed length")
+                                replacement.replace(model)
+                                return prepared
+
+                            with patch.object(self.suite, "_prepare_tag_import", side_effect=prepare_then_replace):
+                                result = run(**confirmed)["payload"]
+                            self.assertEqual((0, 1), (result["imported"], result["failed"]))
+                        elif case == "save_failure":
+                            with (patch.object(self.suite.studio, "write_json", side_effect=OSError("DB unavailable")),
+                                  self.assertLogs(self.suite.logger, "ERROR")):
+                                self.assertEqual(500, run(**confirmed)["status"])
+                        else:
+                            with (patch.object(self.suite, "_append_delete_record", side_effect=OSError("Queue unavailable")),
+                                  self.assertLogs(self.suite.logger, "WARNING")):
+                                result = run(**confirmed)["payload"]
+                            self.assertTrue(result["ok"])
+                            self.assertEqual("keep", self.suite._get_status(model.name))
+                            self.assertEqual(1, len(result["reservation_warnings"]))
+                            self.assertIn("cleanup failed", result["message"])
+                if case not in ("cancel_failure", "changed_json"):
+                    self.assertEqual(old_status, status.read_bytes())
+                self.assertEqual(old_queue, queue.read_bytes())
 
     def test_named_import_rejects_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

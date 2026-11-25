@@ -8,6 +8,7 @@ import math
 import os
 import random
 import re
+import stat
 import threading
 import time
 import uuid
@@ -528,8 +529,9 @@ def _validate_tag_import_document(document) -> tuple[list[dict], list[dict], lis
 
 
 def _prepare_tag_import(path: Path) -> dict:
+    content = path.read_bytes()
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(content.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON: {exc.msg}.") from exc
     records, failed, ambiguous = _validate_tag_import_document(document)
@@ -557,8 +559,20 @@ def _prepare_tag_import(path: Path) -> dict:
         if key_counts[os.path.normcase(candidates[0]["relpath"])] > 1:
             ambiguous.append({**record, "reason": "Multiple checkpoints share this evaluation key."})
             continue
-        matches.append({**record, "relpath": candidates[0]["relpath"]})
-    return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed}
+        matches.append({**record, "relpath": candidates[0]["relpath"], "path": candidates[0]["path"]})
+    return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed,
+            "source_digest": hashlib.sha256(content).hexdigest()}
+
+
+def _tag_import_target_matches(record: dict) -> bool:
+    path = Path(record["path"])
+    try:
+        if path.resolve(strict=True) != path or path.name != record["file_name"]:
+            return False
+        info = path.stat()
+        return stat.S_ISREG(info.st_mode) and info.st_size == record["file_size"]
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 @_with_evaluation_lock
@@ -571,6 +585,9 @@ def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmatio
     unchanged = []
     conflicts = []
     applicable = []
+    failed = list(prepared["failed"])
+    reservation_warnings = []
+    reserved_keys = None
     updated_at = _now_iso()
     busy = studio.busy_keys(STATUS_DB_PATH)
     for record in prepared["matches"]:
@@ -589,22 +606,38 @@ def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmatio
         if current == record["tag"]:
             unchanged.append(record)
         elif current == "none" or explicit_source:
+            if record["tag"] == "delete":
+                if reserved_keys is None:
+                    reserved_keys = {os.path.normcase(key) for key in _active_delete_records(strict=True)}
+                if os.path.normcase(relpath) in reserved_keys:
+                    conflicts.append({**record, "current": current, "import": record["tag"],
+                                      "reason": "Importing delete could reactivate an existing deletion reservation."})
+                    continue
             applicable.append((record, current))
         else:
             conflicts.append({**record, "current": current, "import": record["tag"]})
 
+    verified = []
+    for record, current in applicable:
+        if _tag_import_target_matches(record):
+            verified.append((record, current))
+        else:
+            failed.append({**record, "reason": "Checkpoint disappeared or no longer matches its file name and size."})
+    applicable = verified
+
     overwrite_count = sum(current != "none" for _record, current in applicable)
-    if overwrite_count:
-        # Changes to the applicable plan require a new confirmation before any write.
-        signature = json.dumps([explicit_source, applicable], ensure_ascii=True, sort_keys=True)
+    if overwrite_count or (explicit_source and confirmation and applicable):
+        # A previous confirmation never authorizes a changed file or plan, even
+        # if the revised plan now consists only of new evaluations.
+        signature = json.dumps([explicit_source, prepared["source_digest"], applicable],
+                               ensure_ascii=True, sort_keys=True)
         token = hashlib.sha256(signature.encode("utf-8")).hexdigest()
         if confirmation != token:
             return {"confirmation_required": True, "confirmation": token, "overwrite_count": overwrite_count,
-                    "new_count": len(applicable) - overwrite_count}
+                    "new_count": len(applicable) - overwrite_count, "plan_changed": bool(confirmation)}
 
     for record, _current in applicable:
         relpath = record["relpath"]
-        _cancel_reservation(relpath, "status_imported")
         statuses[relpath] = {
             "status": record["tag"],
             "updated_at": updated_at,
@@ -613,6 +646,17 @@ def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmatio
         imported.append(record)
     if imported:
         _save_status_db(db)
+        # The compatible deletion script checks the saved evaluation under this
+        # same lock. Once it is no longer delete, a leftover reservation cannot run.
+        for record in imported:
+            if record["tag"] == "delete":
+                continue
+            try:
+                _cancel_reservation(record["relpath"], "status_imported")
+            except (OSError, ValueError) as exc:
+                logger.warning("Evaluation saved but could not cancel deletion reservation for %s",
+                               record["relpath"], exc_info=True)
+                reservation_warnings.append({"relpath": record["relpath"], "reason": str(exc)})
     return {
         "imported_records": imported,
         "overwrite_count": overwrite_count,
@@ -620,7 +664,8 @@ def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmatio
         "conflict_records": conflicts,
         "missing_records": prepared["missing"],
         "ambiguous_records": prepared["ambiguous"],
-        "failed_records": prepared["failed"],
+        "failed_records": failed,
+        "reservation_warnings": reservation_warnings,
     }
 
 
@@ -1200,6 +1245,9 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         f"- {item.get('file_name', '(unknown)')}",
         f"  {item.get('reason', '')}",
     ])
+    warnings = result["reservation_warnings"]
+    _append_limited_detail(lines, f"Warning: evaluations saved, deletion reservation cleanup failed ({len(warnings)})",
+                           warnings, lambda item: [f"- {item['relpath']}", f"  {item['reason']}"])
     if any(record.get("tag") == "delete" for record in imported):
         lines.extend([
             "",
@@ -3047,6 +3095,7 @@ async def tag_transfer_import(request):
             "missing": len(result["missing_records"]),
             "ambiguous": len(result["ambiguous_records"]),
             "failed": len(result["failed_records"]),
+            "reservation_warnings": result["reservation_warnings"],
             "revision": revision,
         }
         logger.info(

@@ -3126,7 +3126,8 @@ async function runTagTransfer(node, operation, fileName = "") {
       });
       result = await response.json().catch(() => null);
       if (!result?.confirmation_required) break;
-      const message = `${fileName}\n\nOverwrite ${result.overwrite_count} existing evaluation(s) and add ${result.new_count} new evaluation(s)?`;
+      const note = result.plan_changed ? "The file or evaluations to apply have changed.\n\n" : "";
+      const message = `${fileName}\n\n${note}Overwrite ${result.overwrite_count} existing evaluation(s) and add ${result.new_count} new evaluation(s)?`;
       if (!window.confirm(message)) {
         node.__hpsTagTransferResult = "Import cancelled.";
         return;
