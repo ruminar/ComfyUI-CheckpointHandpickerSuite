@@ -177,5 +177,41 @@ class NodeContractTests(unittest.TestCase):
         self.assertEqual((), self.suite.EphemeralPreview.RETURN_TYPES)
 
 
+class StudioIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.suite = _load_suite_nodes()
+
+    def test_versionless_status_database_is_accepted_for_v1_upgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "checkpoint_statuses.json"
+            status_path.write_text(json.dumps({"statuses": {"a.safetensors": {"status": "favorite"}}}), encoding="utf-8")
+            with patch.object(self.suite, "STATUS_DB_PATH", status_path):
+                self.assertEqual(
+                    {"version": 1, "statuses": {"a.safetensors": {"status": "favorite"}}},
+                    self.suite._load_status_db(for_write=True),
+                )
+
+    def test_delete_script_uses_its_sibling_bridge_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            script_dir = Path(temporary)
+            script_path = script_dir / "checkpoint_delete.py"
+            queue_path = script_dir / "checkpoint_delete_queue.jsonl"
+            with (
+                patch.object(self.suite, "DELETE_SCRIPT_DIR", script_dir),
+                patch.object(self.suite, "DELETE_SCRIPT_PATH", script_path),
+                patch.object(self.suite, "DELETE_QUEUE_PATH", queue_path),
+                patch.object(self.suite, "_checkpoint_roots", return_value=[]),
+            ):
+                self.suite._write_delete_script()
+
+            script = script_path.read_text(encoding="utf-8")
+            bridge_copy = script_dir / "checkpoint_studio_bridge.py"
+            self.assertTrue(bridge_copy.is_file())
+            self.assertIn("sys.path.insert(0, str(SCRIPT_DIR))", script)
+            self.assertNotIn(f"sys.path.insert(0, {str(self.suite.NODE_DIR)!r})", script)
+            compile(script, str(script_path), "exec")
+
+
 if __name__ == "__main__":
     unittest.main()
