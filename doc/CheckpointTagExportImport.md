@@ -35,20 +35,24 @@ Temporary files are unique, and a short-lived reservation prevents simultaneous 
 
 ## Import
 
+To import a Studio file such as `Anima_20261125_153000.json`, copy it directly into Tag Transfer Directory and enter its name with **Import File…**. This action asks before overwriting existing evaluations. Cancelling leaves the database unchanged. The regular **Import** button still uses the latest standard-named file and preserves existing evaluations on conflict.
+
 Copy an exported JSON file into `output/CheckpointHandpickerSuite/` and click `Import`.
 
 Import selects the matching filename with the greatest timestamp string. Timestamp validity and future dates are not checked. A numeric suffix resolves exports created in the same second. If the selected file is invalid, Import stops and does not fall back.
 
+If the JSON content or the changes to be applied differ from the approved import, the old confirmation cannot authorize a write. Confirm again if there are still changes to apply. Checkpoint names and sizes are rechecked before saving; targets that disappeared or changed size are reported as Failed.
+
 Current checkpoints are matched by exact file name and file size:
 
 - no match: Missing;
-- multiple matches: Ambiguous;
+- multiple matches, or a matched checkpoint that shares its evaluation key with another checkpoint: Ambiguous;
 - current tag is `none`: Imported;
 - current tag equals the imported tag: Unchanged;
-- current tag differs: Conflict, and the current tag is preserved.
+- current tag differs: regular Import reports a conflict. Import File applies the evaluation after you confirm the overwrite.
 
 All valid changes are saved together. HandpickerSuite state is then refreshed automatically in every open browser tab.
 
-An imported `delete` tag never creates a deletion reservation and never deletes a file. Toggle `delete` OFF and ON in `Checkpoint Status Tagger` if you later want to create the normal deletion reservation.
+An imported `delete` tag never creates a deletion reservation and never deletes a file. Applying a new `delete` tag is skipped if it could reactivate an existing reservation. Overwriting a `delete` tag with another tag cancels any existing reservation after the evaluation is saved. If cancellation fails, it is reported separately as a warning. Toggle `delete` OFF and ON in `Checkpoint Status Tagger` if you later want to create the normal deletion reservation.
 
 `Refresh All` removes a `delete` tag automatically after its checkpoint file no longer exists, even when no deletion reservation remains. Missing `god`, `favorite`, `nice`, and `keep` evaluations are preserved.

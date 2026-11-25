@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -7,9 +8,13 @@ import math
 import os
 import random
 import re
+import stat
 import threading
 import time
 import uuid
+from collections import Counter
+from contextvars import ContextVar
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -19,6 +24,11 @@ import numpy as np
 from aiohttp import web
 from PIL import Image, ImageOps
 from server import PromptServer
+
+try:
+    from . import checkpoint_studio_bridge as studio
+except ImportError:
+    import checkpoint_studio_bridge as studio
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +57,10 @@ NODE_DIR = Path(__file__).resolve().parent
 DATA_DIR = NODE_DIR / "data"
 STATUS_DB_PATH = DATA_DIR / "checkpoint_statuses.json"
 FAVORITES_COMPAT_PATH = DATA_DIR / "checkpoint_favorites.json"
+_STUDIO_SYNC_LOCK = threading.Lock()
+_CYCLE_RATINGS = ContextVar("checkpoint_handpicker_cycle_ratings", default=None)
+_last_cycle_ratings = {}
+
 try:
     OUTPUT_DIR = Path(folder_paths.get_output_directory()).resolve()
 except Exception:
@@ -135,27 +149,49 @@ def _ckpt_name_safe_from_relpath(value: str) -> str:
 
 
 def _safe_json_write(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    studio.write_json(path, data)
 
 
-def _load_status_db() -> dict:
-    _ensure_data_dir()
-    if not STATUS_DB_PATH.exists():
-        return {"version": 1, "statuses": {}}
+def _studio_manifest() -> Path:
+    return STATUS_DB_PATH.with_name("checkpoint_studio.json")
+
+
+def _load_versionless_status_db() -> dict | None:
+    """Read the only pre-Studio schema accepted for an in-place v1 upgrade."""
     try:
-        data = json.loads(STATUS_DB_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("root must be object")
-        statuses = data.setdefault("statuses", {})
-        if not isinstance(statuses, dict):
-            data["statuses"] = {}
-        data.setdefault("version", 1)
-        return data
-    except Exception:
-        logger.exception("Failed to read checkpoint_statuses.json; using empty database")
+        data = json.loads(STATUS_DB_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "version" in data or not isinstance(data.get("statuses"), dict):
+        return None
+
+    normalized_keys = set()
+    for relpath, entry in data["statuses"].items():
+        normalized = os.path.normcase(relpath) if isinstance(relpath, str) else ""
+        if (not normalized or normalized in normalized_keys or not isinstance(entry, dict)
+                or entry.get("status") not in STATUS_VALUES):
+            return None
+        normalized_keys.add(normalized)
+    data["version"] = 1
+    return data
+
+
+def _load_status_db(*, for_write=False) -> dict:
+    try:
+        return studio.load_database(STATUS_DB_PATH, allow_missing=not _studio_manifest().exists())
+    except ValueError:
+        legacy = _load_versionless_status_db()
+        if legacy is not None:
+            logger.info("Upgrading versionless checkpoint status database to v1 on its next write")
+            return legacy
+        if for_write:
+            raise
+        logger.warning("Could not read checkpoint_statuses.json", exc_info=True)
+        return {"version": 1, "statuses": {}}
+    except OSError:
+        if for_write:
+            raise
+        logger.warning("Could not read checkpoint_statuses.json", exc_info=True)
         return {"version": 1, "statuses": {}}
 
 
@@ -170,34 +206,76 @@ def _save_status_db(data: dict):
                 "favorited_at": entry.get("updated_at", _now_iso()),
                 "last_seen_at": entry.get("updated_at", _now_iso()),
             }
-    _safe_json_write(FAVORITES_COMPAT_PATH, {"version": 1, "favorites": favorites})
+    try:
+        _safe_json_write(FAVORITES_COMPAT_PATH, {"version": 1, "favorites": favorites})
+    except OSError:
+        logger.warning("Checkpoint evaluations saved; favorite compatibility data needs regeneration", exc_info=True)
 
 
 def _get_status(relpath: str) -> str:
     relpath = _normalize_relpath(relpath)
-    db = _load_status_db()
-    entry = db.get("statuses", {}).get(relpath) or {}
-    status = entry.get("status", "none")
-    return status if status in STATUS_VALUES else "none"
+    statuses = _CYCLE_RATINGS.get()
+    if statuses is None:
+        statuses = _load_status_db()["statuses"]
+    return (statuses.get(relpath) or {}).get("status", "none")
+
+
+def _update_status(db, relpath, status):
+    statuses = db["statuses"]
+    if any(key != relpath and os.path.normcase(key) == os.path.normcase(relpath) for key in statuses):
+        raise ValueError("Checkpoint evaluation key uses different casing.")
+    if status == "none":
+        statuses.pop(relpath, None)
+    else:
+        entry = statuses.setdefault(relpath, {})
+        entry.update(status=status, updated_at=_now_iso(), ckpt_name_safe=_ckpt_name_safe_from_relpath(relpath))
+    _save_status_db(db)
 
 
 def _set_status(relpath: str, status: str):
     relpath = _normalize_relpath(relpath)
-    if not _is_valid_checkpoint_relpath(relpath):
-        raise ValueError("Invalid checkpoint path")
-    if status not in STATUS_VALUES:
-        raise ValueError(f"Invalid status: {status}")
-    db = _load_status_db()
-    statuses = db.setdefault("statuses", {})
-    if status == "none":
-        statuses.pop(relpath, None)
-    else:
-        statuses[relpath] = {
-            "status": status,
-            "updated_at": _now_iso(),
-            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-        }
-    _save_status_db(db)
+    if not _is_valid_checkpoint_relpath(relpath) or status not in STATUS_VALUES:
+        raise ValueError("Invalid checkpoint path or status.")
+    with studio.evaluation_lock(STATUS_DB_PATH):
+        studio.ensure_idle(STATUS_DB_PATH, relpath)
+        db = _load_status_db(for_write=True)
+        _cancel_reservation(relpath, "status_changed_to_" + status)
+        _update_status(db, relpath, status)
+
+
+def _with_evaluation_lock(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with studio.evaluation_lock(STATUS_DB_PATH):
+            return function(*args, **kwargs)
+    return wrapped
+
+
+def _with_cycle_ratings(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        global _last_cycle_ratings
+        with _STUDIO_SYNC_LOCK:
+            try:
+                ratings = studio.load_database(STATUS_DB_PATH, allow_missing=not _studio_manifest().exists())["statuses"]
+                previous = _last_cycle_ratings
+                changes = {
+                    key: ratings.get(key, {}).get("status", "none")
+                    for key in previous.keys() | ratings.keys()
+                    if previous.get(key, {}).get("status") != ratings.get(key, {}).get("status")
+                }
+                _last_cycle_ratings = ratings
+                if changes:
+                    _sync_tag_status_changes(changes)
+            except (OSError, ValueError):
+                logger.warning("Could not refresh checkpoint evaluations for Cycler", exc_info=True)
+                ratings = _last_cycle_ratings
+        token = _CYCLE_RATINGS.set(ratings)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _CYCLE_RATINGS.reset(token)
+    return wrapped
 
 
 def _tag_export_filename_key(path: Path):
@@ -235,6 +313,16 @@ def _latest_tag_export_path(directory: Path) -> Path | None:
         if key is not None:
             candidates.append((key, path))
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _named_tag_import_path(directory: Path, file_name: str) -> Path:
+    if (not file_name or any(char in file_name for char in ("/", "\\", ":", "\0"))
+            or not file_name.lower().endswith(".json")):
+        raise ValueError("Specify a JSON file name in Tag Transfer Directory.")
+    candidate = directory / file_name
+    if not candidate.is_file() or candidate.resolve().parent != directory.resolve():
+        raise ValueError("The specified JSON was not found in Tag Transfer Directory.")
+    return candidate
 
 
 def _tag_export_candidate_path(directory: Path, stamp: str, suffix: int) -> Path:
@@ -441,12 +529,18 @@ def _validate_tag_import_document(document) -> tuple[list[dict], list[dict], lis
 
 
 def _prepare_tag_import(path: Path) -> dict:
+    content = path.read_bytes()
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(content.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON: {exc.msg}.") from exc
     records, failed, ambiguous = _validate_tag_import_document(document)
     identity_index = _build_current_checkpoint_identity_index()
+    key_counts = Counter(
+        os.path.normcase(candidate["relpath"])
+        for candidates in identity_index.values()
+        for candidate in candidates
+    )
     matches = []
     missing = []
     for record in records:
@@ -462,21 +556,40 @@ def _prepare_tag_import(path: Path) -> dict:
                 "reason": "Multiple checkpoints match this identity.",
             })
             continue
-        matches.append({**record, "relpath": candidates[0]["relpath"]})
-    return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed}
+        if key_counts[os.path.normcase(candidates[0]["relpath"])] > 1:
+            ambiguous.append({**record, "reason": "Multiple checkpoints share this evaluation key."})
+            continue
+        matches.append({**record, "relpath": candidates[0]["relpath"], "path": candidates[0]["path"]})
+    return {"matches": matches, "missing": missing, "ambiguous": ambiguous, "failed": failed,
+            "source_digest": hashlib.sha256(content).hexdigest()}
 
 
-def _commit_tag_import(prepared: dict) -> dict:
-    # This is deliberately one synchronous read/merge/write section. No await or
-    # worker hand-off may be inserted here: a Tagger request completed before this
-    # read must win by being observed as current state, while a later Tagger request
-    # naturally wins by writing after this commit.
-    db = _load_status_db()
+def _tag_import_target_matches(record: dict) -> bool:
+    path = Path(record["path"])
+    try:
+        if path.resolve(strict=True) != path or path.name != record["file_name"]:
+            return False
+        info = path.stat()
+        return stat.S_ISREG(info.st_mode) and info.st_size == record["file_size"]
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+@_with_evaluation_lock
+def _commit_tag_import(prepared: dict, *, explicit_source: str = "", confirmation: str = "") -> dict:
+    # Recalculate against the DB under the write lock. Automatic import preserves
+    # existing ratings; explicit import must confirm the current overwrite plan.
+    db = _load_status_db(for_write=True)
     statuses = db.setdefault("statuses", {})
     imported = []
     unchanged = []
     conflicts = []
+    applicable = []
+    failed = list(prepared["failed"])
+    reservation_warnings = []
+    reserved_keys = None
     updated_at = _now_iso()
+    busy = studio.busy_keys(STATUS_DB_PATH)
     for record in prepared["matches"]:
         relpath = record["relpath"]
         raw_current = statuses.get(relpath)
@@ -484,26 +597,75 @@ def _commit_tag_import(prepared: dict) -> dict:
         current = current_entry.get("status", "none")
         if current not in STATUS_VALUES:
             current = "none"
-        if current == "none":
-            statuses[relpath] = {
-                "status": record["tag"],
-                "updated_at": updated_at,
-                "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
-            }
-            imported.append(record)
-        elif current == record["tag"]:
+        if os.path.normcase(relpath) in busy or any(
+            key != relpath and os.path.normcase(key) == os.path.normcase(relpath) for key in statuses
+        ):
+            conflicts.append({**record, "current": current, "import": record["tag"],
+                              "reason": "Checkpoint is being disposed of or its evaluation key uses different casing."})
+            continue
+        if current == record["tag"]:
             unchanged.append(record)
+        elif current == "none" or explicit_source:
+            if record["tag"] == "delete":
+                if reserved_keys is None:
+                    reserved_keys = {os.path.normcase(key) for key in _active_delete_records(strict=True)}
+                if os.path.normcase(relpath) in reserved_keys:
+                    conflicts.append({**record, "current": current, "import": record["tag"],
+                                      "reason": "Importing delete could reactivate an existing deletion reservation."})
+                    continue
+            applicable.append((record, current))
         else:
             conflicts.append({**record, "current": current, "import": record["tag"]})
+
+    verified = []
+    for record, current in applicable:
+        if _tag_import_target_matches(record):
+            verified.append((record, current))
+        else:
+            failed.append({**record, "reason": "Checkpoint disappeared or no longer matches its file name and size."})
+    applicable = verified
+
+    overwrite_count = sum(current != "none" for _record, current in applicable)
+    if overwrite_count or (explicit_source and confirmation and applicable):
+        # A previous confirmation never authorizes a changed file or plan, even
+        # if the revised plan now consists only of new evaluations.
+        signature = json.dumps([explicit_source, prepared["source_digest"], applicable],
+                               ensure_ascii=True, sort_keys=True)
+        token = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        if confirmation != token:
+            return {"confirmation_required": True, "confirmation": token, "overwrite_count": overwrite_count,
+                    "new_count": len(applicable) - overwrite_count, "plan_changed": bool(confirmation)}
+
+    for record, _current in applicable:
+        relpath = record["relpath"]
+        statuses[relpath] = {
+            "status": record["tag"],
+            "updated_at": updated_at,
+            "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
+        }
+        imported.append(record)
     if imported:
         _save_status_db(db)
+        # The compatible deletion script checks the saved evaluation under this
+        # same lock. Once it is no longer delete, a leftover reservation cannot run.
+        for record in imported:
+            if record["tag"] == "delete":
+                continue
+            try:
+                _cancel_reservation(record["relpath"], "status_imported")
+            except (OSError, ValueError) as exc:
+                logger.warning("Evaluation saved but could not cancel deletion reservation for %s",
+                               record["relpath"], exc_info=True)
+                reservation_warnings.append({"relpath": record["relpath"], "reason": str(exc)})
     return {
         "imported_records": imported,
+        "overwrite_count": overwrite_count,
         "unchanged_records": unchanged,
         "conflict_records": conflicts,
         "missing_records": prepared["missing"],
         "ambiguous_records": prepared["ambiguous"],
-        "failed_records": prepared["failed"],
+        "failed_records": failed,
+        "reservation_warnings": reservation_warnings,
     }
 
 
@@ -1057,6 +1219,7 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         str(source.parent),
         "",
         f"Imported:  {len(imported)}",
+        f"  Overwritten: {result['overwrite_count']}",
         f"Unchanged: {len(unchanged)}",
         f"Conflicts: {len(conflicts)}",
         f"Missing:   {len(missing)}",
@@ -1069,6 +1232,7 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         item["file_name"],
         f"Current: {item['current']}",
         f"Import: {item['import']}",
+        *([item["reason"]] if item.get("reason") else []),
         "",
     ])
     _append_limited_detail(lines, "Missing", missing, lambda item: [f"- {item['file_name']}"])
@@ -1081,6 +1245,9 @@ def _format_tag_import_message(source: Path, result: dict) -> str:
         f"- {item.get('file_name', '(unknown)')}",
         f"  {item.get('reason', '')}",
     ])
+    warnings = result["reservation_warnings"]
+    _append_limited_detail(lines, f"Warning: evaluations saved, deletion reservation cleanup failed ({len(warnings)})",
+                           warnings, lambda item: [f"- {item['relpath']}", f"  {item['reason']}"])
     if any(record.get("tag") == "delete" for record in imported):
         lines.extend([
             "",
@@ -1174,36 +1341,30 @@ def _send_preview(node_id, title, image: Image.Image | None, extra: dict | None 
     _send_event(PREVIEW_EVENT, payload)
 
 
-def _active_delete_records() -> dict[str, dict]:
-    active = {}
-    if not DELETE_QUEUE_PATH.exists():
-        return active
+def _active_delete_records(*, strict=False) -> dict[str, dict]:
     try:
-        for line in DELETE_QUEUE_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            typ = rec.get("type")
-            relpath = _normalize_relpath(rec.get("ckpt_name_str", ""))
-            rid = rec.get("id")
-            if typ == "reserve" and rid and relpath:
-                active[relpath] = rec
-            elif typ == "cancel":
-                if relpath:
-                    active.pop(relpath, None)
-                elif rid:
-                    for key, value in list(active.items()):
-                        if value.get("id") == rid:
-                            active.pop(key, None)
-    except Exception:
+        return studio.active_reservations(DELETE_QUEUE_PATH)
+    except (OSError, ValueError):
+        if strict:
+            raise
         logger.exception("Failed to parse delete queue")
-    return active
+        return {}
 
 
 def _append_delete_record(record: dict):
-    DELETE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DELETE_QUEUE_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    studio.append_reservation(DELETE_QUEUE_PATH, record)
+
+
+def _cancel_reservation(relpath, reason):
+    active = _active_delete_records(strict=True)
+    for key, record in active.items():
+        if os.path.normcase(key) != os.path.normcase(relpath):
+            continue
+        _append_delete_record({
+            "version": 1, "type": "cancel", "id": record["id"], "ckpt_name_str": key,
+            "cancelled_at": _now_iso(), "reason": reason,
+        })
+    return any(os.path.normcase(key) == os.path.normcase(relpath) for key in active)
 
 
 def _resolve_checkpoint_unique(ckpt_name_str: str):
@@ -1245,7 +1406,7 @@ def _checkpoint_thumbnail_candidates(safetensors_path: Path) -> list[Path]:
     parent = path.parent
     stem = path.stem
     name = path.name
-    patterns: list[str] = []
+    patterns: list[str] = [f"{stem}.jpg"]
     for ext in sorted(ALLOWED_THUMBNAIL_SUFFIXES):
         patterns.extend([
             f"{stem}{ext}",
@@ -1453,6 +1614,11 @@ def _write_delete_script():
     DELETE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
     script_path = DELETE_SCRIPT_PATH
     plan_path = DELETE_SCRIPT_PATH.with_name("checkpoint_delete_plan.txt")
+    bridge_source = NODE_DIR / "checkpoint_studio_bridge.py"
+    bridge_copy = DELETE_SCRIPT_DIR / bridge_source.name
+    bridge_copy_tmp = bridge_copy.with_name(bridge_copy.name + ".tmp")
+    bridge_copy_tmp.write_text(bridge_source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+    bridge_copy_tmp.replace(bridge_copy)
     targets = _delete_plan_targets()
     roots_json = json.dumps([str(root) for root in _checkpoint_roots()], ensure_ascii=False, indent=2)
     script_lines = [
@@ -1460,10 +1626,12 @@ def _write_delete_script():
         "# Generated by ComfyUI-CheckpointHandpickerSuite.",
         "# Review each prompt carefully. Default answer is No.",
         "",
-        "import json",
+        "import sys",
         "from pathlib import Path",
-        "",
         "SCRIPT_DIR = Path(__file__).resolve().parent",
+        "sys.path.insert(0, str(SCRIPT_DIR))",
+        "import checkpoint_studio_bridge as studio",
+        f"STATUS_DB = Path({str(STATUS_DB_PATH)!r})",
         "QUEUE_PATH = SCRIPT_DIR / 'checkpoint_delete_queue.jsonl'",
         f"ALLOWED_ROOTS = [Path(p).resolve() for p in {roots_json}]",
         "ALLOWED_THUMBNAIL_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}",
@@ -1503,59 +1671,44 @@ def _write_delete_script():
         "            found.append(candidate)",
         "    return found",
         "",
-        "def read_records():",
-        "    if not QUEUE_PATH.exists():",
-        "        return []",
-        "    records = []",
-        "    for line in QUEUE_PATH.read_text(encoding='utf-8', errors='replace').splitlines():",
-        "        if not line.strip():",
-        "            continue",
-        "        try:",
-        "            rec = json.loads(line)",
-        "            if isinstance(rec, dict): records.append(rec)",
-        "        except Exception as exc:",
-        "            print('Skipping invalid queue record:', exc)",
-        "    return records",
+        "def current_identity(path):",
+        "    try:",
+        "        return studio.file_identity(path) if is_safe_target(path) else None",
+        "    except (OSError, ValueError):",
+        "        return None",
         "",
-        "def active_records():",
-        "    active = {}",
-        "    for rec in read_records():",
-        "        rec_type = rec.get('type')",
-        "        relpath = rec.get('ckpt_name_str') or ''",
-        "        rid = rec.get('id')",
-        "        if rec_type == 'reserve' and relpath:",
-        "            active[relpath] = rec",
-        "        elif rec_type == 'cancel':",
-        "            if relpath: active.pop(relpath, None)",
-        "            elif rid:",
-        "                for key, value in list(active.items()):",
-        "                    if value.get('id') == rid: active.pop(key, None)",
-        "    return active",
-        "",
-        "def delete_file(path):",
-        "    path = Path(path).resolve()",
-        "    if not is_safe_target(path):",
-        "        print('Unsafe target, skipped:', path); return",
-        "    if not path.exists():",
-        "        print('Not found:', path); return",
-        "    if not path.is_file():",
-        "        print('Not a file, skipped:', path); return",
-        "    path.unlink(); print('Deleted:', path)",
+        "def delete_reservation(relpath, model_path, reservation_id, fingerprints):",
+        "    with studio.evaluation_lock(STATUS_DB):",
+        "        studio.ensure_idle(STATUS_DB, relpath)",
+        "        status = studio.load_database(STATUS_DB)['statuses'].get(relpath, {}).get('status')",
+        "        current = studio.active_reservations(QUEUE_PATH).get(relpath, {})",
+        "        expected = current.get('identity')",
+        "        if (status != 'delete' or current.get('id') != reservation_id or not expected or",
+        "            current.get('resolved_path') != str(model_path) or fingerprints.get(model_path) != expected):",
+        "            raise ValueError('Reservation changed, or the file needs to be reserved again.')",
+        "        studio.remove_verified(model_path, expected)",
+        "        studio.append_reservation(QUEUE_PATH, {'version': 1, 'type': 'cancel', 'id': reservation_id, 'ckpt_name_str': relpath, 'reason': 'suite_script_deleted'})",
+        "        print('Deleted:', model_path)",
+        "        for path, identity in fingerprints.items():",
+        "            if path != model_path and identity is not None and is_safe_target(path):",
+        "                try: studio.remove_verified(path, identity); print('Deleted:', path)",
+        "                except (OSError, ValueError) as exc: print('Sidecar kept:', exc)",
         "",
         "def main():",
         "    targets = []",
-        "    for relpath, rec in sorted(active_records().items(), key=lambda item: item[0].lower()):",
+        "    for relpath, rec in sorted(studio.active_reservations(QUEUE_PATH).items(), key=lambda item: item[0].lower()):",
         "        raw = rec.get('resolved_path') or rec.get('safetensors_path') or ''",
         "        if not raw:",
         "            print('Skipping target without resolved_path:', relpath); continue",
         "        safetensors_path = Path(raw).resolve()",
         "        json_path = Path(rec.get('json_path') or safetensors_path.with_suffix('.json')).resolve()",
         "        thumbnails = thumbnail_candidates(safetensors_path)",
-        "        targets.append((relpath, safetensors_path, json_path, thumbnails, rec.get('reserved_at', '')))",
+        "        fingerprints = {path: current_identity(path) for path in (safetensors_path, json_path, *thumbnails)}",
+        "        targets.append((relpath, safetensors_path, json_path, thumbnails, rec.get('reserved_at', ''), rec['id'], fingerprints))",
         "    print('Checkpoint delete script')",
         "    print('Queue file:', QUEUE_PATH)",
         "    print('Targets:', len(targets))",
-        "    for idx, (relpath, safetensors_path, json_path, thumbnails, reserved_at) in enumerate(targets, start=1):",
+        "    for idx, (relpath, safetensors_path, json_path, thumbnails, reserved_at, reservation_id, fingerprints) in enumerate(targets, start=1):",
         "        print()",
         "        print('[{}/{}] Delete checkpoint?'.format(idx, len(targets)))",
         "        print('  relpath:', relpath)",
@@ -1569,10 +1722,8 @@ def _write_delete_script():
         "            print('  thumbnails: (none)')",
         "        answer = input('Delete this checkpoint and listed sidecar thumbnails? (y/N): ').strip().lower()",
         "        if answer != 'y': print('Skipped.'); continue",
-        "        delete_file(safetensors_path)",
-        "        delete_file(json_path)",
-        "        for thumb in thumbnails:",
-        "            delete_file(thumb)",
+        "        try: delete_reservation(relpath, safetensors_path, reservation_id, fingerprints)",
+        "        except (OSError, ValueError) as exc: print('Checkpoint kept:', exc)",
         "    print()",
         "    print('Deletion completed. Please return to ComfyUI and click Refresh All.')",
         "",
@@ -1601,22 +1752,30 @@ def _write_delete_script():
     return script_path, plan_path, len(targets)
 
 
+@_with_evaluation_lock
 def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None = None) -> dict:
-    active = _active_delete_records()
+    roots = _checkpoint_roots()
+    if not roots or any(not root.is_dir() for root in roots):
+        return {"pruned_delete_records": 0, "cleared_missing_delete_statuses": 0, "cleared_relpaths": []}
+    active = _active_delete_records(strict=True)
+    busy = studio.busy_keys(STATUS_DB_PATH)
+    db = _load_status_db(for_write=True)
     current_names = {_normalize_relpath(value) for value in (checkpoint_values if checkpoint_values is not None else _get_fresh_checkpoint_values())}
     pruned_reservations = 0
     for relpath, rec in list(active.items()):
         relpath = _normalize_relpath(relpath)
         rid = rec.get("id")
-        if not rid or relpath in current_names:
+        if not rid or relpath in current_names or os.path.normcase(relpath) in busy:
             continue
         raw_path = rec.get("resolved_path") or rec.get("safetensors_path") or ""
         if raw_path:
             try:
-                if Path(raw_path).expanduser().resolve().exists():
-                    continue
-            except Exception:
+                Path(raw_path).expanduser().stat()
+                continue
+            except FileNotFoundError:
                 pass
+            except OSError:
+                continue
         _append_delete_record({
             "version": 1,
             "type": "cancel",
@@ -1632,15 +1791,14 @@ def _prune_missing_delete_records_on_refresh(checkpoint_values: list[str] | None
     # in Explorer). On Refresh All, a delete tag whose exact checkpoint relpath no
     # longer resolves to a physical file is stale and should not remain as a
     # permanent Failed export record. Other missing statuses are intentionally kept.
-    db = _load_status_db()
-    statuses = db.get("statuses", {}) if isinstance(db.get("statuses"), dict) else {}
+    statuses = db["statuses"]
     cleared_relpaths = []
     for raw_relpath, raw_entry in list(statuses.items()):
         entry = raw_entry if isinstance(raw_entry, dict) else {}
         if entry.get("status") != "delete":
             continue
         relpath = _normalize_relpath(raw_relpath)
-        if relpath in current_names or _checkpoint_candidates_for_relpath(relpath):
+        if relpath in current_names or os.path.normcase(relpath) in busy or _checkpoint_candidates_for_relpath(relpath):
             continue
         statuses.pop(raw_relpath, None)
         cleared_relpaths.append(relpath)
@@ -2174,6 +2332,7 @@ class CheckpointNameCycler:
     def IS_CHANGED(cls, start_checkpoint, mode="increment", change_every=1, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
         return float("nan")
 
+    @_with_cycle_ratings
     def cycle(self, start_checkpoint, mode="increment", change_every=1, hps_tab_id="", hps_filter_statuses="", hps_use_local_list="", hps_settings_revision="0", unique_id=None):
         tab_id = _clean_tab_id(hps_tab_id)
         node_id = str(unique_id or "")
@@ -2594,6 +2753,32 @@ class ImageDirPreview:
         return ()
 
 
+def initialize_studio_integration():
+    global _last_cycle_ratings
+    if os.name != "nt":
+        return
+    roots = _checkpoint_roots()
+    if not roots:
+        return
+    try:
+        with studio.evaluation_lock(STATUS_DB_PATH):
+            db = _load_status_db(for_write=True)
+            # A fresh installation can publish an empty, valid database. A missing DB
+            # after enrollment is an error and _load_status_db refuses to recreate it.
+            _save_status_db(db)
+            _last_cycle_ratings = db["statuses"]
+            DELETE_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+            _active_delete_records(strict=True)
+            _write_delete_script()
+            studio.write_json(_studio_manifest(), {
+                "protocolVersion": 1,
+                "checkpointRoots": [str(root) for root in roots],
+                "deleteQueuePath": str(DELETE_QUEUE_PATH),
+            })
+    except (OSError, ValueError):
+        logger.warning("CheckpointHandpickerSuite could not enable Studio write integration", exc_info=True)
+
+
 routes = PromptServer.instance.routes
 
 
@@ -2855,13 +3040,14 @@ async def tag_transfer_import(request):
             request_data = {}
         try:
             directory = _resolve_tag_transfer_directory(request_data.get("directory", ""), create_default=False)
+            file_name = str(request_data.get("file_name") or "").strip()
+            source = _named_tag_import_path(directory, file_name) if file_name else _latest_tag_export_path(directory)
         except ValueError as exc:
             return web.json_response({
                 "ok": False,
                 "error": str(exc),
                 "message": f"Import failed.\n\n{exc}",
             }, status=400)
-        source = _latest_tag_export_path(directory)
         if source is None:
             return web.json_response({
                 "ok": False,
@@ -2876,12 +3062,17 @@ async def tag_transfer_import(request):
                 "ok": False,
                 "error": str(exc),
                 "file_name": source.name,
-                "message": f"Latest export:\n{source.name}\n\nERROR:\n{exc}\n\nImport cancelled.",
+                "message": f"Import file:\n{source.name}\n\nERROR:\n{exc}\n\nImport cancelled.",
             }, status=400)
 
-        # Read the latest DB and commit synchronously only after all slow work is
-        # complete, so Tagger changes made before this point are never overwritten.
-        result = _commit_tag_import(prepared)
+        # Read and confirm against the latest DB while its write lock is held.
+        if file_name:
+            result = _commit_tag_import(prepared, explicit_source=str(source.resolve()),
+                                        confirmation=str(request_data.get("confirmation") or ""))
+        else:
+            result = _commit_tag_import(prepared)
+        if result.get("confirmation_required"):
+            return web.json_response(result)
         revision = _sync_imported_tag_states(result["imported_records"])
         message = _format_tag_import_message(source, result)
         response = {
@@ -2898,11 +3089,13 @@ async def tag_transfer_import(request):
                 for record in result["imported_records"]
             ],
             "imported": len(result["imported_records"]),
+            "overwritten": result["overwrite_count"],
             "unchanged": len(result["unchanged_records"]),
             "conflicts": len(result["conflict_records"]),
             "missing": len(result["missing_records"]),
             "ambiguous": len(result["ambiguous_records"]),
             "failed": len(result["failed_records"]),
+            "reservation_warnings": result["reservation_warnings"],
             "revision": revision,
         }
         logger.info(
@@ -2925,7 +3118,10 @@ async def tag_transfer_import(request):
 @routes.post(f"/{EXTENSION_PREFIX}/refresh_all")
 async def refresh_all(_request):
     checkpoint_values = _get_fresh_checkpoint_values()
-    delete_cleanup = _prune_missing_delete_records_on_refresh(checkpoint_values)
+    try:
+        delete_cleanup = _prune_missing_delete_records_on_refresh(checkpoint_values)
+    except (OSError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
     pruned_delete_records = delete_cleanup["pruned_delete_records"]
     cleared_missing_delete_statuses = delete_cleanup["cleared_missing_delete_statuses"]
     if delete_cleanup["cleared_relpaths"]:
@@ -2965,42 +3161,38 @@ async def tagger_set_status(request):
         return web.json_response({"ok": False, "error": "Invalid checkpoint path."}, status=400)
     if requested not in STATUS_VALUES:
         return web.json_response({"ok": False, "error": "Invalid status."}, status=400)
-    current = _get_status(relpath)
-    if requested == "none":
-        status = "none"
-    elif requested == current:
-        status = "none"
-    elif requested == "delete" and current not in ("none", "delete"):
-        return web.json_response({"ok": False, "error": "Delete is available only from none."}, status=400)
-    else:
-        status = requested
-    _set_status(relpath, status)
-    if status == "delete":
-        resolved = _resolve_checkpoint_unique(relpath)
-        if resolved:
-            _append_delete_record({
-                "version": 1,
-                "type": "reserve",
-                "id": f"{int(time.time())}_{uuid.uuid4().hex}",
-                "ckpt_name_str": relpath,
-                "resolved_path": resolved["path"],
-                "json_path": resolved["json_path"],
-                "reserved_at": _now_iso(),
-            })
-            _write_delete_script()
-    else:
-        # Cancel active delete reservation for this checkpoint if it existed.
-        active = _active_delete_records().get(relpath)
-        if active and active.get("id"):
-            _append_delete_record({
-                "version": 1,
-                "type": "cancel",
-                "id": active.get("id"),
-                "ckpt_name_str": relpath,
-                "cancelled_at": _now_iso(),
-                "reason": f"status_changed_to_{status}",
-            })
-            _write_delete_script()
+    try:
+        with studio.evaluation_lock(STATUS_DB_PATH):
+            studio.ensure_idle(STATUS_DB_PATH, relpath)
+            db = _load_status_db(for_write=True)
+            current = db["statuses"].get(relpath, {}).get("status", "none")
+            if requested == "none" or requested == current:
+                status = "none"
+            elif requested == "delete" and current not in ("none", "delete"):
+                return web.json_response({"ok": False, "error": "Delete is available only from none."}, status=400)
+            else:
+                status = requested
+
+            cancelled = _cancel_reservation(relpath, "status_changed_to_" + status)
+            _update_status(db, relpath, status)
+            reserved = False
+            if status == "delete":
+                resolved = _resolve_checkpoint_unique(relpath)
+                if resolved:
+                    try:
+                        identity = studio.file_identity(Path(resolved["path"]))
+                        _append_delete_record({
+                            "version": 1, "type": "reserve", "id": f"{int(time.time())}_{uuid.uuid4().hex}",
+                            "ckpt_name_str": relpath, "resolved_path": resolved["path"], "identity": identity,
+                            "json_path": resolved["json_path"], "reserved_at": _now_iso(),
+                        })
+                        reserved = True
+                    except (OSError, ValueError):
+                        logger.warning("Evaluation saved without a deletion reservation", exc_info=True)
+            if reserved or cancelled:
+                _write_delete_script()
+    except (OSError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
     _store_tagger_state(tab_id, node_id, relpath, status)
     _send_status_changed(relpath, tab_id=tab_id, node_id=node_id)
     _refresh_cycler_states_for_status_change(relpath)
@@ -3010,6 +3202,7 @@ async def tagger_set_status(request):
         "ckpt_name_safe": _ckpt_name_safe_from_relpath(relpath),
         "status": status,
         "status_icon": STATUS_ICON[status],
+        "delete_reserved": reserved,
         "summary": _delete_status_summary(),
     })
 

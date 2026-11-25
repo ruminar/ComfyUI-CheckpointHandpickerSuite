@@ -3066,6 +3066,7 @@ function tagTransferRects(node) {
   return {
     exportButton: { x: margin, y: 76, w: buttonW, h: buttonH },
     importButton: { x: margin + buttonW + gap, y: 76, w: buttonW, h: buttonH },
+    importFileButton: { x: margin + (buttonW + gap) * 2, y: 76, w: buttonW, h: buttonH },
     result: { x: margin, y: 116, w: Math.max(1, node.size[0] - margin * 2), h: Math.max(1, node.size[1] - 126) },
   };
 }
@@ -3095,29 +3096,43 @@ function wrapTagTransferText(ctx, text, maxWidth) {
 function tagTransferCursorAt(node, local) {
   if (!local) return "";
   const r = tagTransferRects(node);
-  if (hit(local, r.exportButton) || hit(local, r.importButton)) {
+  if (hit(local, r.exportButton) || hit(local, r.importButton) || hit(local, r.importFileButton)) {
     return node.__hpsTagTransferBusy ? "not-allowed" : "pointer";
   }
   return "";
 }
 
-async function runTagTransfer(node, operation) {
+function importSpecifiedTagFile(node) {
+  if (node.__hpsTagTransferBusy) return;
+  const fileName = window.prompt("JSON file name in Tag Transfer Directory", "")?.trim();
+  if (fileName) void runTagTransfer(node, "import", fileName);
+}
+
+async function runTagTransfer(node, operation, fileName = "") {
   if (!node || node.__hpsTagTransferBusy) return;
   node.__hpsTagTransferBusy = true;
   node.__hpsTagTransferScroll = 0;
   node.__hpsTagTransferResult = operation === "export" ? "Exporting..." : "Importing...";
   app.graph?.setDirtyCanvas?.(true, true);
   try {
-    const response = await api.fetchApi(`/${EXTENSION_PREFIX}/tag_transfer/${operation}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ directory: tagTransferDirectoryValue(node) }),
-    });
+    const payload = { directory: tagTransferDirectoryValue(node), file_name: fileName };
+    let response;
     let result = null;
-    try {
-      result = await response.json();
-    } catch {
-      result = null;
+    while (true) {
+      response = await api.fetchApi(`/${EXTENSION_PREFIX}/tag_transfer/${operation}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      result = await response.json().catch(() => null);
+      if (!result?.confirmation_required) break;
+      const note = result.plan_changed ? "The file or evaluations to apply have changed.\n\n" : "";
+      const message = `${fileName}\n\n${note}Overwrite ${result.overwrite_count} existing evaluation(s) and add ${result.new_count} new evaluation(s)?`;
+      if (!window.confirm(message)) {
+        node.__hpsTagTransferResult = "Import cancelled.";
+        return;
+      }
+      payload.confirmation = result.confirmation;
     }
     if (operation === "import" && result?.ok && Array.isArray(result.changes)) {
       applyTagTransferChanges({ scope: "global", changes: result.changes });
@@ -3144,6 +3159,7 @@ function syncVueTagTransferUI(node) {
   const busy = !!node.__hpsTagTransferBusy;
   ui.exportButton.disabled = busy;
   ui.importButton.disabled = busy;
+  ui.importFileButton.disabled = busy;
   ui.result.textContent = node.__hpsTagTransferResult || "Ready.";
 }
 function buildVueTagTransferUI(node) {
@@ -3164,7 +3180,9 @@ function buildVueTagTransferUI(node) {
   exportButton.textContent = "📤 Export";
   const importButton = document.createElement("button");
   importButton.textContent = "📥 Import";
-  for (const button of [exportButton, importButton]) {
+  const importFileButton = document.createElement("button");
+  importFileButton.textContent = "Import File…";
+  for (const button of [exportButton, importButton, importFileButton]) {
     button.style.flex = "1";
     button.style.padding = "5px 0";
     button.style.background = "rgba(80,120,180,0.65)";
@@ -3183,13 +3201,14 @@ function buildVueTagTransferUI(node) {
   result.style.padding = "6px 8px";
   result.style.fontSize = "12px";
   keepWheelForNativeScroll(result);
-  buttons.append(exportButton, importButton);
+  buttons.append(exportButton, importButton, importFileButton);
   root.append(buttons, result);
   stopHpsWidgetEventPropagation(root);
   exportButton.addEventListener("click", () => void runTagTransfer(node, "export"));
   importButton.addEventListener("click", () => void runTagTransfer(node, "import"));
+  importFileButton.addEventListener("click", () => importSpecifiedTagFile(node));
   if (!addVueOnlyDomWidget(node, "hps_tag_transfer_actions", "hps-tag-transfer-actions", root, 118, "fill")) return;
-  node.__hpsVueTagTransferUI = { root, exportButton, importButton, result };
+  node.__hpsVueTagTransferUI = { root, exportButton, importButton, importFileButton, result };
   syncVueTagTransferUI(node);
 }
 
@@ -3226,6 +3245,7 @@ function setupTagTransferNode(nodeType) {
     const enabled = !this.__hpsTagTransferBusy;
     drawButton(ctx, r.exportButton, "📤 Export", enabled);
     drawButton(ctx, r.importButton, "📥 Import", enabled);
+    drawButton(ctx, r.importFileButton, "Import File…", enabled);
 
     ctx.save();
     ctx.fillStyle = "rgba(12,12,12,0.72)";
@@ -3270,6 +3290,10 @@ function setupTagTransferNode(nodeType) {
     }
     if (hitAny(this, pos, r.importButton)) {
       if (!this.__hpsTagTransferBusy) runTagTransfer(this, "import");
+      return true;
+    }
+    if (hitAny(this, pos, r.importFileButton)) {
+      importSpecifiedTagFile(this);
       return true;
     }
     return origMouseDown ? origMouseDown.apply(this, arguments) : false;
