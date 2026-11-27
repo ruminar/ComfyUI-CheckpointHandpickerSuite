@@ -681,6 +681,9 @@ def _clear_checkpoint_filename_cache():
     cache = getattr(folder_paths, "filename_list_cache", None)
     if isinstance(cache, dict):
         cache.pop("checkpoints", None)
+    active_cache = getattr(getattr(folder_paths, "cache_helper", None), "cache", None)
+    if isinstance(active_cache, dict):
+        active_cache.pop("checkpoints", None)
 
 
 def _checkpoint_roots() -> list[Path]:
@@ -2155,14 +2158,14 @@ def _load_image_dir_preview(node_id, relpath, search_directory=None, tab_id="", 
     return sheet, extra
 
 
-def _valid_local_list(local_list: list[str] | None) -> list[str]:
+def _valid_local_list(local_list: list[str] | None, checkpoint_values: list[str] | None = None) -> list[str]:
     """Return valid Local List entries while preserving order and duplicates.
 
     Local List is a manual per-Cycler queue, not a set. The same checkpoint may
     intentionally be pushed multiple times, and each entry must be consumed
     independently.
     """
-    all_set = set(_get_checkpoint_list())
+    all_set = set(_get_checkpoint_list() if checkpoint_values is None else checkpoint_values)
     local = []
     for item in local_list or []:
         rel = _normalize_relpath(item)
@@ -2209,14 +2212,14 @@ def _build_cycler_title(source, ckpt_name, hold_index, change_every, active_filt
     return f"{prefix} : {body} ({hold_index}/{change_every})"
 
 
-def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True, shuffle_deck_remaining=None) -> str:
+def _build_cycler_status_text(source, ckpt_name, active_filter, fallback_all, queue, hold_index, change_every, match_count, local_count, mode, local_items=None, use_local_list=True, shuffle_deck_remaining=None, checkpoint_total=None) -> str:
     status = _get_status(ckpt_name) if ckpt_name else "none"
     current = f"Current: {STATUS_ICON[status]} {ckpt_name}" if status != "none" and ckpt_name else (f"Current: {ckpt_name}" if ckpt_name else "Current: (none)")
     display_mode = "local list" if source == "local_list" else mode
     lines = [
         current,
         f"Mode: {display_mode}" if source == "local_list" else f"Mode: {mode}  Hold: {hold_index}/{change_every}",
-        f"Filter: {_filter_display(active_filter)}  Matches: {match_count} / {_checkpoint_total_count()}",
+        f"Filter: {_filter_display(active_filter)}  Matches: {match_count} / {checkpoint_total if checkpoint_total is not None else _checkpoint_total_count()}",
     ]
     if fallback_all:
         lines.append("Filter fallback: all checkpoints")
@@ -2268,13 +2271,12 @@ def _build_cycler_idle_status_text(action: str, state: dict, detail: str = "") -
     return "\n".join(lines)
 
 
-def _candidate_checkpoints(active_filter: list[str]) -> tuple[list[str], bool, int]:
+def _candidate_checkpoints(active_filter: list[str], all_checkpoints: list[str]) -> tuple[list[str], bool, int]:
     """Return global candidates, fallback flag, and global filter match count.
 
     Local List is intentionally handled outside this function. Filter metadata is
     always about the entire checkpoint set, not about the Local List.
     """
-    all_checkpoints = _get_checkpoint_list()
     if not active_filter:
         return list(all_checkpoints), False, len(all_checkpoints)
     filtered = [ckpt for ckpt in all_checkpoints if _get_status(ckpt) in active_filter]
@@ -2372,22 +2374,61 @@ class CheckpointNameCycler:
         start_checkpoint_used = _normalize_relpath(controls.get("start_checkpoint") or prompt_start_checkpoint)
 
         all_checkpoints = _get_checkpoint_list()
-        if not all_checkpoints:
-            title = "Cycler : no checkpoints"
-            status_text = "Current: (no checkpoints)"
-            state["last_title"] = title
-            state["last_status_text"] = status_text
-            _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
-            return ("", "", "checkpoint")
+        original_checkpoints = all_checkpoints
+        original_index = int(state.get("current_index", 0))
+        missing = set()
+        refreshed = False
+        if not all_checkpoints and _is_valid_checkpoint_relpath(start_checkpoint_used):
+            # A disappeared checkpoint directory can leave the listing empty
+            # before a candidate can be selected and checked.
+            _clear_checkpoint_filename_cache()
+            all_checkpoints = _get_checkpoint_list()
+            refreshed = True
+        while all_checkpoints:
+            current_index = original_index
+            if missing and original_checkpoints and mode == "increment":
+                # Keep the same point in the rotation when removing stale entries.
+                pivot = max(0, min(len(original_checkpoints) - 1, original_index))
+                ordered = original_checkpoints[pivot:] + original_checkpoints[:pivot]
+                available = set(all_checkpoints)
+                next_name = next((name for name in ordered if name in available), all_checkpoints[0])
+                current_index = all_checkpoints.index(next_name)
+            result, missing_name = self._cycle_from_list(
+                state, all_checkpoints, start_checkpoint_used, mode, change_every,
+                active_filter, use_local_list, tab_id, node_id, unique_id, current_index, refreshed,
+            )
+            if result is not None:
+                return result
+            logger.info("[CheckpointHandpickerSuite] Cycler skipped missing checkpoint: %s", missing_name)
+            missing.add(missing_name)
+            if not refreshed:
+                _clear_checkpoint_filename_cache()
+                all_checkpoints = _get_checkpoint_list()
+                refreshed = True
+            all_checkpoints = [name for name in all_checkpoints if name not in missing]
 
+        title = "Cycler : no checkpoints"
+        status_text = ("Current: (no checkpoints after automatic refresh)" if refreshed
+                       else "Current: (no checkpoints)")
+        state["last_title"] = title
+        state["last_status_text"] = status_text
+        _send_cycler_update(node_id, title, status_text, tab_id=tab_id)
+        if refreshed:
+            raise FileNotFoundError("Checkpoint Name Cycler: no checkpoints found after automatic refresh.")
+        return ("", "", "checkpoint")
+
+    def _cycle_from_list(self, live_state, all_checkpoints, start_checkpoint_used, mode, change_every,
+                         active_filter, use_local_list, tab_id, node_id, unique_id, current_index, refreshed):
+        # Only publish/commit selection state after the file has been found.
+        state = live_state.copy()
         if start_checkpoint_used not in all_checkpoints:
-            # Backend fallback only. The frontend must still keep the visible
-            # combo value valid so ComfyUI's queue-time validation does not fail.
             start_checkpoint_used = all_checkpoints[0]
-            controls = _set_runtime_controls(state, start_checkpoint=start_checkpoint_used, mark_initialized=bool(state.get("runtime_controls_initialized", False)))
 
-        global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter)
-        local_items = _valid_local_list(state.get("local_list", []))
+        global_candidates, fallback_all, global_match_count = _candidate_checkpoints(active_filter, all_checkpoints)
+        local_items = _valid_local_list(state.get("local_list", []), all_checkpoints)
+        if refreshed and use_local_list:
+            state["local_list"] = local_items
+            state["override_queue"] = local_items
         use_local_source = use_local_list and bool(local_items)
         # fixed mode is a normal checkpoint selector and deliberately ignores
         # status filters. Local List remains the only source allowed to override
@@ -2402,12 +2443,6 @@ class CheckpointNameCycler:
             candidates = all_checkpoints
             fallback_all = True
         candidate_set = set(candidates)
-
-        def start_index() -> int:
-            requested = _normalize_relpath(start_checkpoint_used)
-            if requested in all_checkpoints:
-                return all_checkpoints.index(requested)
-            return 0
 
         source = "local_list" if use_local_source else "cycle"
         hold_index = 1
@@ -2437,6 +2472,7 @@ class CheckpointNameCycler:
                 local_items=remaining_local_items,
                 use_local_list=True,
                 shuffle_deck_remaining=None,
+                checkpoint_total=len(all_checkpoints),
             )
             local_items = remaining_local_items
         else:
@@ -2505,7 +2541,7 @@ class CheckpointNameCycler:
                     ckpt_name = draw_from_shuffle_deck()
                     selected_index = all_checkpoints.index(ckpt_name)
                 else:
-                    ckpt_name, selected_index = find_next_increment(int(state.get("current_index", start_index())))
+                    ckpt_name, selected_index = find_next_increment(current_index)
 
             hold_index = repeat_count + 1 if can_hold_last else 1
             if hold_index >= change_every:
@@ -2538,7 +2574,25 @@ class CheckpointNameCycler:
                 local_items=local_items,
                 use_local_list=use_local_list,
                 shuffle_deck_remaining=len(state.get("shuffle_deck", [])) if mode == "shuffle_once" else None,
+                checkpoint_total=len(all_checkpoints),
             )
+
+        if folder_paths.get_full_path("checkpoints", ckpt_name) is None:
+            return None, ckpt_name
+
+        if use_local_source or (refreshed and use_local_list):
+            for field in ("local_list", "override_queue", "local_index"):
+                live_state[field] = state[field]
+        if not use_local_source:
+            for field in ("current_index", "cycle_count", "repeat_count", "shuffle_deck", "last_normal_ckpt_name"):
+                live_state[field] = state[field]
+        state = live_state
+        controls = _runtime_controls_from_state(state)
+        if controls.get("start_checkpoint") != start_checkpoint_used:
+            controls = _set_runtime_controls(state, start_checkpoint=start_checkpoint_used,
+                                             mark_initialized=bool(state.get("runtime_controls_initialized", False)))
+        if refreshed:
+            status_text += "\nCheckpoint list refreshed automatically."
 
         status = _get_status(ckpt_name)
         snapshot = {
@@ -2613,14 +2667,14 @@ class CheckpointNameCycler:
             local_list_count=len(local_items),
             local_list_items=list(local_items),
             filter_matches=global_match_count,
-            filter_total=_checkpoint_total_count(),
+            filter_total=len(all_checkpoints),
             active_filter=list(active_filter),
             use_local_list=use_local_list,
             runtime_controls=controls,
             last_execution_snapshot=snapshot,
             execution_revision=state["execution_revision"],
         )
-        return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name))
+        return (ckpt_name, ckpt_name, _ckpt_name_safe_from_relpath(ckpt_name)), None
 
 
 class CheckpointStatusTagger:

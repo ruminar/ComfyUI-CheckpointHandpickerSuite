@@ -85,6 +85,15 @@ class CyclerModeTests(unittest.TestCase):
 
     def setUp(self):
         self.checkpoints = ["a.safetensors", "b.safetensors", "c.safetensors"]
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        models = Path(temporary.name)
+        self.models = models
+        for name in self.checkpoints:
+            (models / name).touch()
+        self.suite.folder_paths.get_full_path = lambda _kind, name: str(models / name) if (models / name).is_file() else None
+        self.suite.folder_paths.filename_list_cache = {"checkpoints": object(), "loras": object()}
+        self.suite.folder_paths.cache_helper = types.SimpleNamespace(cache={"checkpoints": object(), "loras": object()})
         self.statuses = {
             "a.safetensors": "god",
             "b.safetensors": "none",
@@ -95,11 +104,11 @@ class CyclerModeTests(unittest.TestCase):
         self.suite._get_checkpoint_list = lambda: list(self.checkpoints)
         self.suite._get_status = lambda relpath: self.statuses.get(relpath, "none")
 
-    def cycle(self, *, start="a.safetensors", mode="increment", statuses=None, use_local_list=False):
+    def cycle(self, *, start="a.safetensors", mode="increment", statuses=None, use_local_list=False, change_every=1):
         return self.suite.CheckpointNameCycler().cycle(
             start,
             mode=mode,
-            change_every=1,
+            change_every=change_every,
             hps_tab_id="test-tab",
             hps_filter_statuses=json.dumps(statuses or []),
             hps_use_local_list="true" if use_local_list else "false",
@@ -138,6 +147,63 @@ class CyclerModeTests(unittest.TestCase):
         )
         self.assertEqual("c.safetensors", selected)
         self.assertEqual([], self.cycler_state()["local_list"])
+
+    def test_existing_checkpoint_does_not_invalidate_cache(self):
+        self.assertEqual("a.safetensors", self.cycle(mode="fixed"))
+        self.assertIn("checkpoints", self.suite.folder_paths.filename_list_cache)
+        self.assertIn("checkpoints", self.suite.folder_paths.cache_helper.cache)
+
+    def test_missing_fixed_checkpoint_refreshes_and_uses_fresh_list(self):
+        folder_paths = self.suite.folder_paths
+        replacement = "new.safetensors"
+        (self.models / replacement).touch()
+        (self.models / "a.safetensors").unlink()
+        with patch.object(self.suite, "_get_checkpoint_list", side_effect=[list(self.checkpoints), [replacement]]):
+            self.assertEqual(replacement, self.cycle(mode="fixed"))
+        self.assertEqual({"loras"}, set(folder_paths.filename_list_cache))
+        self.assertEqual({"loras"}, set(folder_paths.cache_helper.cache))
+        self.assertEqual(replacement, self.cycler_state()["runtime_controls"]["start_checkpoint"])
+        self.assertIn("refreshed automatically", self.cycler_state()["last_status_text"])
+
+    def test_missing_local_items_are_skipped_even_if_refresh_still_lists_them(self):
+        state = self.cycler_state()
+        state["local_list"] = ["a.safetensors", "a.safetensors", "b.safetensors", "c.safetensors", "c.safetensors"]
+        (self.models / "a.safetensors").unlink()
+        (self.models / "b.safetensors").unlink()
+        with patch.object(self.suite, "_clear_checkpoint_filename_cache", wraps=self.suite._clear_checkpoint_filename_cache) as refresh:
+            self.assertEqual("c.safetensors", self.cycle(mode="fixed", use_local_list=True))
+        refresh.assert_called_once()
+        self.assertEqual(["c.safetensors"], state["local_list"])
+        self.assertEqual("local_list", state["last_execution_snapshot"]["source"])
+
+    def test_empty_listing_with_requested_checkpoint_retries_once(self):
+        with patch.object(self.suite, "_get_checkpoint_list", side_effect=[[], ["c.safetensors"]]):
+            self.assertEqual("c.safetensors", self.cycle(mode="fixed"))
+        self.assertNotIn("checkpoints", self.suite.folder_paths.filename_list_cache)
+
+    def test_missing_held_checkpoint_restarts_hold_at_next_valid_checkpoint(self):
+        self.assertEqual("a.safetensors", self.cycle(change_every=2))
+        (self.models / "a.safetensors").unlink()
+        self.assertEqual("b.safetensors", self.cycle(change_every=2))
+        self.assertEqual(1, self.cycler_state()["last_hold_index"])
+        self.assertEqual("b.safetensors", self.cycle(change_every=2))
+        self.assertEqual(2, self.cycler_state()["last_hold_index"])
+
+    def test_missing_shuffle_candidate_keeps_filter_and_remaining_deck(self):
+        state = self.cycler_state()
+        state["shuffle_deck"] = list(self.checkpoints)
+        (self.models / "a.safetensors").unlink()
+        self.assertEqual("c.safetensors", self.cycle(mode="shuffle_once", statuses=["god", "favorite"]))
+        self.assertEqual([], state["shuffle_deck"])
+        self.assertFalse(state["last_execution_snapshot"]["fallback_all"])
+
+    def test_no_candidates_after_refresh_reports_cycler_error(self):
+        for name in self.checkpoints:
+            (self.models / name).unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "no checkpoints found after automatic refresh"):
+            self.cycle(mode="fixed")
+        self.assertIsNone(self.cycler_state()["last_execution_snapshot"])
+        self.assertIn("no checkpoints after automatic refresh", self.cycler_state()["last_status_text"])
 
 
 class NodeContractTests(unittest.TestCase):
